@@ -8,8 +8,29 @@ mod state;
 use app::{ComicApp, UI_HIDE_DELAY};
 use eframe::egui;
 
+const LOGO_BYTES: &[u8] = include_bytes!("logo.ico");
+
+/// Decodes the embedded logo into raw RGBA bytes plus its dimensions, shared
+/// by both the OS window/taskbar icon and the in-app splash texture.
+fn load_logo_rgba() -> (Vec<u8>, u32, u32) {
+    let image = image::load_from_memory(LOGO_BYTES)
+        .expect("embedded logo.ico should decode")
+        .into_rgba8();
+    let (width, height) = (image.width(), image.height());
+    (image.into_raw(), width, height)
+}
+
 fn main() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions::default();
+    let (rgba, width, height) = load_logo_rgba();
+    let options = eframe::NativeOptions {
+        // `app_id` is what Wayland compositors (KWin, GNOME Shell...) use to
+        // find a matching .desktop file and pull its `Icon=` — Wayland has no
+        // per-window icon protocol, unlike X11's `_NET_WM_ICON` set below.
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(egui::IconData { rgba, width, height })
+            .with_app_id("comic-reader"),
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Comic Reader",
@@ -94,9 +115,19 @@ impl eframe::App for ComicApp {
                 }
             });
         } else if self.pages.is_empty() {
+            if self.logo_texture.is_none() {
+                let (rgba, width, height) = load_logo_rgba();
+                let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                self.logo_texture = Some(ui.ctx().load_texture("logo", image, egui::TextureOptions::LINEAR));
+            }
+
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.heading("🎯 Comic Reader v2.0");
+                if let Some(logo) = &self.logo_texture {
+                    ui.add(egui::Image::new(logo).max_size(egui::vec2(96.0, 96.0)).shrink_to_fit());
+                    ui.add_space(8.0);
+                }
+                ui.heading("Comic Reader");
 
                 if let Some(error) = &self.load_error {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);

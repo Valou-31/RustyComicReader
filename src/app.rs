@@ -51,6 +51,8 @@ pub struct ComicApp {
     pub preview_texture: Option<egui::TextureHandle>,
     pub window_title: String,
     pub title_dirty: bool,
+    /// Lazily uploaded the first time the empty-state screen is drawn.
+    pub logo_texture: Option<egui::TextureHandle>,
     pending_load: Option<std::sync::mpsc::Receiver<crate::comic::loader::LoadEvent>>,
 }
 
@@ -79,6 +81,7 @@ impl Default for ComicApp {
             preview_texture: None,
             window_title: "Comic Reader".to_string(),
             title_dirty: false,
+            logo_texture: None,
             pending_load: None,
         }
     }
