@@ -51,8 +51,7 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
 
                     let keys = app.keybindings.bindings.get(&action).cloned().unwrap_or_default();
                     for key in keys {
-                        ui.label(&key);
-                        if ui.small_button("✕").clicked() {
+                        if draw_key_chip(ui, &key) {
                             app.keybindings.remove_key(action, &key);
                             app.save_config();
                         }
@@ -131,4 +130,29 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
         app.show_settings = false;
         app.remapping_action = None;
     }
+}
+
+/// Draws a bound key as a single rounded chip — the key text with a small
+/// "×" at the end, both inside one bordered rectangle instead of a separate
+/// label + button. Returns `true` if the "×" was clicked (caller removes it).
+fn draw_key_chip(ui: &mut egui::Ui, key: &str) -> bool {
+    let mut remove = false;
+    egui::Frame::NONE
+        .fill(ui.visuals().widgets.inactive.weak_bg_fill)
+        .stroke(ui.visuals().widgets.inactive.bg_stroke)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(key);
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("×").size(13.0)).small().frame(false))
+                    .clicked()
+                {
+                    remove = true;
+                }
+            });
+        });
+    remove
 }
