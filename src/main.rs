@@ -5,7 +5,7 @@ mod comic;
 mod storage;
 mod state;
 
-use app::{ComicApp, UI_FADE_DURATION, UI_HIDE_DELAY};
+use app::{ComicApp, UI_HIDE_DELAY};
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
@@ -19,7 +19,12 @@ fn main() -> Result<(), eframe::Error> {
 }
 
 impl eframe::App for ComicApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        self.theme_preset.theme().bg.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {  // ✅ Changé : &mut Ui au lieu de Context
+        self.theme_preset.theme().apply(ui.ctx());
         self.poll_loading();
         if self.loading {
             ui.ctx().request_repaint();
@@ -50,7 +55,7 @@ impl eframe::App for ComicApp {
             let idle_for = self.idle_time();
             if idle_for < UI_HIDE_DELAY {
                 ui.ctx().request_repaint_after(UI_HIDE_DELAY - idle_for);
-            } else if idle_for < UI_HIDE_DELAY + UI_FADE_DURATION {
+            } else if idle_for < UI_HIDE_DELAY + self.layout.fade_duration() {
                 ui.ctx().request_repaint();
             }
         }

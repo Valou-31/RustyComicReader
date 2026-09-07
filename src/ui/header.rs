@@ -1,4 +1,4 @@
-use crate::app::{ComicApp, UI_FADE_DURATION, UI_HIDE_DELAY};
+use crate::app::{ComicApp, UI_HIDE_DELAY};
 use egui::Ui;
 
 /// Draws the top bar (filename, live page numbers, peek badge, controls) for
@@ -10,7 +10,7 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
     let alpha = ui.ctx().animate_bool_with_time(
         egui::Id::new("header_fade"),
         visible,
-        UI_FADE_DURATION.as_secs_f32(),
+        app.layout.fade_duration().as_secs_f32(),
     );
 
     if alpha <= 0.01 {
@@ -20,9 +20,10 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
     ui.scope(|ui| {
         ui.set_opacity(alpha);
 
+        let secondary = app.theme_preset.theme().text_secondary;
         ui.horizontal(|ui| {
             ui.label(&app.filename);
-            ui.label(page_label(app));
+            ui.colored_label(secondary, page_label(app));
 
             if app.page_offset > 0 {
                 ui.colored_label(

@@ -1,13 +1,18 @@
 use crate::app::ReadingMode;
 use crate::input::keybindings::KeyBindings;
+use crate::ui::layout::LayoutConfig;
+use crate::ui::theme::ThemePreset;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub reading_mode: ReadingMode,
     pub keybindings: KeyBindings,
+    pub theme: ThemePreset,
+    pub layout: LayoutConfig,
 }
 
 impl Default for Config {
@@ -15,6 +20,8 @@ impl Default for Config {
         Self {
             reading_mode: ReadingMode::LTR,
             keybindings: KeyBindings::default(),
+            theme: ThemePreset::default(),
+            layout: LayoutConfig::default(),
         }
     }
 }

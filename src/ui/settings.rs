@@ -1,5 +1,7 @@
 use crate::app::{ComicApp, ReadingMode};
 use crate::input::keybindings::{Action, Preset};
+use crate::ui::layout::LayoutConfig;
+use crate::ui::theme::ThemePreset;
 use egui::{Color32, Context};
 
 /// Draws the settings window (reading direction, key remapping, presets)
@@ -78,6 +80,46 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                     }
                 }
             });
+
+            ui.separator();
+            ui.heading("Theme");
+            ui.horizontal(|ui| {
+                for preset in ThemePreset::ALL {
+                    if ui.selectable_label(app.theme_preset == preset, preset.label()).clicked()
+                        && app.theme_preset != preset
+                    {
+                        app.theme_preset = preset;
+                        app.save_config();
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.heading("Layout");
+            let mut layout_changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Spine width");
+                layout_changed |= ui.add(egui::Slider::new(&mut app.layout.spine_width, 0.0..=6.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Spine opacity");
+                layout_changed |= ui.add(egui::Slider::new(&mut app.layout.spine_opacity, 0.0..=1.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Page gap");
+                layout_changed |= ui.add(egui::Slider::new(&mut app.layout.page_gap, 0.0..=80.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fade speed (ms)");
+                layout_changed |= ui.add(egui::Slider::new(&mut app.layout.fade_duration_ms, 50..=1000)).changed();
+            });
+            if ui.button("Reset layout to defaults").clicked() {
+                app.layout = LayoutConfig::default();
+                layout_changed = true;
+            }
+            if layout_changed {
+                app.save_config();
+            }
 
             ui.separator();
             if ui.button("Close").clicked() {

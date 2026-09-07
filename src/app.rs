@@ -1,13 +1,13 @@
 use crate::input::keybindings::{Action, KeyBindings};
 use crate::storage::config::Config;
+use crate::ui::layout::LayoutConfig;
+use crate::ui::theme::ThemePreset;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
 /// How long the header stays visible after the last mouse movement.
 pub const UI_HIDE_DELAY: Duration = Duration::from_secs(3);
-/// How long the fade in/out transition itself takes.
-pub const UI_FADE_DURATION: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingMode {
@@ -36,6 +36,8 @@ pub struct ComicApp {
     pub fullscreen: bool,
     pub fullscreen_dirty: bool,
     pub keybindings: KeyBindings,
+    pub theme_preset: ThemePreset,
+    pub layout: LayoutConfig,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -66,6 +68,8 @@ impl Default for ComicApp {
             fullscreen: false,
             fullscreen_dirty: false,
             keybindings: KeyBindings::default(),
+            theme_preset: ThemePreset::default(),
+            layout: LayoutConfig::default(),
             remapping_action: None,
             textures: HashMap::new(),
             loading: false,
@@ -89,16 +93,21 @@ impl ComicApp {
         if let Ok(config) = Config::load() {
             app.reading_mode = config.reading_mode;
             app.keybindings = config.keybindings;
+            app.theme_preset = config.theme;
+            app.layout = config.layout;
         }
         app
     }
 
-    /// Persists the current reading mode and keybindings. Failures are
-    /// logged, not surfaced — losing a settings save shouldn't interrupt reading.
+    /// Persists the current reading mode, keybindings, theme and layout.
+    /// Failures are logged, not surfaced — losing a settings save shouldn't
+    /// interrupt reading.
     pub fn save_config(&self) {
         let config = Config {
             reading_mode: self.reading_mode,
             keybindings: self.keybindings.clone(),
+            theme: self.theme_preset,
+            layout: self.layout.clone(),
         };
         if let Err(err) = config.save() {
             tracing::warn!("Failed to save config: {err}");
