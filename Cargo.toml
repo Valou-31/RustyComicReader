@@ -30,3 +30,6 @@ zip = "8.6.0"
 # Optimize dependencies while keeping our own crate's debug info/fast rebuilds.
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+strip = true
