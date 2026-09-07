@@ -1,18 +1,20 @@
+use crate::app::ReadingMode;
+use crate::input::keybindings::KeyBindings;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use anyhow::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub reading_mode: String,
-    pub keybindings: serde_json::Value,
+    pub reading_mode: ReadingMode,
+    pub keybindings: KeyBindings,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            reading_mode: "ltr".to_string(),
-            keybindings: serde_json::json!({}),
+            reading_mode: ReadingMode::LTR,
+            keybindings: KeyBindings::default(),
         }
     }
 }

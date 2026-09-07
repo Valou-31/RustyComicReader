@@ -18,11 +18,11 @@ Feature checklist derived from `README.md`, checked against the actual code in `
 
 ## ⌨️ Advanced Controls
 
-- [ ] Fully Remappable Keybindings — the data model and key-capture logic exist (`KeyBindings::add_key`, the remapping branch in `keyboard.rs`), but `remapping_action` is **never set anywhere in the codebase** — there is no button, menu, or panel that starts a remap. Completely unreachable from the running app.
-  - [x] Multiple keys per action (data model) — `HashMap<Action, Vec<String>>` supports it
-  - [ ] Configuration panel — `ui/settings.rs` is an empty file
-  - [ ] Persisted settings — see Persistence section below
-  - [ ] Recommended presets (left-hand, right-hand, dual-mode, numpad) — don't exist anywhere
+- [x] Fully Remappable Keybindings — `ui/settings.rs` (new) is a real settings window: "+ Add Key" sets `remapping_action`, the next physical key press (captured in `keyboard.rs`) binds it and exits remap mode automatically, `Escape` cancels a pending remap without binding anything. Removed the redundant `RemappingAction` enum (`Option<Action>` directly) and fixed `KeyBindings::add_key` to dedupe case-insensitively (pressing the same key twice for one action no longer creates duplicate chips in the UI).
+  - [x] Multiple keys per action — `HashMap<Action, Vec<String>>`, each shown as a removable chip with a "✕" button
+  - [x] Configuration panel — `ui/settings.rs::draw_settings`, opened via a "⚙ Settings" button in the header and on the empty-state screen
+  - [x] Persisted settings — see Persistence section below
+  - [x] Recommended presets (left-hand, right-hand, dual-mode, numpad) — `input/keybindings.rs::Preset`, one-click buttons in the settings panel; see that file for the exact key choices (numpad presets use `Num4/6/7/9` since egui doesn't distinguish numpad digits from the top row)
 - [x] Default Keybindings (arrows/WASD, `E`/`Q`) — match the README's table exactly
 - [x] Fullscreen key non-remappable — `F` is hardcoded in `keyboard.rs`, separate from the remap system (see Interface section for whether it actually does anything)
 
@@ -40,7 +40,7 @@ Feature checklist derived from `README.md`, checked against the actual code in `
 
 ## 💾 Persistence
 
-- [ ] Auto-Save Configuration (reading mode / keybindings / layout) — `storage/config.rs::Config` with `load()`/`save()` exists but is never called from anywhere (compiler: "never used"). Nothing survives a restart; `KeyBindings::default()` runs fresh every launch.
+- [x] Auto-Save Configuration (reading mode / keybindings) — `Config` now uses real typed fields (`ReadingMode`, `KeyBindings`) instead of `String`/`serde_json::Value`; `ComicApp::new()` loads it at startup (used from `main()` instead of `default()`) and `save_config()` writes it back on every reading-mode toggle and every keybinding change, verified with an actual save→reload round trip against `~/.config/comic-reader/config.json`. "Layout preferences" specifically aren't covered — that config doesn't exist yet (see Customization: Configurable Layout, still not done).
 - [x] 100% Local & Private — trivially true, no network code exists in the app
 
 ## Implemented but not in the README
@@ -71,8 +71,8 @@ These landed during this session and aren't reflected in the README's feature li
 |---|---|---|
 | Reading Experience | 5 / 5 | 0 |
 | Format Support | 3 / 3 | 0 |
-| Advanced Controls | 2 / 6 | 4 |
+| Advanced Controls | 6 / 6 | 0 |
 | Interface | 4 / 4 | 0 |
 | Customization | 0 / 2 | 2 |
-| Persistence | 1 / 2 | 1 |
+| Persistence | 2 / 2 | 0 |
 | Roadmap v2.1+ | 0 / 5 | 5 |

@@ -1,4 +1,6 @@
-use crate::input::keybindings::KeyBindings;
+use crate::input::keybindings::{Action, KeyBindings};
+use crate::storage::config::Config;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -7,7 +9,7 @@ pub const UI_HIDE_DELAY: Duration = Duration::from_secs(3);
 /// How long the fade in/out transition itself takes.
 pub const UI_FADE_DURATION: Duration = Duration::from_millis(300);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingMode {
     LTR, // Left-to-Right
     RTL, // Right-to-Left
@@ -22,14 +24,6 @@ impl ReadingMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RemappingAction {
-    NextSpread,
-    PrevSpread,
-    ShiftRight,
-    ShiftLeft,
-}
-
 pub struct ComicApp {
     pub pages: Vec<egui::ColorImage>,  // ✅ egui::ColorImage, pas image::ColorImage
     pub current_spread: usize,
@@ -42,7 +36,8 @@ pub struct ComicApp {
     pub fullscreen: bool,
     pub fullscreen_dirty: bool,
     pub keybindings: KeyBindings,
-    pub remapping_action: Option<RemappingAction>,
+    /// The action currently waiting for its next key press to be bound to it.
+    pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
     pub loading: bool,
     pub load_error: Option<String>,
@@ -86,6 +81,30 @@ impl Default for ComicApp {
 }
 
 impl ComicApp {
+    /// Like `default()`, but starts from whatever was last saved to disk
+    /// (reading mode, keybindings), falling back to defaults if there's
+    /// nothing saved yet or it can't be read.
+    pub fn new() -> Self {
+        let mut app = Self::default();
+        if let Ok(config) = Config::load() {
+            app.reading_mode = config.reading_mode;
+            app.keybindings = config.keybindings;
+        }
+        app
+    }
+
+    /// Persists the current reading mode and keybindings. Failures are
+    /// logged, not surfaced — losing a settings save shouldn't interrupt reading.
+    pub fn save_config(&self) {
+        let config = Config {
+            reading_mode: self.reading_mode,
+            keybindings: self.keybindings.clone(),
+        };
+        if let Err(err) = config.save() {
+            tracing::warn!("Failed to save config: {err}");
+        }
+    }
+
     /// Advances by exactly 2 pages from wherever the peek offset currently
     /// has us looking — not from the un-offset spread boundary — so a peek
     /// (`shift_right`/`shift_left`) carries forward instead of being discarded.
@@ -117,6 +136,7 @@ impl ComicApp {
             ReadingMode::RTL => ReadingMode::LTR,
         };
         self.page_offset = 0;
+        self.save_config();
     }
 
     /// Largest offset for which the spread's left page still stays in bounds.

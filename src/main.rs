@@ -14,7 +14,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Comic Reader",
         options,
-        Box::new(|_cc| Ok(Box::<ComicApp>::default())),
+        Box::new(|_cc| Ok(Box::new(ComicApp::new()))),
     )
 }
 
@@ -36,6 +36,7 @@ impl eframe::App for ComicApp {
         }
 
         input::keyboard::handle_keyboard(self, ui.ctx());
+        ui::settings::draw_settings(ui.ctx(), self);
 
         if !self.pages.is_empty() {
             let moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
@@ -102,6 +103,9 @@ impl eframe::App for ComicApp {
                 ui.add_space(8.0);
                 if ui.button(self.reading_mode.label()).clicked() {
                     self.toggle_reading_mode();
+                }
+                if ui.button("⚙ Settings").clicked() {
+                    self.show_settings = true;
                 }
             });
         } else {

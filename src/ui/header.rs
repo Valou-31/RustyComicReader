@@ -37,6 +37,9 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
             if ui.button(app.reading_mode.label()).clicked() {
                 app.toggle_reading_mode();
             }
+            if ui.button("⚙ Settings").clicked() {
+                app.show_settings = true;
+            }
         });
 
         ui.separator();
