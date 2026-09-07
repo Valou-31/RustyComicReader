@@ -12,6 +12,8 @@ egui = "0.36.1"
 egui-winit = "0.36.1"
 egui_extras = "0.36.1"
 image = "0.25.10"
+pollster = "1.0.1"
+rfd = "0.17.2"
 serde = "1.0.229"
 serde_json = "1.0.151"
 sevenz-rust = "0.6.1"
@@ -22,3 +24,9 @@ tracing-subscriber = "0.3.23"
 unrar = "0.5.8"
 walkdir = "2.5.0"
 zip = "8.6.0"
+
+# Image decoding (jpeg-decoder, sevenz-rust, etc.) is unusably slow without
+# optimizations — a single archive load took 70-90s in plain debug mode.
+# Optimize dependencies while keeping our own crate's debug info/fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 3

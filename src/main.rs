@@ -5,8 +5,8 @@ mod comic;
 mod storage;
 mod state;
 
+use app::{ComicApp, UI_FADE_DURATION, UI_HIDE_DELAY};
 use eframe::egui;
-use app::ComicApp;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
@@ -20,7 +20,93 @@ fn main() -> Result<(), eframe::Error> {
 
 impl eframe::App for ComicApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {  // ✅ Changé : &mut Ui au lieu de Context
-        ui.heading("🎯 Comic Reader v2.0");
-        ui.label("Chargez un fichier pour commencer");
+        self.poll_loading();
+        if self.loading {
+            ui.ctx().request_repaint();
+        }
+        if self.title_dirty {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
+            self.title_dirty = false;
+        }
+        if self.fullscreen_dirty {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            self.fullscreen_dirty = false;
+        }
+
+        input::keyboard::handle_keyboard(self, ui.ctx());
+
+        if !self.pages.is_empty() {
+            let moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+            if moved {
+                self.last_mouse_move = std::time::Instant::now();
+            }
+
+            // Keep repainting while the header is due to hide or mid-fade;
+            // once it's settled (fully shown or fully hidden) stop, and let
+            // the next real mouse-move event wake the loop back up.
+            let idle_for = self.idle_time();
+            if idle_for < UI_HIDE_DELAY {
+                ui.ctx().request_repaint_after(UI_HIDE_DELAY - idle_for);
+            } else if idle_for < UI_HIDE_DELAY + UI_FADE_DURATION {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if self.loading {
+            if let Some(image) = self.load_preview.take() {
+                self.preview_texture =
+                    Some(ui.ctx().load_texture("loading_preview", image, egui::TextureOptions::LINEAR));
+            }
+
+            let available_height = ui.available_height();
+            ui.vertical_centered(|ui| {
+                ui.add_space((available_height * 0.5 - 90.0).max(0.0));
+
+                if let Some(texture) = &self.preview_texture {
+                    ui.add(
+                        egui::Image::new(texture)
+                            .max_size(egui::vec2(220.0, 300.0))
+                            .shrink_to_fit(),
+                    );
+                } else {
+                    ui.add(egui::Spinner::new().size(32.0));
+                }
+                ui.add_space(8.0);
+
+                let (loaded, total) = self.load_progress;
+                if total > 0 {
+                    let fraction = loaded as f32 / total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(220.0)
+                            .text(format!("{loaded} / {total}")),
+                    );
+                } else {
+                    ui.label("Chargement...");
+                }
+            });
+        } else if self.pages.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.heading("🎯 Comic Reader v2.0");
+
+                if let Some(error) = &self.load_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
+                }
+                ui.label("Chargez un fichier pour commencer");
+                if ui.button("Load File").clicked() {
+                    self.start_loading_file();
+                }
+                ui.add_space(8.0);
+                if ui.button(self.reading_mode.label()).clicked() {
+                    self.toggle_reading_mode();
+                }
+            });
+        } else {
+            ui::header::draw_header(ui, self);
+            ui::reader::draw_double_page(ui, self);
+        }
     }
 }

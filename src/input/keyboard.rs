@@ -32,8 +32,8 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
                     match action {
                         Action::NextSpread => app.next_spread(),
                         Action::PrevSpread => app.prev_spread(),
-                        Action::ShiftRight => app.page_offset += 1,
-                        Action::ShiftLeft => app.page_offset -= 1,
+                        Action::ShiftRight => app.shift_right(),
+                        Action::ShiftLeft => app.shift_left(),
                     }
                 }
             }
@@ -43,5 +43,6 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
     // Plein écran
     if ctx.input(|i| i.key_pressed(egui::Key::F)) {
         app.fullscreen = !app.fullscreen;
+        app.fullscreen_dirty = true;
     }
 }
