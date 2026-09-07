@@ -293,14 +293,14 @@ brew install openssl pkg-config
 
 ## 🎯 Roadmap
 
-### v2.0 (Current)
+### Implemented
 - ✅ Dual-page display
 - ✅ LTR/RTL modes
 - ✅ Remappable keybindings
 - ✅ Full archive support
 - ✅ Auto-hide UI
 
-### v2.1+
+### Planned
 - 🔲 Custom zoom
 - 🔲 Image rotation
 - 🔲 Bookmarks
@@ -334,4 +334,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-**Comic Reader v2.0 - Modern Desktop Comic Reading Experience** 📖✨
+**Comic Reader - Modern Desktop Comic Reading Experience** 📖✨

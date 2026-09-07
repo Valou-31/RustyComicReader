@@ -51,7 +51,7 @@ These landed during this session and aren't reflected in the README's feature li
 - [x] Loading progress bar (`loaded / total` pages) with a live preview of the first decoded page
 - [x] Window title updates to the loaded filename
 
-## Roadmap v2.1+ (from README, still all pending)
+## Roadmap (from README, still all pending)
 
 - [ ] Custom zoom
 - [ ] Image rotation
@@ -75,4 +75,4 @@ These landed during this session and aren't reflected in the README's feature li
 | Interface | 4 / 4 | 0 |
 | Customization | 0 / 2 | 2 |
 | Persistence | 2 / 2 | 0 |
-| Roadmap v2.1+ | 0 / 5 | 5 |
+| Roadmap | 0 / 5 | 5 |
