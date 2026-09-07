@@ -1,6 +1,6 @@
 # 📖 Comic Reader
 
-A desktop comic reader built with Rust and egui — dual-page spreads, remappable keybindings, and a local-only, no-server reading experience.
+A desktop comic reader built with Rust and egui — dual-page spreads, remappable keybindings.
 
 ## Features
 
