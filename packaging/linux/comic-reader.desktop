@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Comic Reader
+Comment=Dual-page comic book reader
+Exec=__EXEC_PATH__
+Icon=comic-reader
+Terminal=false
+Categories=Graphics;Viewer;
+StartupWMClass=comic-reader

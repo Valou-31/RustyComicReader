@@ -17,13 +17,13 @@ jobs:
         include:
           - os: ubuntu-latest
             binary_name: rusty_comic_reader
-            asset_name: comic-reader-linux-x86_64
+            asset_name: comic-reader-linux-x86_64.tar.gz
           - os: windows-latest
             binary_name: rusty_comic_reader.exe
             asset_name: comic-reader-windows-x86_64.exe
           - os: macos-latest
             binary_name: rusty_comic_reader
-            asset_name: comic-reader-macos-arm64
+            asset_name: comic-reader-macos-arm64.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -47,10 +47,60 @@ jobs:
         run: cargo build --release
 
       - name: Stage binary
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           mkdir dist
           cp "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Stage Linux bundle
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STAGE=dist/comic-reader
+          mkdir -p dist "$STAGE"
+
+          cp "target/release/${{ matrix.binary_name }}" "$STAGE/${{ matrix.binary_name }}"
+          cp packaging/linux/comic-reader.desktop "$STAGE/"
+          cp packaging/linux/comic-reader.png "$STAGE/"
+          cp packaging/linux/install.sh "$STAGE/"
+          chmod +x "$STAGE/${{ matrix.binary_name }}" "$STAGE/install.sh"
+
+          tar -C dist -czf "dist/${{ matrix.asset_name }}" comic-reader
+
+      - name: Stage macOS app bundle
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="dist/Comic Reader.app"
+          mkdir -p dist "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp "target/release/${{ matrix.binary_name }}" "$APP/Contents/MacOS/${{ matrix.binary_name }}"
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="0.0.0-dev"
+          sed "s/APP_VERSION/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          # Build icon.icns from the embedded 256x256 source icon.
+          ICONSET=dist/icon.iconset
+          mkdir -p "$ICONSET"
+          sips -s format png -z 16 16   src/logo.ico --out "$ICONSET/icon_16x16.png"
+          sips -s format png -z 32 32   src/logo.ico --out "$ICONSET/icon_16x16@2x.png"
+          sips -s format png -z 32 32   src/logo.ico --out "$ICONSET/icon_32x32.png"
+          sips -s format png -z 64 64   src/logo.ico --out "$ICONSET/icon_32x32@2x.png"
+          sips -s format png -z 128 128 src/logo.ico --out "$ICONSET/icon_128x128.png"
+          sips -s format png -z 256 256 src/logo.ico --out "$ICONSET/icon_128x128@2x.png"
+          sips -s format png -z 256 256 src/logo.ico --out "$ICONSET/icon_256x256.png"
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
+          rm -rf "$ICONSET"
+
+          chmod +x "$APP/Contents/MacOS/${{ matrix.binary_name }}"
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.asset_name }}"
 
       - uses: actions/upload-artifact@v4
         with:
