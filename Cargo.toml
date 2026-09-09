@@ -25,6 +25,9 @@ unrar = "0.5.8"
 walkdir = "2.5.0"
 zip = "8.6.0"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 # Image decoding (jpeg-decoder, sevenz-rust, etc.) is unusably slow without
 # optimizations — a single archive load took 70-90s in plain debug mode.
 # Optimize dependencies while keeping our own crate's debug info/fast rebuilds.
