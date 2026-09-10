@@ -100,6 +100,11 @@ jobs:
 
           chmod +x "$APP/Contents/MacOS/${{ matrix.binary_name }}"
 
+          # Ad-hoc sign so Gatekeeper reports the normal "unidentified
+          # developer" prompt instead of "app is damaged" on Apple Silicon,
+          # which requires every executable to carry at least a signature.
+          codesign --force --deep -s - "$APP"
+
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.asset_name }}"
 
       - uses: actions/upload-artifact@v4
