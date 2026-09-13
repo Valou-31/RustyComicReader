@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  shared-mime-info package declaring the comic-specific archive extensions
+  Comic Reader can register itself as the default handler for. .zip/.7z/.rar
+  deliberately aren't declared here — those already have system MIME types
+  owned by whatever general-purpose archive tool the user has, and Comic
+  Reader shouldn't hijack them.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+    <mime-type type="application/x-cbz">
+        <comment>Comic Book Archive (CBZ)</comment>
+        <glob pattern="*.cbz"/>
+        <sub-class-of type="application/zip"/>
+    </mime-type>
+    <mime-type type="application/x-cb7">
+        <comment>Comic Book Archive (CB7)</comment>
+        <glob pattern="*.cb7"/>
+        <sub-class-of type="application/x-7z-compressed"/>
+    </mime-type>
+    <mime-type type="application/x-cbr">
+        <comment>Comic Book Archive (CBR)</comment>
+        <glob pattern="*.cbr"/>
+        <sub-class-of type="application/vnd.rar"/>
+    </mime-type>
+</mime-info>

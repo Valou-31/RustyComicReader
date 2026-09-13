@@ -108,6 +108,24 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             }
 
             ui.separator();
+            ui.heading("Session");
+            if ui
+                .checkbox(&mut app.resume_last_session, "Reopen the last book on startup")
+                .changed()
+            {
+                app.save_config();
+            }
+            #[cfg(windows)]
+            if ui.button("Set as default comic reader").clicked() {
+                if let Err(err) = crate::platform::windows::register_as_default() {
+                    tracing::warn!("Failed to register as default app: {err}");
+                }
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "ms-settings:defaultapps"])
+                    .spawn();
+            }
+
+            ui.separator();
             ui.heading("Layout");
             let mut layout_changed = false;
             ui.horizontal(|ui| {

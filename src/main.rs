@@ -6,9 +6,11 @@ mod ui;
 mod comic;
 mod storage;
 mod state;
+mod platform;
 
 use app::{ComicApp, UI_HIDE_DELAY};
 use eframe::egui;
+use std::path::PathBuf;
 
 const LOGO_BYTES: &[u8] = include_bytes!("logo.ico");
 
@@ -20,6 +22,22 @@ fn load_logo_rgba() -> (Vec<u8>, u32, u32) {
         .into_rgba8();
     let (width, height) = (image.width(), image.height());
     (image.into_raw(), width, height)
+}
+
+/// Command-line arguments that look like a comic archive we can open —
+/// how the OS hands us a file on double-click/"Open With" on Windows and
+/// Linux (`%1`/`%f` in the registry/.desktop entry become plain argv).
+fn opened_files() -> Vec<PathBuf> {
+    std::env::args()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| comic::loader::SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -34,10 +52,14 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
+    let files = opened_files();
     eframe::run_native(
         "Comic Reader",
         options,
-        Box::new(|_cc| Ok(Box::new(ComicApp::new()))),
+        Box::new(move |_cc| {
+            let app = if files.is_empty() { ComicApp::new() } else { ComicApp::new_with_files(files) };
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -48,8 +70,10 @@ impl eframe::App for ComicApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {  // ✅ Changé : &mut Ui au lieu de Context
         self.theme_preset.theme().apply(ui.ctx());
+        self.poll_picking();
         self.poll_loading();
         self.poll_decoded_pages(ui.ctx());
+        self.poll_history_save();
         if self.loading {
             ui.ctx().request_repaint();
         }
@@ -66,6 +90,7 @@ impl eframe::App for ComicApp {
 
         input::keyboard::handle_keyboard(self, ui.ctx());
         ui::settings::draw_settings(ui.ctx(), self);
+        ui::history::draw_history(ui.ctx(), self);
 
         if !self.pages.is_empty() {
             let moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
@@ -146,10 +171,19 @@ impl eframe::App for ComicApp {
                 if ui.button("⚙ Settings").clicked() {
                     self.show_settings = true;
                 }
+                if ui.button("🕘 History").clicked() {
+                    self.show_history = true;
+                }
             });
         } else {
             ui::header::draw_header(ui, self);
             ui::reader::draw_double_page(ui, self);
         }
+    }
+
+    /// Makes sure the last reading position is on disk even if the debounced
+    /// periodic save (`poll_history_save`) hasn't fired yet.
+    fn on_exit(&mut self) {
+        self.flush_history();
     }
 }

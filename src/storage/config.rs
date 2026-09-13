@@ -14,6 +14,7 @@ pub struct Config {
     pub theme: ThemePreset,
     pub layout: LayoutConfig,
     pub downscale_large_pages: bool,
+    pub resume_last_session: bool,
 }
 
 impl Default for Config {
@@ -24,6 +25,7 @@ impl Default for Config {
             theme: ThemePreset::default(),
             layout: LayoutConfig::default(),
             downscale_large_pages: true,
+            resume_last_session: true,
         }
     }
 }

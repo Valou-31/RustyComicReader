@@ -2,8 +2,9 @@
 Type=Application
 Name=Comic Reader
 Comment=Dual-page comic book reader
-Exec=__EXEC_PATH__
+Exec=__EXEC_PATH__ %f
 Icon=comic-reader
 Terminal=false
 Categories=Graphics;Viewer;
 StartupWMClass=comic-reader
+MimeType=application/x-cbz;application/x-cb7;application/x-cbr;

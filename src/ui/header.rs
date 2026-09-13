@@ -35,11 +35,17 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
             if ui.button("Load File").clicked() {
                 app.start_loading_file();
             }
+            if !app.file_queue.is_empty() && ui.button(format!("▶ Next ({})", app.file_queue.len())).clicked() {
+                app.open_next_in_queue();
+            }
             if ui.button(app.reading_mode.label()).clicked() {
                 app.toggle_reading_mode();
             }
             if ui.button("⚙ Settings").clicked() {
                 app.show_settings = true;
+            }
+            if ui.button("🕘 History").clicked() {
+                app.show_history = true;
             }
         });
 

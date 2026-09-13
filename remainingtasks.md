@@ -35,13 +35,24 @@ Feature checklist derived from `README.md`, checked against the actual code in `
 
 ## 🎨 Customization
 
-- [ ] Theme System — `ui/theme.rs::Theme` defines a full color palette but is never constructed or applied to any widget (compiler: "struct `Theme` is never constructed"). The app renders with egui's default look.
-- [ ] Configurable Layout (separator width/opacity, spacing, transition speed) — `reader.rs` uses a plain `ui.separator()` with no configuration surface at all
+- [x] Theme System — `ui/theme.rs::Theme` + `ThemePreset` (Dark/Light/Midnight/Sepia), applied every frame via `Theme::apply()` in `main.rs:50` and `clear_color()`; picker lives in the settings panel. Visually verified by launching the app and pixel-sampling screenshots across all four presets — window/panel fill colors match the theme definitions exactly.
+- [x] Configurable Layout (separator width/opacity, spacing, transition speed) — settings panel exposes spine width/opacity, page gap, and fade speed sliders wired into `reader.rs`, with a "Reset layout to defaults" button
 
 ## 💾 Persistence
 
 - [x] Auto-Save Configuration (reading mode / keybindings) — `Config` now uses real typed fields (`ReadingMode`, `KeyBindings`) instead of `String`/`serde_json::Value`; `ComicApp::new()` loads it at startup (used from `main()` instead of `default()`) and `save_config()` writes it back on every reading-mode toggle and every keybinding change, verified with an actual save→reload round trip against `~/.config/comic-reader/config.json`. "Layout preferences" specifically aren't covered — that config doesn't exist yet (see Customization: Configurable Layout, still not done).
 - [x] 100% Local & Private — trivially true, no network code exists in the app
+- [x] Reading History — `storage/history.rs::History`, persisted to `history.json` alongside `config.json`; a "🕘 History" window (`ui/history.rs`) lists every book with its saved page, reopens on click, and lets an entry be removed. Updated on load, debounced (5s) during navigation, and flushed unconditionally on `on_exit`. Verified end-to-end: opened two real archives, navigated, quit, and confirmed the on-disk JSON matched.
+- [x] Resume Previous Session — `ComicApp::new()` reopens the most-recently-read book (if `resume_last_session` is on, toggle in Settings → Session, default on) at its saved page. Verified by quitting mid-book and relaunching with no arguments: reopened the same archive at the exact saved spread.
+- [x] Multi-File Queue — the file picker is multi-select (`rfd::pick_files`); every pick after the first goes into `ComicApp::file_queue`, and a "▶ Next (N)" button appears in the header to advance to it. Verified by launching with two archive paths and clicking through.
+
+## 🔗 System Integration
+
+- [x] Default app for `.cbz`/`.cb7`/`.cbr` — deliberately **not** `.zip`/`.7z`/`.rar`, which stay pointed at whatever the user already has for generic archives.
+  - CLI-arg opening (`main.rs::opened_files`) — verified: `./rusty_comic_reader some.cbz` opens directly into that book.
+  - Linux: `.desktop` `MimeType=`, a shared-mime-info package (`packaging/linux/comic-reader-mime.xml`) since these aren't standard system MIME types, and `install.sh` now runs `xdg-mime default` — not runnable on this dev machine, so unverified in practice.
+  - Windows: `platform::windows::register_as_default` (behind a Settings button) writes the `HKCU\Software\RegisteredApplications` capability pattern Microsoft requires since Win8 blocked silent `UserChoice` writes, then opens `ms-settings:defaultapps`. Code checked against the real `winreg` 0.56 API but not runnable on this dev machine — unverified in practice.
+  - macOS: **known gap.** `Info.plist` now declares the UTIs so Finder's "Open With" lists Comic Reader at all, but double-click/"Open With" launches via an Apple Event (`kAEOpenDocuments`) that this winit-based app doesn't handle — confirmed empirically by building the real `.app` bundle and running `open -a "Comic Reader.app" file.cbz`: the app launched to the empty-state screen, no file received. `open` from a Terminal already inside the bundle (`./Comic\ Reader.app/Contents/MacOS/rusty_comic_reader file.cbz`) works fine, same as any CLI launch. Closing this gap needs an `objc2`/`objc2-app-kit` Apple Event handler — not implemented.
 
 ## Implemented but not in the README
 
@@ -50,14 +61,6 @@ These landed during this session and aren't reflected in the README's feature li
 - [x] Native "Load File" picker (`rfd`), decoding on a background thread so the UI never blocks
 - [x] Loading progress bar (`loaded / total` pages) with a live preview of the first decoded page
 - [x] Window title updates to the loaded filename
-
-## Roadmap (from README, still all pending)
-
-- [ ] Custom zoom
-- [ ] Image rotation
-- [ ] Bookmarks
-- [ ] Reading history
-- [ ] Thumbnail gallery
 
 ## Also worth knowing (not features, but affects anyone acting on this file)
 
@@ -73,6 +76,5 @@ These landed during this session and aren't reflected in the README's feature li
 | Format Support | 3 / 3 | 0 |
 | Advanced Controls | 6 / 6 | 0 |
 | Interface | 4 / 4 | 0 |
-| Customization | 0 / 2 | 2 |
+| Customization | 2 / 2 | 0 |
 | Persistence | 2 / 2 | 0 |
-| Roadmap | 0 / 5 | 5 |

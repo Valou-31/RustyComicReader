@@ -26,5 +26,80 @@
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Comic Reader</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Comic Book Archive (CBZ)</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.rustycomicreader.cbz</string></array>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Comic Book Archive (CB7)</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.rustycomicreader.cb7</string></array>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Comic Book Archive (CBR)</string>
+            <key>LSItemContentTypes</key>
+            <array><string>com.rustycomicreader.cbr</string></array>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.rustycomicreader.cbz</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book Archive (CBZ)</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>cbz</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.rustycomicreader.cb7</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book Archive (CB7)</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>cb7</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.rustycomicreader.cbr</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book Archive (CBR)</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>cbr</string></array>
+            </dict>
+        </dict>
+    </array>
 </dict>
 </plist>

@@ -65,6 +65,7 @@ jobs:
           cp "target/release/${{ matrix.binary_name }}" "$STAGE/${{ matrix.binary_name }}"
           cp packaging/linux/comic-reader.desktop "$STAGE/"
           cp packaging/linux/comic-reader.png "$STAGE/"
+          cp packaging/linux/comic-reader-mime.xml "$STAGE/"
           cp packaging/linux/install.sh "$STAGE/"
           chmod +x "$STAGE/${{ matrix.binary_name }}" "$STAGE/install.sh"
 
