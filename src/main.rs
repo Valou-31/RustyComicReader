@@ -49,6 +49,7 @@ impl eframe::App for ComicApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {  // ✅ Changé : &mut Ui au lieu de Context
         self.theme_preset.theme().apply(ui.ctx());
         self.poll_loading();
+        self.poll_decoded_pages(ui.ctx());
         if self.loading {
             ui.ctx().request_repaint();
         }

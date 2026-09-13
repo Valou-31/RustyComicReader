@@ -4,10 +4,10 @@ use egui::{Align, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui
 use std::collections::HashMap;
 
 /// How many pages beyond the currently displayed spread keep their decoded
-/// texture resident (in each direction), so flipping back and forth a page
-/// or two feels instant without redecoding. Anything further out is evicted
-/// — see `prune_distant_textures` — so memory stays bounded regardless of
-/// how long the book is.
+/// texture resident (in each direction) — also how far ahead/behind pages
+/// get prefetched. Close enough to flip back and forth a page or two
+/// instantly; anything further out is evicted (see `spread_window`), so
+/// memory stays bounded regardless of how long the book is.
 const TEXTURE_KEEP_RADIUS: usize = 4;
 
 pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
@@ -23,8 +23,12 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     let left_page = app.left_page();
     let right_page = app.right_page();
 
-    prune_distant_textures(&mut app.textures, [left_page, right_page].into_iter().flatten());
+    if let Some((low, high)) = spread_window([left_page, right_page].into_iter().flatten()) {
+        app.textures.retain(|&page_idx, _| (low..=high).contains(&page_idx));
+        app.request_prefetch(low, high);
+    }
 
+    let max_dimension = app.decode_max_dimension();
     let pages = &app.pages;
     let textures = &mut app.textures;
 
@@ -32,8 +36,8 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     // flush against the left edge of its — both meet at `mid_x` (or the
     // configured gap around it), so the spread reads as one continuous book
     // opening rather than two independently centered pages with a gap.
-    draw_page_slot(ui, left_column, Align::Max, left_page.and_then(|idx| pages.get(idx).map(|data| (idx, data.as_slice()))), textures);
-    draw_page_slot(ui, right_column, Align::Min, right_page.and_then(|idx| pages.get(idx).map(|data| (idx, data.as_slice()))), textures);
+    draw_page_slot(ui, left_column, Align::Max, left_page.and_then(|idx| pages.get(idx).map(|data| (idx, data.as_slice()))), textures, max_dimension);
+    draw_page_slot(ui, right_column, Align::Min, right_page.and_then(|idx| pages.get(idx).map(|data| (idx, data.as_slice()))), textures, max_dimension);
 
     if app.layout.spine_width > 0.0 {
         let separator = app.theme_preset.theme().separator;
@@ -59,6 +63,7 @@ fn draw_page_slot(
     align: Align,
     page: Option<(usize, &[u8])>,
     textures: &mut HashMap<usize, TextureHandle>,
+    max_dimension: Option<u32>,
 ) {
     let Some((page_idx, data)) = page else {
         return;
@@ -67,10 +72,12 @@ fn draw_page_slot(
     let texture = match textures.entry(page_idx) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
-            // Decoded here, on demand, instead of up front for the whole
-            // archive — this is the only point where a page's raw pixels
-            // briefly exist in memory before being handed to the GPU.
-            let image = match ComicArchive::decode_image(data) {
+            // Only reached when the background prefetch (see
+            // `ComicApp::request_prefetch`) hasn't produced this page's
+            // texture yet — e.g. right after opening a file, or a jump to a
+            // spread outside the prefetch window. Decoding here blocks this
+            // frame, but it's the exception rather than the rule.
+            let image = match ComicArchive::decode_image(data, max_dimension) {
                 Ok(image) => image,
                 Err(err) => {
                     tracing::warn!("Failed to decode page {page_idx}: {err}");
@@ -91,20 +98,18 @@ fn draw_page_slot(
     egui::Image::new(&*texture).paint_at(ui, image_rect);
 }
 
-/// Drops textures for any page further than `TEXTURE_KEEP_RADIUS` from the
-/// currently displayed pages. Dropping a `TextureHandle` frees its GPU
-/// allocation, so without this the texture cache would grow for as long as
-/// the book is, holding every page ever viewed in VRAM at once.
-fn prune_distant_textures(textures: &mut HashMap<usize, TextureHandle>, current_pages: impl Iterator<Item = usize>) {
+/// The page-index window (inclusive) within `TEXTURE_KEEP_RADIUS` of the
+/// currently displayed pages — used both to decide which textures to evict
+/// and which pages to prefetch, so the two stay in sync by construction.
+/// `None` when there's nothing currently displayed.
+fn spread_window(current_pages: impl Iterator<Item = usize>) -> Option<(usize, usize)> {
     let (min_page, max_page) = current_pages.fold((usize::MAX, 0usize), |(min, max), page| {
         (min.min(page), max.max(page))
     });
     if min_page > max_page {
-        return;
+        return None;
     }
-    let low = min_page.saturating_sub(TEXTURE_KEEP_RADIUS);
-    let high = max_page + TEXTURE_KEEP_RADIUS;
-    textures.retain(|&page_idx, _| (low..=high).contains(&page_idx));
+    Some((min_page.saturating_sub(TEXTURE_KEEP_RADIUS), max_page + TEXTURE_KEEP_RADIUS))
 }
 
 /// Scales `size` so its height exactly matches `height`, preserving aspect

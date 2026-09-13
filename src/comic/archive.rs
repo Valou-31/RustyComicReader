@@ -51,7 +51,7 @@ impl ComicArchive {
                 if !Self::looks_like_image(&data) {
                     continue;
                 }
-                let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
                 images.push((file.name().to_string(), data));
                 on_progress(images.len(), total, preview.as_ref());
             }
@@ -80,7 +80,7 @@ impl ComicArchive {
                     let mut data = Vec::new();
                     reader.read_to_end(&mut data)?;
                     if Self::looks_like_image(&data) {
-                        let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                        let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
                         images.push((entry.name().to_string(), data));
                         on_progress(images.len(), total, preview.as_ref());
                     }
@@ -123,7 +123,7 @@ impl ComicArchive {
                     .read()
                     .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
                 if Self::looks_like_image(&data) {
-                    let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                    let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
                     images.push((name, data));
                     on_progress(images.len(), total, preview.as_ref());
                 }
@@ -160,8 +160,18 @@ impl ComicArchive {
     /// right before a page's texture is uploaded — not for the whole archive
     /// up front — so decoded (and GPU-uploaded) pages never outnumber the
     /// handful actually near the current spread.
-    pub(crate) fn decode_image(data: &[u8]) -> anyhow::Result<egui::ColorImage> {
-        let img = image::load_from_memory(data)?;
+    ///
+    /// `max_dimension`, when set, downscales the image so neither side
+    /// exceeds it (aspect ratio preserved) — trades a little sharpness on
+    /// very high-res scans for a lot less RAM/VRAM per page.
+    pub(crate) fn decode_image(data: &[u8], max_dimension: Option<u32>) -> anyhow::Result<egui::ColorImage> {
+        let mut img = image::load_from_memory(data)?;
+
+        if let Some(max_dimension) = max_dimension
+            && img.width().max(img.height()) > max_dimension
+        {
+            img = img.resize(max_dimension, max_dimension, image::imageops::FilterType::Triangle);
+        }
 
         let rgba = img.to_rgba8();
         Ok(egui::ColorImage::from_rgba_unmultiplied(

@@ -13,6 +13,7 @@ pub struct Config {
     pub keybindings: KeyBindings,
     pub theme: ThemePreset,
     pub layout: LayoutConfig,
+    pub downscale_large_pages: bool,
 }
 
 impl Default for Config {
@@ -22,6 +23,7 @@ impl Default for Config {
             keybindings: KeyBindings::default(),
             theme: ThemePreset::default(),
             layout: LayoutConfig::default(),
+            downscale_large_pages: true,
         }
     }
 }

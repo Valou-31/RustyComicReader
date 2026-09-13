@@ -1,4 +1,4 @@
-use crate::app::{ComicApp, ReadingMode};
+use crate::app::{ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode};
 use crate::input::keybindings::{Action, Preset};
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
@@ -92,6 +92,20 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                     }
                 }
             });
+
+            ui.separator();
+            ui.heading("Performance");
+            if ui
+                .checkbox(&mut app.downscale_large_pages, "Downscale large pages to save memory")
+                .on_hover_text(format!(
+                    "Caps decoded pages at {DOWNSCALE_MAX_DIMENSION}px on the longest side. \
+                     Lower RAM/VRAM use, slight loss of sharpness on very high-res scans."
+                ))
+                .changed()
+            {
+                app.textures.clear();
+                app.save_config();
+            }
 
             ui.separator();
             ui.heading("Layout");
