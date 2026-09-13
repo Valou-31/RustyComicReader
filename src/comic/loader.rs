@@ -3,7 +3,9 @@ use std::sync::mpsc::Receiver;
 
 pub struct LoadResult {
     pub filename: String,
-    pub pages: Vec<egui::ColorImage>,
+    /// Each page's original compressed bytes, in reading order — decoded
+    /// lazily by the UI as pages come into view.
+    pub pages: Vec<Vec<u8>>,
 }
 
 pub enum LoadEvent {
@@ -41,15 +43,8 @@ pub fn spawn_file_picker() -> Receiver<LoadEvent> {
             .unwrap_or_else(|| "Fichier inconnu".to_string());
 
         let progress_tx = tx.clone();
-        let mut first_page_sent = false;
-        let on_progress = move |loaded: usize, total: usize, image: &egui::ColorImage| {
-            let first_page = if first_page_sent {
-                None
-            } else {
-                first_page_sent = true;
-                Some(image.clone())
-            };
-            let _ = progress_tx.send(LoadEvent::Progress { loaded, total, first_page });
+        let on_progress = move |loaded: usize, total: usize, preview: Option<&egui::ColorImage>| {
+            let _ = progress_tx.send(LoadEvent::Progress { loaded, total, first_page: preview.cloned() });
         };
 
         let event = match pollster::block_on(ComicArchive::load(&path, on_progress)) {

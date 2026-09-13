@@ -1,16 +1,28 @@
 use anyhow::Result;
 use std::path::Path;
 
+/// An opened comic archive. Pages are kept as their original *compressed*
+/// bytes (a few hundred KB each, typically) rather than decoded pixels —
+/// decoding every page up front would mean holding the whole book as raw
+/// RGBA in memory (tens of MB per page) even though only a couple of pages
+/// are ever on screen at once. Callers decode a page (via `decode_image`)
+/// only when they're about to display it.
 pub struct ComicArchive {
-    pub pages: Vec<egui::ColorImage>,
+    pub pages: Vec<Vec<u8>>,
 }
 
-/// Called after each page is decoded, in archive order (not final reading
+/// Called after each page is extracted, in archive order (not final reading
 /// order — that's only known once every entry has been read and sorted).
-type ProgressFn<'a> = dyn FnMut(usize, usize, &egui::ColorImage) + 'a;
+/// Carries a decoded preview image only for the very first entry (so the UI
+/// has something to show while the rest of the archive is still extracting);
+/// `None` for every entry after that.
+type ProgressFn<'a> = dyn FnMut(usize, usize, Option<&egui::ColorImage>) + 'a;
 
 impl ComicArchive {
-    pub async fn load(path: &Path, mut on_progress: impl FnMut(usize, usize, &egui::ColorImage)) -> Result<Self> {
+    pub async fn load(
+        path: &Path,
+        mut on_progress: impl FnMut(usize, usize, Option<&egui::ColorImage>),
+    ) -> Result<Self> {
         let extension = path.extension().unwrap_or_default().to_str().unwrap_or("").to_lowercase();
 
         let pages = match extension.as_str() {
@@ -21,11 +33,11 @@ impl ComicArchive {
         };
 
         Ok(ComicArchive {
-            pages: Self::sort_and_filter_images(pages),
+            pages: Self::sort_and_filter(pages),
         })
     }
 
-    async fn load_zip(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, egui::ColorImage)>> {
+    async fn load_zip(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
         let file = std::fs::File::open(path)?;
         let mut archive = zip::ZipArchive::new(file)?;
         let total = archive.file_names().filter(|n| Self::is_image_file(n)).count();
@@ -36,17 +48,19 @@ impl ComicArchive {
             if Self::is_image_file(&file.name()) {
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)?;
-                if let Ok(img) = Self::decode_image(&data) {
-                    images.push((file.name().to_string(), img));
-                    on_progress(images.len(), total, &images.last().unwrap().1);
+                if !Self::looks_like_image(&data) {
+                    continue;
                 }
+                let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                images.push((file.name().to_string(), data));
+                on_progress(images.len(), total, preview.as_ref());
             }
         }
 
         Ok(images)
     }
 
-    async fn load_7z(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, egui::ColorImage)>> {
+    async fn load_7z(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mut archive = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
@@ -65,9 +79,10 @@ impl ComicArchive {
                 if !entry.is_directory() && Self::is_image_file(entry.name()) {
                     let mut data = Vec::new();
                     reader.read_to_end(&mut data)?;
-                    if let Ok(img) = Self::decode_image(&data) {
-                        images.push((entry.name().to_string(), img));
-                        on_progress(images.len(), total, &images.last().unwrap().1);
+                    if Self::looks_like_image(&data) {
+                        let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                        images.push((entry.name().to_string(), data));
+                        on_progress(images.len(), total, preview.as_ref());
                     }
                 }
                 Ok(true)
@@ -77,7 +92,7 @@ impl ComicArchive {
         Ok(images)
     }
 
-    async fn load_rar(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, egui::ColorImage)>> {
+    async fn load_rar(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
         let total = unrar::Archive::new(path)
             .open_for_listing()
             .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?
@@ -107,9 +122,10 @@ impl ComicArchive {
                 let (data, next) = file
                     .read()
                     .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
-                if let Ok(img) = Self::decode_image(&data) {
-                    images.push((name, img));
-                    on_progress(images.len(), total, &images.last().unwrap().1);
+                if Self::looks_like_image(&data) {
+                    let preview = if images.is_empty() { Self::decode_image(&data).ok() } else { None };
+                    images.push((name, data));
+                    on_progress(images.len(), total, preview.as_ref());
                 }
                 cursor = Some(next);
             } else {
@@ -130,7 +146,21 @@ impl ComicArchive {
             || lower.ends_with(".gif")
     }
 
-    fn decode_image(data: &[u8]) -> anyhow::Result<egui::ColorImage> {
+    /// Sniffs the magic bytes to confirm an entry is really an image, not
+    /// just named like one — archives (especially zips made on macOS) can
+    /// carry `__MACOSX/._*` AppleDouble metadata files that share the real
+    /// image's extension but aren't image data. Cheap (no pixel decode), so
+    /// it's fine to run on every entry even though we no longer decode all
+    /// of them up front.
+    fn looks_like_image(data: &[u8]) -> bool {
+        image::guess_format(data).is_ok()
+    }
+
+    /// Decodes a page's compressed bytes into raw pixels. Called on demand,
+    /// right before a page's texture is uploaded — not for the whole archive
+    /// up front — so decoded (and GPU-uploaded) pages never outnumber the
+    /// handful actually near the current spread.
+    pub(crate) fn decode_image(data: &[u8]) -> anyhow::Result<egui::ColorImage> {
         let img = image::load_from_memory(data)?;
 
         let rgba = img.to_rgba8();
@@ -140,10 +170,10 @@ impl ComicArchive {
         ))
     }
 
-    fn sort_and_filter_images(mut images: Vec<(String, egui::ColorImage)>) -> Vec<egui::ColorImage> {
+    fn sort_and_filter(mut images: Vec<(String, Vec<u8>)>) -> Vec<Vec<u8>> {
         images.sort_by(|a, b| {
             alphanumeric_sort::compare_str(&a.0, &b.0)
         });
-        images.into_iter().map(|(_, img)| img).collect()
+        images.into_iter().map(|(_, data)| data).collect()
     }
 }

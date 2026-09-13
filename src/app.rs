@@ -25,7 +25,10 @@ impl ReadingMode {
 }
 
 pub struct ComicApp {
-    pub pages: Vec<egui::ColorImage>,  // ✅ egui::ColorImage, pas image::ColorImage
+    /// Each page's original compressed bytes (JPEG/PNG/etc.), not decoded
+    /// pixels — decoding happens on demand in the reader UI, only for pages
+    /// near the current spread, so memory doesn't scale with book length.
+    pub pages: Vec<Vec<u8>>,
     pub current_spread: usize,
     pub total_pages: usize,
     pub page_offset: usize,
