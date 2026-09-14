@@ -13,6 +13,7 @@ pub struct Config {
     pub keybindings: KeyBindings,
     pub theme: ThemePreset,
     pub layout: LayoutConfig,
+    pub blue_light_filter: f32,
     pub downscale_large_pages: bool,
     pub resume_last_session: bool,
 }
@@ -24,6 +25,7 @@ impl Default for Config {
             keybindings: KeyBindings::default(),
             theme: ThemePreset::default(),
             layout: LayoutConfig::default(),
+            blue_light_filter: 0.0,
             downscale_large_pages: true,
             resume_last_session: true,
         }

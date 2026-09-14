@@ -179,6 +179,16 @@ impl eframe::App for ComicApp {
             ui::header::draw_header(ui, self);
             ui::reader::draw_double_page(ui, self);
         }
+
+        // Warm-tint overlay for the blue light filter — painted last, above
+        // everything else, on a dedicated foreground layer so it never
+        // intercepts clicks meant for the header or the reader below it.
+        if let Some(color) = self.blue_light_overlay_color() {
+            let screen_rect = ui.ctx().input(|i| i.viewport_rect());
+            ui.ctx()
+                .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("blue_light_filter")))
+                .rect_filled(screen_rect, 0.0, color);
+        }
     }
 
     /// Makes sure the last reading position is on disk even if the debounced

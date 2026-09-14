@@ -55,6 +55,10 @@ pub struct ComicApp {
     pub keybindings: KeyBindings,
     pub theme_preset: ThemePreset,
     pub layout: LayoutConfig,
+    /// Warm-tint overlay strength, `0.0` (off) to `1.0` (strongest). Exposed
+    /// as a slider on the auto-hiding header rather than in Settings, since
+    /// it's meant to be nudged in the moment while reading.
+    pub blue_light_filter: f32,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -122,6 +126,7 @@ impl Default for ComicApp {
             keybindings: KeyBindings::default(),
             theme_preset: ThemePreset::default(),
             layout: LayoutConfig::default(),
+            blue_light_filter: 0.0,
             remapping_action: None,
             textures: HashMap::new(),
             loading: false,
@@ -160,6 +165,7 @@ impl ComicApp {
             self.keybindings = config.keybindings;
             self.theme_preset = config.theme;
             self.layout = config.layout;
+            self.blue_light_filter = config.blue_light_filter;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
         }
@@ -209,6 +215,7 @@ impl ComicApp {
             keybindings: self.keybindings.clone(),
             theme: self.theme_preset,
             layout: self.layout.clone(),
+            blue_light_filter: self.blue_light_filter,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
         };
@@ -443,6 +450,16 @@ impl ComicApp {
         }
         self.history_dirty = false;
         self.history_last_saved = std::time::Instant::now();
+    }
+
+    /// The warm-tint overlay color to paint over the whole window for the
+    /// current filter strength, or `None` when the filter is off.
+    pub fn blue_light_overlay_color(&self) -> Option<egui::Color32> {
+        if self.blue_light_filter <= 0.0 {
+            return None;
+        }
+        let alpha = (self.blue_light_filter.clamp(0.0, 1.0) * 150.0) as u8;
+        Some(egui::Color32::from_rgba_unmultiplied(255, 147, 30, alpha))
     }
 
     /// The dimension cap to decode pages at, or `None` for full source

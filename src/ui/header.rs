@@ -47,6 +47,16 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
             if ui.button("🕘 History").clicked() {
                 app.show_history = true;
             }
+
+            ui.separator();
+            ui.colored_label(secondary, "🌙");
+            if ui
+                .add(egui::Slider::new(&mut app.blue_light_filter, 0.0..=1.0).show_value(false))
+                .on_hover_text("Blue light filter")
+                .changed()
+            {
+                app.save_config();
+            }
         });
 
         ui.separator();
