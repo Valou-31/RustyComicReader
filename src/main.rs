@@ -89,6 +89,7 @@ impl eframe::App for ComicApp {
         }
 
         input::keyboard::handle_keyboard(self, ui.ctx());
+        input::scroll::handle_scroll(self, ui.ctx());
         ui::settings::draw_settings(ui.ctx(), self);
         ui::history::draw_history(ui.ctx(), self);
 

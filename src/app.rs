@@ -7,7 +7,7 @@ use crate::ui::theme::ThemePreset;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the header stays visible after the last mouse movement.
 pub const UI_HIDE_DELAY: Duration = Duration::from_secs(3);
@@ -59,6 +59,10 @@ pub struct ComicApp {
     /// as a slider on the auto-hiding header rather than in Settings, since
     /// it's meant to be nudged in the moment while reading.
     pub blue_light_filter: f32,
+    /// Flips the direction two-finger trackpad scroll maps to next/prev —
+    /// the base mapping already depends on `reading_mode`, this is purely a
+    /// per-user trackpad preference (like macOS's own "natural scrolling").
+    pub scroll_inverted: bool,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -107,6 +111,11 @@ pub struct ComicApp {
     /// piling up behind a worker that can't keep up.
     decode_queue: DecodeQueue,
     decode_result_rx: std::sync::mpsc::Receiver<crate::comic::prefetch::DecodedPage>,
+    /// Accumulated vertical trackpad scroll (in points) since the current
+    /// gesture started — see `input::scroll::handle_scroll`.
+    pub scroll_accum: f32,
+    pub last_scroll_at: Instant,
+    pub scroll_cooldown_until: Instant,
 }
 
 impl Default for ComicApp {
@@ -127,6 +136,7 @@ impl Default for ComicApp {
             theme_preset: ThemePreset::default(),
             layout: LayoutConfig::default(),
             blue_light_filter: 0.0,
+            scroll_inverted: false,
             remapping_action: None,
             textures: HashMap::new(),
             loading: false,
@@ -151,6 +161,9 @@ impl Default for ComicApp {
             load_generation: 0,
             decode_queue,
             decode_result_rx,
+            scroll_accum: 0.0,
+            last_scroll_at: Instant::now(),
+            scroll_cooldown_until: Instant::now(),
         }
     }
 }
@@ -166,6 +179,7 @@ impl ComicApp {
             self.theme_preset = config.theme;
             self.layout = config.layout;
             self.blue_light_filter = config.blue_light_filter;
+            self.scroll_inverted = config.scroll_inverted;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
         }
@@ -216,6 +230,7 @@ impl ComicApp {
             theme: self.theme_preset,
             layout: self.layout.clone(),
             blue_light_filter: self.blue_light_filter,
+            scroll_inverted: self.scroll_inverted,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
         };

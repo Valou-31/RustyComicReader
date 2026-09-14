@@ -108,6 +108,20 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             }
 
             ui.separator();
+            ui.heading("Trackpad");
+            ui.horizontal(|ui| {
+                ui.label("Scroll direction");
+                if ui.selectable_label(!app.scroll_inverted, "Natural").clicked() && app.scroll_inverted {
+                    app.scroll_inverted = false;
+                    app.save_config();
+                }
+                if ui.selectable_label(app.scroll_inverted, "Inverted").clicked() && !app.scroll_inverted {
+                    app.scroll_inverted = true;
+                    app.save_config();
+                }
+            });
+
+            ui.separator();
             ui.heading("Session");
             if ui
                 .checkbox(&mut app.resume_last_session, "Reopen the last book on startup")
