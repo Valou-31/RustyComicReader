@@ -187,3 +187,67 @@ impl ComicArchive {
         images.into_iter().map(|(_, data)| data).collect()
     }
 }
+
+/// A decoded page's average edge colors — the leftmost and rightmost strip
+/// of pixels, each averaged over the full height. Used to fill the gap
+/// between two facing pages with a tint that blends into each page's own
+/// edge (so an all-white page keeps a white gap, an all-black one a black
+/// gap, and two different pages a gradient between them) instead of a flat
+/// background color showing through.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeColors {
+    pub left: egui::Color32,
+    pub right: egui::Color32,
+}
+
+impl EdgeColors {
+    /// Averaging a few-pixel-wide strip, rather than a single edge column,
+    /// smooths out noise (JPEG ringing, a stray dark line of text right at
+    /// the margin) that one column would be too sensitive to.
+    const SAMPLE_WIDTH: usize = 4;
+
+    pub fn sample(image: &egui::ColorImage) -> Self {
+        let [w, h] = image.size;
+        if w == 0 || h == 0 {
+            return Self { left: egui::Color32::WHITE, right: egui::Color32::WHITE };
+        }
+        let sample_w = Self::SAMPLE_WIDTH.min(w);
+        Self { left: Self::average(image, 0..sample_w), right: Self::average(image, (w - sample_w)..w) }
+    }
+
+    fn average(image: &egui::ColorImage, columns: std::ops::Range<usize>) -> egui::Color32 {
+        let [w, h] = image.size;
+        let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+        for y in 0..h {
+            let row = y * w;
+            for x in columns.clone() {
+                let px = image.pixels[row + x];
+                r += px.r() as u64;
+                g += px.g() as u64;
+                b += px.b() as u64;
+                n += 1;
+            }
+        }
+        egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+    }
+}
+
+/// What's known about a decoded page beyond its pixels — computed once,
+/// off the UI thread, alongside decoding (see `prefetch::spawn_decode_worker`
+/// and `ComicArchive::decode_image`'s callers).
+#[derive(Clone, Copy, Debug)]
+pub struct PageMeta {
+    pub edge: EdgeColors,
+    /// True for a page scanned as a single wide image spanning what would
+    /// normally be two facing pages (landscape orientation — width clearly
+    /// exceeds height, unlike a normal comic page). Shown alone, spanning
+    /// the full reader width, instead of being paired with another page.
+    pub is_spread: bool,
+}
+
+impl PageMeta {
+    pub fn sample(image: &egui::ColorImage) -> Self {
+        let [w, h] = image.size;
+        Self { edge: EdgeColors::sample(image), is_spread: w > h }
+    }
+}

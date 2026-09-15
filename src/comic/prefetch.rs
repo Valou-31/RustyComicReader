@@ -1,4 +1,4 @@
-use crate::comic::archive::ComicArchive;
+use crate::comic::archive::{ComicArchive, PageMeta};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -19,6 +19,7 @@ pub struct DecodedPage {
     pub generation: u64,
     pub page_idx: usize,
     pub image: egui::ColorImage,
+    pub meta: PageMeta,
 }
 
 struct Shared {
@@ -85,7 +86,8 @@ pub fn spawn_decode_worker() -> (DecodeQueue, Receiver<DecodedPage>) {
             drop(queue);
 
             if let Ok(image) = ComicArchive::decode_image(&request.data, request.max_dimension) {
-                let result = DecodedPage { generation: request.generation, page_idx, image };
+                let meta = PageMeta::sample(&image);
+                let result = DecodedPage { generation: request.generation, page_idx, image, meta };
                 if result_tx.send(result).is_err() {
                     break;
                 }

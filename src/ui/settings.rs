@@ -3,12 +3,30 @@ use crate::input::keybindings::{Action, Preset};
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
 use egui::{Color32, Context};
+use std::time::Duration;
+
+/// How long the spine color picker must sit still before its value is
+/// recorded into `LayoutConfig::spine_color_history` — long enough that
+/// dragging around the hue/sat sliders doesn't flood the history with every
+/// intermediate shade, short enough to feel immediate once you settle on one.
+const COLOR_HISTORY_DEBOUNCE: Duration = Duration::from_millis(600);
 
 /// Draws the settings window (reading direction, key remapping, presets)
 /// when `app.show_settings` is set. No-op otherwise.
 pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
     if !app.show_settings {
         return;
+    }
+
+    if let Some(since) = app.spine_color_pending_since {
+        let elapsed = since.elapsed();
+        if elapsed >= COLOR_HISTORY_DEBOUNCE {
+            app.layout.record_spine_color(app.layout.spine_color);
+            app.spine_color_pending_since = None;
+            app.save_config();
+        } else {
+            ctx.request_repaint_after(COLOR_HISTORY_DEBOUNCE - elapsed);
+        }
     }
 
     let mut open = true;
@@ -151,12 +169,44 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                 layout_changed |= ui.add(egui::Slider::new(&mut app.layout.spine_opacity, 0.0..=1.0)).changed();
             });
             ui.horizontal(|ui| {
+                ui.label("Spine shadow width");
+                layout_changed |=
+                    ui.add(egui::Slider::new(&mut app.layout.spine_shadow_width, 0.0..=120.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Spine color");
+                if ui.color_edit_button_srgb(&mut app.layout.spine_color).changed() {
+                    layout_changed = true;
+                    app.spine_color_pending_since = Some(std::time::Instant::now());
+                }
+                if !app.layout.spine_color_history.is_empty() {
+                    ui.label("Recent:");
+                    for color in app.layout.spine_color_history.clone() {
+                        let swatch = egui::Button::new("")
+                            .fill(Color32::from_rgb(color[0], color[1], color[2]))
+                            .min_size(egui::vec2(18.0, 18.0));
+                        let hex = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+                        if ui.add(swatch).on_hover_text(hex).clicked() {
+                            app.layout.spine_color = color;
+                            app.layout.record_spine_color(color);
+                            app.spine_color_pending_since = None;
+                            app.save_config();
+                        }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.label("Page gap");
                 layout_changed |= ui.add(egui::Slider::new(&mut app.layout.page_gap, 0.0..=80.0)).changed();
             });
             ui.horizontal(|ui| {
                 ui.label("Fade speed (ms)");
                 layout_changed |= ui.add(egui::Slider::new(&mut app.layout.fade_duration_ms, 50..=1000)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Page transition speed (ms)");
+                layout_changed |=
+                    ui.add(egui::Slider::new(&mut app.layout.page_transition_ms, 0..=600)).changed();
             });
             if ui.button("Reset layout to defaults").clicked() {
                 app.layout = LayoutConfig::default();
