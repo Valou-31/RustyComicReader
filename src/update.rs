@@ -128,9 +128,12 @@ fn apply(info: &UpdateInfo) -> Result<(), String> {
     result.map_err(|e| e.to_string())
 }
 
+/// Release assets are well over ureq's default 10MB read limit.
+const MAX_ASSET_SIZE: u64 = 200 * 1024 * 1024;
+
 fn download(url: &str) -> Result<Vec<u8>, String> {
     let mut response = ureq::get(url).header("User-Agent", USER_AGENT).call().map_err(|e| e.to_string())?;
-    response.body_mut().read_to_vec().map_err(|e| e.to_string())
+    response.body_mut().with_config().limit(MAX_ASSET_SIZE).read_to_vec().map_err(|e| e.to_string())
 }
 
 /// Pulls the platform binary out of the downloaded release asset — a zip
