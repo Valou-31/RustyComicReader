@@ -251,3 +251,37 @@ impl PageMeta {
         Self { edge: EdgeColors::sample(image), is_spread: w > h }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid_image(width: usize, height: usize, color: egui::Color32) -> egui::ColorImage {
+        egui::ColorImage::new([width, height], vec![color; width * height])
+    }
+
+    #[test]
+    fn portrait_page_is_not_a_spread() {
+        let image = solid_image(600, 900, egui::Color32::WHITE);
+        assert!(!PageMeta::sample(&image).is_spread);
+    }
+
+    #[test]
+    fn landscape_page_is_a_spread() {
+        let image = solid_image(1800, 900, egui::Color32::WHITE);
+        assert!(PageMeta::sample(&image).is_spread);
+    }
+
+    #[test]
+    fn edge_colors_average_each_side_independently() {
+        let mut image = solid_image(10, 4, egui::Color32::WHITE);
+        for y in 0..4 {
+            image.pixels[y * 10] = egui::Color32::BLACK; // leftmost column only
+        }
+        let edge = EdgeColors::sample(&image);
+        // Averaged over a 4px-wide strip, one all-black column among four
+        // white ones darkens the left average without making it pure black.
+        assert!(edge.left.r() < 255 && edge.left.r() > 0);
+        assert_eq!(edge.right, egui::Color32::WHITE);
+    }
+}
