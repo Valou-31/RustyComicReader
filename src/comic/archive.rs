@@ -188,12 +188,12 @@ impl ComicArchive {
     }
 }
 
-/// A decoded page's average edge colors — the leftmost and rightmost strip
-/// of pixels, each averaged over the full height. Used to fill the gap
-/// between two facing pages with a tint that blends into each page's own
-/// edge (so an all-white page keeps a white gap, an all-black one a black
-/// gap, and two different pages a gradient between them) instead of a flat
-/// background color showing through.
+/// A decoded page's representative edge colors — the leftmost and rightmost
+/// strip of pixels, each summarized over the full height. Used to fill the
+/// gap between two facing pages with a tint that blends into each page's
+/// own edge (so an all-white page keeps a white gap, an all-black one a
+/// black gap, and two different pages a gradient between them) instead of a
+/// flat background color showing through.
 #[derive(Clone, Copy, Debug)]
 pub struct EdgeColors {
     pub left: egui::Color32,
@@ -201,10 +201,10 @@ pub struct EdgeColors {
 }
 
 impl EdgeColors {
-    /// Averaging a few-pixel-wide strip, rather than a single edge column,
-    /// smooths out noise (JPEG ringing, a stray dark line of text right at
-    /// the margin) that one column would be too sensitive to.
-    const SAMPLE_WIDTH: usize = 4;
+    /// Wide enough that the per-channel median below (see `dominant`) has
+    /// enough samples to be meaningful, without sampling so far in from the
+    /// edge that it stops representing "the edge".
+    const SAMPLE_WIDTH: usize = 24;
 
     pub fn sample(image: &egui::ColorImage) -> Self {
         let [w, h] = image.size;
@@ -212,24 +212,37 @@ impl EdgeColors {
             return Self { left: egui::Color32::WHITE, right: egui::Color32::WHITE };
         }
         let sample_w = Self::SAMPLE_WIDTH.min(w);
-        Self { left: Self::average(image, 0..sample_w), right: Self::average(image, (w - sample_w)..w) }
+        Self { left: Self::dominant(image, 0..sample_w), right: Self::dominant(image, (w - sample_w)..w) }
     }
 
-    fn average(image: &egui::ColorImage, columns: std::ops::Range<usize>) -> egui::Color32 {
+    /// Per-channel median over the given columns (full height). A comic
+    /// page's outer edge is routinely crossed by a panel's black border
+    /// line for part of its height — a plain average gets dragged toward
+    /// gray by that minority of dark pixels even when the edge reads as
+    /// white overall, while the median only moves once a color actually
+    /// covers more than half the sampled strip.
+    fn dominant(image: &egui::ColorImage, columns: std::ops::Range<usize>) -> egui::Color32 {
         let [w, h] = image.size;
-        let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+        let mut reds = Vec::with_capacity(h * columns.len());
+        let mut greens = Vec::with_capacity(h * columns.len());
+        let mut blues = Vec::with_capacity(h * columns.len());
         for y in 0..h {
             let row = y * w;
             for x in columns.clone() {
                 let px = image.pixels[row + x];
-                r += px.r() as u64;
-                g += px.g() as u64;
-                b += px.b() as u64;
-                n += 1;
+                reds.push(px.r());
+                greens.push(px.g());
+                blues.push(px.b());
             }
         }
-        egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+        egui::Color32::from_rgb(median(&mut reds), median(&mut greens), median(&mut blues))
     }
+}
+
+/// The middle value of `values` once sorted. `values` must be non-empty.
+fn median(values: &mut [u8]) -> u8 {
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 /// What's known about a decoded page beyond its pixels — computed once,
@@ -273,15 +286,32 @@ mod tests {
     }
 
     #[test]
-    fn edge_colors_average_each_side_independently() {
-        let mut image = solid_image(10, 4, egui::Color32::WHITE);
-        for y in 0..4 {
-            image.pixels[y * 10] = egui::Color32::BLACK; // leftmost column only
+    fn edge_colors_sample_each_side_independently() {
+        let width = 40; // wider than SAMPLE_WIDTH so left/right strips don't overlap
+        let mut image = solid_image(width, 20, egui::Color32::WHITE);
+        for y in 0..20 {
+            image.pixels[y * width] = egui::Color32::BLACK; // one column, left edge only
         }
         let edge = EdgeColors::sample(&image);
-        // Averaged over a 4px-wide strip, one all-black column among four
-        // white ones darkens the left average without making it pure black.
-        assert!(edge.left.r() < 255 && edge.left.r() > 0);
+        // A thin border line is a small minority of the sampled strip, so
+        // the median (unlike a plain average) isn't dragged off white by it.
+        assert_eq!(edge.left, egui::Color32::WHITE);
+        assert_eq!(edge.right, egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn edge_color_follows_the_majority_not_a_minority_border() {
+        let width = 40;
+        let mut image = solid_image(width, 20, egui::Color32::WHITE);
+        // A panel's black border covering most (not all) of the page's
+        // height at its left edge should register as black, not white.
+        for y in 0..14 {
+            for x in 0..EdgeColors::SAMPLE_WIDTH {
+                image.pixels[y * width + x] = egui::Color32::BLACK;
+            }
+        }
+        let edge = EdgeColors::sample(&image);
+        assert_eq!(edge.left, egui::Color32::BLACK);
         assert_eq!(edge.right, egui::Color32::WHITE);
     }
 }
