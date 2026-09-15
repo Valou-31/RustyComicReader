@@ -158,6 +158,28 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             }
 
             ui.separator();
+            ui.heading("Updates");
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            if ui.checkbox(&mut app.auto_check_updates, "Check for updates on startup").changed() {
+                app.save_config();
+            }
+            ui.horizontal(|ui| {
+                let checking = matches!(app.update_status, crate::app::UpdateStatus::Checking);
+                if ui.add_enabled(!checking, egui::Button::new("Check now")).clicked() {
+                    app.check_for_updates();
+                }
+                let status = match &app.update_status {
+                    crate::app::UpdateStatus::Idle => "Up to date".to_string(),
+                    crate::app::UpdateStatus::Checking => "Checking…".to_string(),
+                    crate::app::UpdateStatus::Available(info) => format!("v{} available", info.version),
+                    crate::app::UpdateStatus::Downloading => "Downloading…".to_string(),
+                    crate::app::UpdateStatus::Ready => "Ready — restart to apply".to_string(),
+                    crate::app::UpdateStatus::Failed(err) => format!("Failed: {err}"),
+                };
+                ui.label(status);
+            });
+
+            ui.separator();
             ui.heading("Layout");
             let mut layout_changed = false;
             ui.horizontal(|ui| {

@@ -7,6 +7,7 @@ mod comic;
 mod storage;
 mod state;
 mod platform;
+mod update;
 
 use app::{ComicApp, UI_HIDE_DELAY};
 use eframe::egui;
@@ -74,6 +75,8 @@ impl eframe::App for ComicApp {
         self.poll_loading();
         self.poll_decoded_pages(ui.ctx());
         self.poll_history_save();
+        self.poll_update_check();
+        self.poll_update_apply();
         if self.loading {
             ui.ctx().request_repaint();
         }
@@ -175,6 +178,7 @@ impl eframe::App for ComicApp {
                 if ui.button("🕘 History").clicked() {
                     self.show_history = true;
                 }
+                ui::header::draw_update_indicator(ui, self);
             });
         } else {
             ui::header::draw_header(ui, self);

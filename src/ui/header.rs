@@ -1,4 +1,4 @@
-use crate::app::{ComicApp, UI_HIDE_DELAY};
+use crate::app::{ComicApp, UI_HIDE_DELAY, UpdateStatus};
 use egui::Ui;
 
 /// Draws the top bar (filename, live page numbers, peek badge, controls) for
@@ -48,6 +48,8 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
                 app.show_history = true;
             }
 
+            draw_update_indicator(ui, app);
+
             ui.separator();
             ui.colored_label(secondary, "🌙");
             if ui
@@ -61,6 +63,39 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
 
         ui.separator();
     });
+}
+
+/// A small button that only appears when there's something to act on — a
+/// newer release found, mid-download, ready to apply, or failed. Silent the
+/// rest of the time (idle, or still checking) so it doesn't clutter the
+/// header on every launch. Shared between the reading header and the
+/// empty-state screen, since an update can be found before any book is open.
+pub fn draw_update_indicator(ui: &mut Ui, app: &mut ComicApp) {
+    match app.update_status.clone() {
+        UpdateStatus::Available(info) => {
+            if ui.button(format!("⬆ Update to v{}", info.version)).clicked() {
+                app.start_update_download();
+            }
+        }
+        UpdateStatus::Downloading => {
+            ui.add_enabled(false, egui::Button::new("⬇ Downloading update…"));
+        }
+        UpdateStatus::Ready => {
+            if ui
+                .button("🔄 Restart to update")
+                .on_hover_text("Update downloaded — restart to apply it")
+                .clicked()
+            {
+                app.restart_to_apply_update();
+            }
+        }
+        UpdateStatus::Failed(err) => {
+            if ui.button("⚠ Update failed").on_hover_text(format!("{err}\n\nClick to retry")).clicked() {
+                app.check_for_updates();
+            }
+        }
+        UpdateStatus::Idle | UpdateStatus::Checking => {}
+    }
 }
 
 fn page_label(app: &ComicApp) -> String {

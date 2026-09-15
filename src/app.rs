@@ -4,6 +4,7 @@ use crate::storage::config::Config;
 use crate::storage::history::History;
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
+use crate::update::{ApplyEvent, CheckEvent, UpdateInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -70,6 +71,20 @@ impl ReadingMode {
             ReadingMode::RTL => "⬅ RTL (Manga)",
         }
     }
+}
+
+/// Where the background update check/download currently stands — drives
+/// both the header's small update button and the Settings "Updates" panel.
+#[derive(Clone, Debug, Default)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    Available(UpdateInfo),
+    Downloading,
+    /// Downloaded and swapped into place — takes effect on next launch.
+    Ready,
+    Failed(String),
 }
 
 pub struct ComicApp {
@@ -161,6 +176,12 @@ pub struct ComicApp {
     /// `LayoutConfig::spine_color_history`, so dragging around the picker
     /// doesn't flood the history with every intermediate shade.
     pub spine_color_pending_since: Option<Instant>,
+    /// Whether to check GitHub for a newer release on startup. Persisted;
+    /// toggled from the settings panel.
+    pub auto_check_updates: bool,
+    pub update_status: UpdateStatus,
+    pending_update_check: Option<std::sync::mpsc::Receiver<CheckEvent>>,
+    pending_update_apply: Option<std::sync::mpsc::Receiver<ApplyEvent>>,
 }
 
 impl Default for ComicApp {
@@ -209,6 +230,10 @@ impl Default for ComicApp {
             decode_result_rx,
             page_transition: None,
             spine_color_pending_since: None,
+            auto_check_updates: true,
+            update_status: UpdateStatus::default(),
+            pending_update_check: None,
+            pending_update_apply: None,
         }
     }
 }
@@ -227,6 +252,7 @@ impl ComicApp {
             self.scroll_inverted = config.scroll_inverted;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
+            self.auto_check_updates = config.auto_check_updates;
         }
         if let Ok(history) = History::load() {
             self.history = history;
@@ -247,6 +273,9 @@ impl ComicApp {
             app.resume_to_page = Some(entry.last_page);
             app.start_loading_path(path);
         }
+        if app.auto_check_updates {
+            app.check_for_updates();
+        }
         app
     }
 
@@ -261,6 +290,9 @@ impl ComicApp {
         if let Some(first) = paths.next() {
             app.file_queue.extend(paths);
             app.start_loading_path(first);
+        }
+        if app.auto_check_updates {
+            app.check_for_updates();
         }
         app
     }
@@ -278,6 +310,7 @@ impl ComicApp {
             scroll_inverted: self.scroll_inverted,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
+            auto_check_updates: self.auto_check_updates,
         };
         if let Err(err) = config.save() {
             tracing::warn!("Failed to save config: {err}");
@@ -737,6 +770,80 @@ impl ComicApp {
             self.textures.entry(decoded.page_idx).or_insert_with(|| {
                 ctx.load_texture(format!("page_{}", decoded.page_idx), decoded.image, egui::TextureOptions::LINEAR)
             });
+        }
+    }
+
+    /// Starts a background check against GitHub's latest release. No-op if
+    /// one's already in flight (a check or a download).
+    pub fn check_for_updates(&mut self) {
+        if matches!(self.update_status, UpdateStatus::Checking | UpdateStatus::Downloading) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        self.pending_update_check = Some(crate::update::spawn_check());
+    }
+
+    /// Starts downloading and applying the update found by the last check.
+    /// No-op if `update_status` isn't currently `Available`.
+    pub fn start_update_download(&mut self) {
+        let UpdateStatus::Available(info) = self.update_status.clone() else { return };
+        self.update_status = UpdateStatus::Downloading;
+        self.pending_update_apply = Some(crate::update::spawn_apply(info));
+    }
+
+    /// Relaunches the app (picking up the just-applied update) and exits
+    /// this process. Only meaningful once `update_status` is `Ready`.
+    pub fn restart_to_apply_update(&mut self) {
+        self.flush_history();
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        std::process::exit(0);
+    }
+
+    /// Call once per frame: picks up the result of a background update
+    /// check, if any.
+    pub fn poll_update_check(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(receiver) = &self.pending_update_check else { return };
+        match receiver.try_recv() {
+            Ok(CheckEvent::Available(info)) => {
+                self.update_status = UpdateStatus::Available(info);
+                self.pending_update_check = None;
+            }
+            Ok(CheckEvent::UpToDate) => {
+                self.update_status = UpdateStatus::Idle;
+                self.pending_update_check = None;
+            }
+            Ok(CheckEvent::Failed(err)) => {
+                tracing::warn!("Update check failed: {err}");
+                self.update_status = UpdateStatus::Idle;
+                self.pending_update_check = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_update_check = None,
+        }
+    }
+
+    /// Call once per frame: picks up the result of a background update
+    /// download/apply, if any.
+    pub fn poll_update_apply(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(receiver) = &self.pending_update_apply else { return };
+        match receiver.try_recv() {
+            Ok(ApplyEvent::Done) => {
+                self.update_status = UpdateStatus::Ready;
+                self.pending_update_apply = None;
+            }
+            Ok(ApplyEvent::Failed(err)) => {
+                tracing::warn!("Failed to apply update: {err}");
+                self.update_status = UpdateStatus::Failed(err);
+                self.pending_update_apply = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_update_apply = None,
         }
     }
 }

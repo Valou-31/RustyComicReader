@@ -17,6 +17,7 @@ pub struct Config {
     pub scroll_inverted: bool,
     pub downscale_large_pages: bool,
     pub resume_last_session: bool,
+    pub auto_check_updates: bool,
 }
 
 impl Default for Config {
@@ -30,6 +31,7 @@ impl Default for Config {
             scroll_inverted: false,
             downscale_large_pages: true,
             resume_last_session: true,
+            auto_check_updates: true,
         }
     }
 }
