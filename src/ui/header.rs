@@ -42,6 +42,20 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
             if ui.button(app.reading_mode.label()).clicked() {
                 app.toggle_reading_mode();
             }
+            if app.is_zoomed() && ui.button("🔍 Reset Zoom").clicked() {
+                app.reset_zoom();
+            }
+            if ui
+                .selectable_label(app.zoom_locked, "🔒 Lock Zoom")
+                .on_hover_text(
+                    "Keep the current zoom level instead of resetting it to normal on every page \
+                     turn or when opening a different book.",
+                )
+                .clicked()
+            {
+                app.zoom_locked = !app.zoom_locked;
+                app.save_config();
+            }
             if ui.button("⚙ Settings").clicked() {
                 app.show_settings = true;
             }

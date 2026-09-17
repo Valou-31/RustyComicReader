@@ -1,4 +1,4 @@
-use crate::app::{ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode};
+use crate::app::{ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode, ZoomTarget};
 use crate::input::keybindings::{Action, Preset};
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
@@ -176,6 +176,20 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             {
                 app.set_show_page_preview(show_page_preview);
             }
+
+            ui.separator();
+            ui.heading("Zoom");
+            ui.horizontal(|ui| {
+                ui.label("Zoom applies to");
+                for target in [ZoomTarget::Spread, ZoomTarget::SinglePage] {
+                    if ui.selectable_label(app.zoom_target == target, target.label()).clicked()
+                        && app.zoom_target != target
+                    {
+                        app.zoom_target = target;
+                        app.save_config();
+                    }
+                }
+            });
 
             ui.separator();
             ui.heading("Session");

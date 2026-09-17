@@ -1,4 +1,4 @@
-use crate::app::ReadingMode;
+use crate::app::{ReadingMode, ZoomTarget, ZOOM_MIN};
 use crate::input::keybindings::KeyBindings;
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
@@ -18,6 +18,11 @@ pub struct Config {
     pub scroll_sensitivity: f32,
     pub one_turn_per_swipe: bool,
     pub show_page_preview: bool,
+    pub zoom_spread: f32,
+    pub zoom_left: f32,
+    pub zoom_right: f32,
+    pub zoom_locked: bool,
+    pub zoom_target: ZoomTarget,
     pub downscale_large_pages: bool,
     pub resume_last_session: bool,
     pub auto_check_updates: bool,
@@ -35,6 +40,11 @@ impl Default for Config {
             scroll_sensitivity: 1.0,
             one_turn_per_swipe: true,
             show_page_preview: true,
+            zoom_spread: ZOOM_MIN,
+            zoom_left: ZOOM_MIN,
+            zoom_right: ZOOM_MIN,
+            zoom_locked: false,
+            zoom_target: ZoomTarget::Spread,
             downscale_large_pages: true,
             resume_last_session: true,
             auto_check_updates: true,

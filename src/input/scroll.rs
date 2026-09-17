@@ -39,6 +39,11 @@ pub fn handle_scroll(app: &mut ComicApp, ctx: &egui::Context) {
 
     let (delta_sum, gesture_ended, gesture_started) = ctx.input(|i| {
         i.events.iter().fold((0.0f32, false, false), |(sum, ended, started), event| match event {
+            // A scroll held with the zoom modifier (Cmd on macOS, Ctrl
+            // elsewhere) is `ui::reader`'s ctrl/Cmd-scroll-to-zoom, not a
+            // page-turn swipe — ignore it here entirely so the two don't
+            // fire at once.
+            Event::MouseWheel { modifiers, .. } if modifiers.command => (sum, ended, started),
             Event::MouseWheel { phase: TouchPhase::Start, delta, .. } => (sum + delta.x, ended, true),
             Event::MouseWheel { phase: TouchPhase::End | TouchPhase::Cancel, .. } => (sum, true, started),
             Event::MouseWheel { delta, .. } => (sum + delta.x, ended, started),

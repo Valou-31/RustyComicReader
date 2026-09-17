@@ -24,6 +24,51 @@ pub const HISTORY_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// saving per page.
 pub const DOWNSCALE_MAX_DIMENSION: u32 = 2400;
 
+/// `PageZoom::scale`'s lower bound — the normal fit-to-height view. Zooming
+/// "out" past this would just shrink the page for no benefit, since it
+/// already fills the available height at `1.0`.
+pub const ZOOM_MIN: f32 = 1.0;
+/// `PageZoom::scale`'s upper bound.
+pub const ZOOM_MAX: f32 = 5.0;
+
+/// Whether zooming magnifies the whole two-page spread together
+/// (`ComicApp::zoom_spread`), or each page independently
+/// (`ComicApp::zoom_left`/`zoom_right`) — pinching in on one page doesn't
+/// affect the other, so the two can end up at different zoom levels at
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoomTarget {
+    Spread,
+    SinglePage,
+}
+
+impl ZoomTarget {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ZoomTarget::Spread => "Both pages",
+            ZoomTarget::SinglePage => "Single page",
+        }
+    }
+}
+
+/// A magnification level and pan offset for one zoomed view. `ComicApp`
+/// keeps three independent ones — `zoom_spread` for `ZoomTarget::Spread`,
+/// and `zoom_left`/`zoom_right` for `ZoomTarget::SinglePage`, one per
+/// physical side so each page can be zoomed to its own level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageZoom {
+    pub scale: f32,
+    pub pan: egui::Vec2,
+}
+
+impl PageZoom {
+    pub const NONE: PageZoom = PageZoom { scale: ZOOM_MIN, pan: egui::Vec2::ZERO };
+
+    pub fn is_zoomed(&self) -> bool {
+        self.scale > ZOOM_MIN
+    }
+}
+
 /// A page-turn slide in progress, either a live trackpad drag (`dragging:
 /// true`, `progress` set directly by `drag_page_by` each frame) or a
 /// physical damped spring pulling `progress` toward `target`, stepped once
@@ -143,6 +188,26 @@ pub struct ComicApp {
     /// unloads whatever was already cached. The progress bar itself (fill,
     /// hover marker, click-to-jump) is unaffected either way.
     pub show_page_preview: bool,
+    /// `ZoomTarget::Spread`'s magnification/pan — the whole two-page layout
+    /// scaled and shifted together. Driven by pinch/ctrl(-or-Cmd)-scroll and
+    /// click-drag in `ui::reader`. Resets to `PageZoom::NONE` on every page
+    /// turn or book switch unless `zoom_locked` is on, in which case it's
+    /// left exactly as it was — see `reset_zoom_for_new_page`.
+    pub zoom_spread: PageZoom,
+    /// `ZoomTarget::SinglePage`'s magnification/pan for the left page's own
+    /// box, independent of `zoom_right` — pinching in on one page doesn't
+    /// affect the other. Same reset rules as `zoom_spread`.
+    pub zoom_left: PageZoom,
+    /// `ZoomTarget::SinglePage`'s magnification/pan for the right page's
+    /// own box — see `zoom_left`.
+    pub zoom_right: PageZoom,
+    /// Whether each zoom's `scale` survives page turns and opening a
+    /// different book, instead of resetting to `ZOOM_MIN` each time.
+    /// Persisted, so it also survives an app restart.
+    pub zoom_locked: bool,
+    /// Whether zooming magnifies the whole spread or each page
+    /// independently — see `ZoomTarget`. Persisted.
+    pub zoom_target: ZoomTarget,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -256,6 +321,11 @@ impl Default for ComicApp {
             one_turn_per_swipe: true,
             swipe_locked: false,
             show_page_preview: true,
+            zoom_spread: PageZoom::NONE,
+            zoom_left: PageZoom::NONE,
+            zoom_right: PageZoom::NONE,
+            zoom_locked: false,
+            zoom_target: ZoomTarget::Spread,
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
@@ -311,6 +381,11 @@ impl ComicApp {
             self.scroll_sensitivity = config.scroll_sensitivity;
             self.one_turn_per_swipe = config.one_turn_per_swipe;
             self.show_page_preview = config.show_page_preview;
+            self.zoom_spread.scale = config.zoom_spread;
+            self.zoom_left.scale = config.zoom_left;
+            self.zoom_right.scale = config.zoom_right;
+            self.zoom_locked = config.zoom_locked;
+            self.zoom_target = config.zoom_target;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
             self.auto_check_updates = config.auto_check_updates;
@@ -372,6 +447,11 @@ impl ComicApp {
             scroll_sensitivity: self.scroll_sensitivity,
             one_turn_per_swipe: self.one_turn_per_swipe,
             show_page_preview: self.show_page_preview,
+            zoom_spread: self.zoom_spread.scale,
+            zoom_left: self.zoom_left.scale,
+            zoom_right: self.zoom_right.scale,
+            zoom_locked: self.zoom_locked,
+            zoom_target: self.zoom_target,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
             auto_check_updates: self.auto_check_updates,
@@ -414,6 +494,7 @@ impl ComicApp {
         self.current_page = page_idx.min(self.total_pages - 1);
         self.page_offset = 0;
         self.page_transition = None;
+        self.reset_zoom_for_new_page();
         self.mark_history_dirty();
     }
 
@@ -428,6 +509,7 @@ impl ComicApp {
         if can_advance {
             self.current_page = next;
             self.page_offset = 0;
+            self.reset_zoom_for_new_page();
             self.mark_history_dirty();
         }
         can_advance
@@ -437,8 +519,48 @@ impl ComicApp {
         let Some(prev) = self.prev_spread_start(self.effective_position()) else { return false };
         self.current_page = prev;
         self.page_offset = 0;
+        self.reset_zoom_for_new_page();
         self.mark_history_dirty();
         true
+    }
+
+    /// Whether any of the three zooms is currently engaged — drives the
+    /// header's "Reset Zoom" button.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom_spread.is_zoomed() || self.zoom_left.is_zoomed() || self.zoom_right.is_zoomed()
+    }
+
+    /// Resets zoom state for a newly-shown spread — called by
+    /// `advance_forward`/`advance_backward`/`jump_to_page` and when a book
+    /// finishes loading. A no-op while `zoom_locked` is on: locking holds
+    /// the exact view — both `scale` and `pan` — steady across page turns
+    /// and book switches, not just the magnification level.
+    fn reset_zoom_for_new_page(&mut self) {
+        if !self.zoom_locked {
+            self.apply_reset_zoom();
+        }
+    }
+
+    /// Explicitly resets all zoom back to normal — the header's "Reset
+    /// Zoom" button. Unlike `reset_zoom_for_new_page`, this always resets
+    /// `scale` too, even when `zoom_locked` is on: locking keeps a chosen
+    /// zoom level from resetting on its own, but an explicit reset should
+    /// still work regardless, and persists so the reset actually sticks
+    /// next time (otherwise the locked, still-2x-saved value would just
+    /// reapply on the next page turn).
+    pub fn reset_zoom(&mut self) {
+        self.apply_reset_zoom();
+        if self.zoom_locked {
+            self.save_config();
+        }
+    }
+
+    /// The mutating half of `reset_zoom`, split out so it can be exercised
+    /// without the accompanying disk write.
+    fn apply_reset_zoom(&mut self) {
+        self.zoom_spread = PageZoom::NONE;
+        self.zoom_left = PageZoom::NONE;
+        self.zoom_right = PageZoom::NONE;
     }
 
     /// Which side the *next* spread visually enters from: `+1.0` (right) in
@@ -858,6 +980,7 @@ impl ComicApp {
 
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
                     self.page_offset = 0;
+                    self.reset_zoom_for_new_page();
 
                     self.loading = false;
                     // Any decode still in flight for the previous archive is
@@ -1559,6 +1682,69 @@ mod tests {
         let mut app = app_with(4, &[]);
         assert!(app.show_page_preview); // on by default
         assert!(!app.apply_show_page_preview(true));
+    }
+
+    fn zoomed(scale: f32, pan: egui::Vec2) -> PageZoom {
+        PageZoom { scale, pan }
+    }
+
+    #[test]
+    fn page_turn_resets_all_three_zooms_when_not_locked() {
+        let mut app = app_with(6, &[]);
+        app.zoom_spread = zoomed(3.0, egui::Vec2::new(10.0, 20.0));
+        app.zoom_left = zoomed(2.0, egui::Vec2::new(1.0, 1.0));
+        app.zoom_right = zoomed(4.0, egui::Vec2::new(-1.0, -1.0));
+
+        app.next_spread();
+        assert_eq!(app.zoom_spread, PageZoom::NONE);
+        assert_eq!(app.zoom_left, PageZoom::NONE);
+        assert_eq!(app.zoom_right, PageZoom::NONE);
+    }
+
+    #[test]
+    fn page_turn_keeps_the_exact_view_when_locked() {
+        let mut app = app_with(6, &[]);
+        app.zoom_locked = true;
+        app.zoom_left = zoomed(2.0, egui::Vec2::new(10.0, 20.0));
+        app.zoom_right = zoomed(3.0, egui::Vec2::new(-5.0, 5.0));
+
+        app.next_spread();
+        // Both scale *and* pan survive — locking holds the exact view, not
+        // just the magnification level.
+        assert_eq!(app.zoom_left, zoomed(2.0, egui::Vec2::new(10.0, 20.0)));
+        assert_eq!(app.zoom_right, zoomed(3.0, egui::Vec2::new(-5.0, 5.0)));
+    }
+
+    #[test]
+    fn jump_to_page_also_keeps_the_exact_view_when_locked() {
+        let mut app = app_with(6, &[]);
+        app.zoom_locked = true;
+        app.zoom_spread = zoomed(2.0, egui::Vec2::new(5.0, 5.0));
+
+        app.jump_to_page(3);
+        assert_eq!(app.zoom_spread, zoomed(2.0, egui::Vec2::new(5.0, 5.0)));
+    }
+
+    #[test]
+    fn explicit_reset_zoom_clears_all_three_even_when_locked() {
+        let mut app = app_with(6, &[]);
+        app.zoom_locked = true;
+        app.zoom_spread = zoomed(4.0, egui::Vec2::new(1.0, 1.0));
+        app.zoom_left = zoomed(2.0, egui::Vec2::ONE);
+        app.zoom_right = zoomed(3.0, egui::Vec2::ONE);
+
+        app.apply_reset_zoom();
+        assert_eq!(app.zoom_spread, PageZoom::NONE);
+        assert_eq!(app.zoom_left, PageZoom::NONE);
+        assert_eq!(app.zoom_right, PageZoom::NONE);
+    }
+
+    #[test]
+    fn is_zoomed_reflects_any_of_the_three() {
+        let mut app = app_with(6, &[]);
+        assert!(!app.is_zoomed());
+        app.zoom_right = zoomed(1.5, egui::Vec2::ZERO);
+        assert!(app.is_zoomed());
     }
 
     #[test]
