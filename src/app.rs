@@ -142,6 +142,19 @@ pub struct ComicApp {
     /// Each decoded page's edge colors and double-page-spread flag,
     /// alongside its texture in `textures` — see `comic::archive::PageMeta`.
     pub page_meta: HashMap<usize, crate::comic::archive::PageMeta>,
+    /// Cheap low-res previews for `ui::progress_bar`, one per page for the
+    /// whole book — see `warm_thumbnail_cache`. Small enough to keep for the
+    /// whole session (cleared only when a different book opens) without it
+    /// costing much, and exists so there's always *something* instant to
+    /// show while the sharp version in `thumbnail_hires_textures` is still
+    /// decoding. Kept separate from `textures` since scrubbing can touch
+    /// pages far outside the current spread's prefetch/eviction window.
+    pub thumbnail_textures: HashMap<usize, egui::TextureHandle>,
+    /// Sharp on-demand previews for whichever page(s) the progress bar was
+    /// actually hovered over recently — see `request_thumbnail`. Far more
+    /// expensive per page than `thumbnail_textures`, so this is capped
+    /// (`THUMBNAIL_HIRES_CACHE_CAP`) rather than kept for the whole book.
+    pub thumbnail_hires_textures: HashMap<usize, egui::TextureHandle>,
     pub loading: bool,
     pub load_error: Option<String>,
     /// Full path of the archive currently loaded, if any — `None` on the
@@ -187,6 +200,15 @@ pub struct ComicApp {
     /// piling up behind a worker that can't keep up.
     decode_queue: DecodeQueue,
     decode_result_rx: std::sync::mpsc::Receiver<crate::comic::prefetch::DecodedPage>,
+    /// The background thumbnail worker's request queue and result channel —
+    /// see `comic::thumbnail`. Decodes hover-preview thumbnails off the UI
+    /// thread so showing one never blocks a frame.
+    thumbnail_queue: crate::comic::thumbnail::ThumbnailQueue,
+    thumbnail_result_rx: std::sync::mpsc::Receiver<crate::comic::thumbnail::DecodedThumbnail>,
+    /// The page a hi-res thumbnail request is currently in flight for, if
+    /// any — `request_thumbnail` uses this to avoid re-queuing the same
+    /// page every single frame the cursor holds still over it.
+    thumbnail_pending: Option<usize>,
     /// Set by `next_spread`/`prev_spread` or an in-progress trackpad drag,
     /// consumed and cleared once fully settled.
     pub page_transition: Option<PageTransition>,
@@ -206,6 +228,7 @@ pub struct ComicApp {
 impl Default for ComicApp {
     fn default() -> Self {
         let (decode_queue, decode_result_rx) = crate::comic::prefetch::spawn_decode_worker();
+        let (thumbnail_queue, thumbnail_result_rx) = crate::comic::thumbnail::spawn_thumbnail_worker();
         Self {
             pages: Vec::new(),
             current_page: 0,
@@ -228,6 +251,8 @@ impl Default for ComicApp {
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
+            thumbnail_textures: HashMap::new(),
+            thumbnail_hires_textures: HashMap::new(),
             loading: false,
             load_error: None,
             current_path: None,
@@ -250,6 +275,9 @@ impl Default for ComicApp {
             load_generation: 0,
             decode_queue,
             decode_result_rx,
+            thumbnail_queue,
+            thumbnail_result_rx,
+            thumbnail_pending: None,
             page_transition: None,
             spine_color_pending_since: None,
             auto_check_updates: true,
@@ -361,6 +389,22 @@ impl ComicApp {
         if self.advance_backward() {
             self.begin_transition(-self.forward_entry_sign(), false, old);
         }
+    }
+
+    /// Jumps straight to the spread starting at `page_idx` — used by
+    /// `ui::progress_bar` when the progress bar is clicked. Clamped to a
+    /// valid index; drops any in-flight page-turn transition and clears the
+    /// peek offset, since an arbitrary jump has no adjacent spread to slide
+    /// in from. No pairing realignment: `page_idx` becomes the new spread's
+    /// own leading page, same as a history/session resume.
+    pub fn jump_to_page(&mut self, page_idx: usize) {
+        if self.total_pages == 0 {
+            return;
+        }
+        self.current_page = page_idx.min(self.total_pages - 1);
+        self.page_offset = 0;
+        self.page_transition = None;
+        self.mark_history_dirty();
     }
 
     /// Moves to the next spread without starting any transition — the
@@ -793,6 +837,10 @@ impl ComicApp {
                 Ok(LoadEvent::Finished(result)) => {
                     self.textures.clear();
                     self.page_meta.clear();
+                    self.thumbnail_textures.clear();
+                    self.thumbnail_hires_textures.clear();
+                    self.thumbnail_pending = None;
+                    self.thumbnail_queue.clear();
                     self.total_pages = result.pages.len();
                     self.pages = result.pages;
                     self.filename = result.filename;
@@ -812,6 +860,7 @@ impl ComicApp {
                     self.pending_load = None;
                     self.window_title = format!("Comic Reader — {}", self.filename);
                     self.title_dirty = true;
+                    self.warm_thumbnail_cache();
 
                     let last_page = self.effective_position();
                     self.history.touch(&result.path, &self.filename, last_page, self.total_pages);
@@ -922,6 +971,127 @@ impl ComicApp {
                 ctx.load_texture(format!("page_{}", decoded.page_idx), decoded.image, egui::TextureOptions::LINEAR)
             });
         }
+    }
+
+    /// Asks the background thumbnail worker (`comic::thumbnail`) to decode
+    /// `page_idx`'s hover preview right away, ahead of any whole-book
+    /// preload in progress, unless it's already cached or already the most
+    /// recently requested page — called every frame `ui::progress_bar`
+    /// shows a preview for `page_idx`, so holding the cursor still over one
+    /// spot doesn't keep re-queuing (and re-cloning that page's bytes for)
+    /// the same request.
+    /// Above this many cached hi-res hover previews, the whole cache is
+    /// dropped rather than evicted piecemeal — simplest way to bound its
+    /// (much higher per-page) memory cost without tracking per-entry
+    /// recency. Never hit in normal use (you'd need to scrub across this
+    /// many distinct pages in one sitting), just a backstop.
+    const THUMBNAIL_HIRES_CACHE_CAP: usize = 30;
+
+    /// Asks the background thumbnail worker (`comic::thumbnail`) to decode
+    /// `page_idx`'s *sharp* hover preview right away, ahead of anything
+    /// else queued, unless it's already cached or already the most recently
+    /// requested page — called every frame `ui::progress_bar` shows a
+    /// preview for `page_idx`, so holding the cursor still over one spot
+    /// doesn't keep re-queuing (and re-cloning that page's bytes for) the
+    /// same request. The cheap low-res preview from `warm_thumbnail_cache`
+    /// is what actually makes the popup feel instant; this just upgrades it
+    /// to something sharp a few milliseconds later.
+    pub fn request_thumbnail(&mut self, page_idx: usize) {
+        if self.thumbnail_hires_textures.contains_key(&page_idx) || self.thumbnail_pending == Some(page_idx) {
+            return;
+        }
+        let Some(data) = self.pages.get(page_idx) else { return };
+        self.thumbnail_pending = Some(page_idx);
+        self.thumbnail_queue.prioritize(crate::comic::thumbnail::ThumbnailRequest {
+            generation: self.load_generation,
+            page_idx,
+            tier: crate::comic::thumbnail::ThumbnailTier::High,
+            max_dimension: crate::comic::thumbnail::HIGH_RES_MAX_DIMENSION,
+            data: data.clone(),
+        });
+    }
+
+    /// Call once per frame: turns every background-decoded thumbnail that's
+    /// finished since the last poll into a GPU texture, routed to the
+    /// low-res or hi-res cache per its tier (capping the latter). Cheap
+    /// no-op when nothing has arrived.
+    pub fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+        use crate::comic::thumbnail::ThumbnailTier;
+
+        while let Ok(decoded) = self.thumbnail_result_rx.try_recv() {
+            if decoded.tier == ThumbnailTier::High && self.thumbnail_pending == Some(decoded.page_idx) {
+                self.thumbnail_pending = None;
+            }
+            if decoded.generation != self.load_generation {
+                continue; // stale — belonged to a since-replaced archive
+            }
+            let texture = ctx.load_texture(
+                format!("thumb_{}_{:?}", decoded.page_idx, decoded.tier),
+                decoded.image,
+                egui::TextureOptions::LINEAR,
+            );
+            match decoded.tier {
+                ThumbnailTier::Low => {
+                    self.thumbnail_textures.insert(decoded.page_idx, texture);
+                }
+                ThumbnailTier::High => {
+                    if self.thumbnail_hires_textures.len() >= Self::THUMBNAIL_HIRES_CACHE_CAP {
+                        self.thumbnail_hires_textures.clear();
+                    }
+                    self.thumbnail_hires_textures.insert(decoded.page_idx, texture);
+                }
+            }
+            // The whole point of decoding off-thread is to show the preview
+            // the instant it's ready — don't wait for the next mouse move.
+            ctx.request_repaint();
+        }
+    }
+
+    /// Queues a background decode, at low priority and low resolution, for
+    /// every page that doesn't already have a cached low-res thumbnail —
+    /// called once when a book finishes loading, so the whole book
+    /// gradually becomes ready to hover instantly well before the reader
+    /// would ever check the progress bar, rather than only starting once
+    /// they go looking for it. Kept for the entire session (cleared only
+    /// when a different book is opened, same as the full-page texture
+    /// cache) instead of being unloaded after a period of inactivity — at
+    /// this resolution the memory cost is modest even for a very long book,
+    /// and unloading was actively counterproductive: normal reading goes
+    /// idle for longer than any reasonable timeout, so the cache would tend
+    /// to be cold again right when it'd actually get used. `request_thumbnail`
+    /// layers a sharper on-demand preview on top for whichever page is
+    /// actually under the cursor.
+    fn warm_thumbnail_cache(&mut self) {
+        let generation = self.load_generation;
+        let current = self.effective_position();
+        let cached: HashSet<usize> = self.thumbnail_textures.keys().copied().collect();
+        let wanted = Self::thumbnail_preload_order(self.total_pages, current, &cached);
+
+        let pages = &self.pages;
+        let requests = wanted
+            .into_iter()
+            .filter_map(|page_idx| {
+                pages.get(page_idx).map(|data| crate::comic::thumbnail::ThumbnailRequest {
+                    generation,
+                    page_idx,
+                    tier: crate::comic::thumbnail::ThumbnailTier::Low,
+                    max_dimension: crate::comic::thumbnail::LOW_RES_MAX_DIMENSION,
+                    data: data.clone(),
+                })
+            })
+            .collect();
+        self.thumbnail_queue.extend_low_priority(requests);
+    }
+
+    /// Every page index in `0..total_pages` not already in `cached`,
+    /// ordered by distance from `current` (closest first) — split out from
+    /// `warm_thumbnail_cache` as a pure function purely so the ordering
+    /// itself is unit-testable without needing real texture handles or a
+    /// running decode worker.
+    fn thumbnail_preload_order(total_pages: usize, current: usize, cached: &HashSet<usize>) -> Vec<usize> {
+        let mut wanted: Vec<usize> = (0..total_pages).filter(|idx| !cached.contains(idx)).collect();
+        wanted.sort_by_key(|&idx| (idx as isize - current as isize).abs());
+        wanted
     }
 
     /// Starts a background check against GitHub's latest release. No-op if
@@ -1244,6 +1414,81 @@ mod tests {
         app.start_page_drag(false);
         assert!(!app.is_dragging());
         assert!(app.page_transition.is_none());
+    }
+
+    #[test]
+    fn jump_to_page_moves_directly_there() {
+        let mut app = app_with(10, &[]);
+        app.jump_to_page(6);
+        assert_eq!((app.left_page(), app.right_page()), (Some(6), Some(7)));
+    }
+
+    #[test]
+    fn jump_to_page_clamps_past_the_end() {
+        let mut app = app_with(10, &[]);
+        app.jump_to_page(999);
+        assert_eq!(app.current_page, 9);
+    }
+
+    #[test]
+    fn jump_to_page_clears_peek_offset_and_any_in_flight_transition() {
+        let mut app = app_with(10, &[]);
+        app.shift_right();
+        app.next_spread(); // leaves an in-flight page_transition
+        assert!(app.page_transition.is_some());
+
+        app.jump_to_page(4);
+        assert_eq!(app.page_offset, 0);
+        assert!(app.page_transition.is_none());
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+    }
+
+    #[test]
+    fn request_thumbnail_marks_pending_and_avoids_requeuing_the_same_page() {
+        let mut app = app_with(4, &[]);
+        app.pages = vec![vec![0u8]; 4]; // dummy bytes — only pending-tracking matters here
+
+        assert!(app.thumbnail_pending.is_none());
+        app.request_thumbnail(2);
+        assert_eq!(app.thumbnail_pending, Some(2));
+
+        // Still hovering the same page: no-op, stays marked pending for it.
+        app.request_thumbnail(2);
+        assert_eq!(app.thumbnail_pending, Some(2));
+    }
+
+    #[test]
+    fn request_thumbnail_skips_a_page_already_cached_at_hires() {
+        let mut app = app_with(4, &[]);
+        app.pages = vec![vec![0u8]; 4];
+
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+        let texture = ctx.load_texture("test_thumb", image, egui::TextureOptions::LINEAR);
+        // A low-res cache hit alone shouldn't skip the request: it's the
+        // hi-res tier `request_thumbnail` is responsible for.
+        app.thumbnail_textures.insert(1, texture.clone());
+        app.request_thumbnail(1);
+        assert_eq!(app.thumbnail_pending, Some(1));
+
+        app.thumbnail_pending = None;
+        app.thumbnail_hires_textures.insert(1, texture);
+        app.request_thumbnail(1);
+        assert!(app.thumbnail_pending.is_none()); // never queued: already cached at hi-res
+    }
+
+    #[test]
+    fn thumbnail_preload_order_starts_from_the_current_page_outward() {
+        let cached = HashSet::new();
+        let order = ComicApp::thumbnail_preload_order(6, 2, &cached);
+        assert_eq!(order, vec![2, 1, 3, 0, 4, 5]);
+    }
+
+    #[test]
+    fn thumbnail_preload_order_skips_already_cached_pages() {
+        let cached: HashSet<usize> = [2, 3].into_iter().collect();
+        let order = ComicApp::thumbnail_preload_order(6, 2, &cached);
+        assert_eq!(order, vec![1, 0, 4, 5]);
     }
 
     #[test]

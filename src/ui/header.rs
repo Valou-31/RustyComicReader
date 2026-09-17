@@ -1,10 +1,11 @@
 use crate::app::{ComicApp, UI_HIDE_DELAY, UpdateStatus};
 use egui::Ui;
 
-/// Draws the top bar (filename, live page numbers, peek badge, controls) for
-/// an open comic. Fades out after `UI_HIDE_DELAY` of no mouse movement and
-/// fades back in as soon as the mouse moves — skips layout entirely once
-/// fully hidden, so it doesn't intercept clicks meant for the reader below.
+/// Draws the top bar (filename, live page numbers, peek badge, controls) and
+/// the page-progress bar right below it for an open comic. Fades out after
+/// `UI_HIDE_DELAY` of no mouse movement and fades back in as soon as the
+/// mouse moves — skips layout entirely once fully hidden, so it doesn't
+/// intercept clicks meant for the reader below.
 pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
     let visible = app.idle_time() < UI_HIDE_DELAY;
     let alpha = ui.ctx().animate_bool_with_time(
@@ -62,6 +63,8 @@ pub fn draw_header(ui: &mut Ui, app: &mut ComicApp) {
         });
 
         ui.separator();
+        crate::ui::progress_bar::draw_progress_bar(ui, app);
+        ui.add_space(4.0);
     });
 }
 
