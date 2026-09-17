@@ -136,6 +136,13 @@ pub struct ComicApp {
     /// second swipe. Not persisted: purely a within-session, frame-to-frame
     /// signal, reset fresh on every launch.
     pub swipe_locked: bool,
+    /// Whether `ui::progress_bar` decodes and shows page previews at all.
+    /// On by default; with it off, cost is zero — `warm_thumbnail_cache`
+    /// never runs and `thumbnail_textures`/`thumbnail_hires_textures` stay
+    /// empty — and toggling it off mid-session (`set_show_page_preview`)
+    /// unloads whatever was already cached. The progress bar itself (fill,
+    /// hover marker, click-to-jump) is unaffected either way.
+    pub show_page_preview: bool,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -248,6 +255,7 @@ impl Default for ComicApp {
             scroll_sensitivity: 1.0,
             one_turn_per_swipe: true,
             swipe_locked: false,
+            show_page_preview: true,
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
@@ -302,6 +310,7 @@ impl ComicApp {
             self.scroll_inverted = config.scroll_inverted;
             self.scroll_sensitivity = config.scroll_sensitivity;
             self.one_turn_per_swipe = config.one_turn_per_swipe;
+            self.show_page_preview = config.show_page_preview;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
             self.auto_check_updates = config.auto_check_updates;
@@ -362,6 +371,7 @@ impl ComicApp {
             scroll_inverted: self.scroll_inverted,
             scroll_sensitivity: self.scroll_sensitivity,
             one_turn_per_swipe: self.one_turn_per_swipe,
+            show_page_preview: self.show_page_preview,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
             auto_check_updates: self.auto_check_updates,
@@ -860,7 +870,9 @@ impl ComicApp {
                     self.pending_load = None;
                     self.window_title = format!("Comic Reader — {}", self.filename);
                     self.title_dirty = true;
-                    self.warm_thumbnail_cache();
+                    if self.show_page_preview {
+                        self.warm_thumbnail_cache();
+                    }
 
                     let last_page = self.effective_position();
                     self.history.touch(&result.path, &self.filename, last_page, self.total_pages);
@@ -1045,6 +1057,39 @@ impl ComicApp {
             // the instant it's ready — don't wait for the next mouse move.
             ctx.request_repaint();
         }
+    }
+
+    /// Turns the whole page-preview feature on or off, from Settings.
+    /// Turning it on immediately starts the whole-book low-res preload (if
+    /// a book is open); turning it off drops everything it had cached —
+    /// both tiers, plus anything still queued and any in-flight hover
+    /// request — so the memory is actually freed, not just left unused.
+    /// No-op (skips the save) if already in that state.
+    pub fn set_show_page_preview(&mut self, enabled: bool) {
+        if self.apply_show_page_preview(enabled) {
+            self.save_config();
+        }
+    }
+
+    /// The mutating half of `set_show_page_preview`, split out so it can be
+    /// exercised without the accompanying disk write. Returns whether
+    /// anything actually changed (`false` if already in that state).
+    fn apply_show_page_preview(&mut self, enabled: bool) -> bool {
+        if self.show_page_preview == enabled {
+            return false;
+        }
+        self.show_page_preview = enabled;
+        if enabled {
+            if !self.pages.is_empty() {
+                self.warm_thumbnail_cache();
+            }
+        } else {
+            self.thumbnail_textures.clear();
+            self.thumbnail_hires_textures.clear();
+            self.thumbnail_queue.clear();
+            self.thumbnail_pending = None;
+        }
+        true
     }
 
     /// Queues a background decode, at low priority and low resolution, for
@@ -1489,6 +1534,31 @@ mod tests {
         let cached: HashSet<usize> = [2, 3].into_iter().collect();
         let order = ComicApp::thumbnail_preload_order(6, 2, &cached);
         assert_eq!(order, vec![1, 0, 4, 5]);
+    }
+
+    #[test]
+    fn disabling_page_preview_unloads_both_caches_and_pending_state() {
+        let mut app = app_with(4, &[]);
+        app.pages = vec![vec![0u8]; 4];
+
+        let ctx = egui::Context::default();
+        let image = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+        app.thumbnail_textures.insert(0, ctx.load_texture("a", image.clone(), egui::TextureOptions::LINEAR));
+        app.thumbnail_hires_textures.insert(0, ctx.load_texture("b", image, egui::TextureOptions::LINEAR));
+        app.thumbnail_pending = Some(0);
+
+        assert!(app.apply_show_page_preview(false));
+        assert!(app.thumbnail_textures.is_empty());
+        assert!(app.thumbnail_hires_textures.is_empty());
+        assert!(app.thumbnail_pending.is_none());
+        assert!(!app.show_page_preview);
+    }
+
+    #[test]
+    fn toggling_page_preview_to_the_same_state_is_a_no_op() {
+        let mut app = app_with(4, &[]);
+        assert!(app.show_page_preview); // on by default
+        assert!(!app.apply_show_page_preview(true));
     }
 
     #[test]

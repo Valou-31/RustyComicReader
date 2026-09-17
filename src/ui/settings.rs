@@ -163,6 +163,21 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             }
 
             ui.separator();
+            ui.heading("Progress Bar");
+            let mut show_page_preview = app.show_page_preview;
+            if ui
+                .checkbox(&mut show_page_preview, "Show page preview on hover")
+                .on_hover_text(
+                    "Preview the page under the cursor when hovering the progress bar. Turning \
+                     this off also unloads the whole-book preview cache, freeing the memory it \
+                     was using.",
+                )
+                .changed()
+            {
+                app.set_show_page_preview(show_page_preview);
+            }
+
+            ui.separator();
             ui.heading("Session");
             if ui
                 .checkbox(&mut app.resume_last_session, "Reopen the last book on startup")
