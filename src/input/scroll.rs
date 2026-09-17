@@ -33,7 +33,13 @@ const DRAG_FULL_DISTANCE: f32 = 220.0;
 /// this lock those trailing deltas just look like more swiping and can
 /// accumulate into a second (or third) commit.
 pub fn handle_scroll(app: &mut ComicApp, ctx: &egui::Context) {
-    if app.pages.is_empty() || app.show_settings || app.show_history || app.remapping_action.is_some() {
+    if app.pages.is_empty()
+        || app.show_settings
+        || app.show_history
+        || app.show_bookmarks
+        || app.toolbar_edit_mode
+        || app.remapping_action.is_some()
+    {
         return;
     }
 

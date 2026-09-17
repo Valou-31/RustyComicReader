@@ -208,7 +208,7 @@ fn handle_zoom_and_pan(ui: &Ui, app: &mut ComicApp, base_rect: Rect) {
     // area still counts as claimed for layout even when zoomed out.
     let response = ui.interact(base_rect, ui.id().with("reader_pan_zoom"), egui::Sense::click_and_drag());
 
-    if app.show_settings || app.show_history {
+    if app.show_settings || app.show_history || app.show_bookmarks {
         return;
     }
 

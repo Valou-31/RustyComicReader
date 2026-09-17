@@ -1,5 +1,6 @@
 use crate::comic::prefetch::{DecodeQueue, DecodeRequest};
 use crate::input::keybindings::{Action, KeyBindings};
+use crate::storage::bookmarks::Bookmarks;
 use crate::storage::config::Config;
 use crate::storage::history::History;
 use crate::ui::layout::LayoutConfig;
@@ -240,6 +241,22 @@ pub struct ComicApp {
     /// Set true by navigation, cleared once `flush_history` runs.
     history_dirty: bool,
     history_last_saved: std::time::Instant,
+    /// Saved reading spots, independent of `history` (which only ever
+    /// tracks the single most recent position per book) — see
+    /// `toggle_bookmark`.
+    pub bookmarks: Bookmarks,
+    pub show_bookmarks: bool,
+    /// Live drag-and-drop toolbar customization, toggled from Settings.
+    /// Not persisted — always starts off on launch. While true, the header
+    /// and footer render their controls as draggable chips instead of their
+    /// normal interactive form, plus a "done"/remove/add-new strip.
+    pub toolbar_edit_mode: bool,
+    /// A toolbar drag-and-drop move or removal discovered during this
+    /// frame's rendering, applied by `apply_pending_toolbar_edit` before the
+    /// *next* frame's toolbar rows render — see
+    /// `ui::toolbar::PendingToolbarEdit` for why this can't just mutate
+    /// `layout.toolbar_items` immediately.
+    pub toolbar_pending_edit: Option<crate::ui::toolbar::PendingToolbarEdit>,
     /// Whether to reopen the last-read book (at its last page) on startup.
     /// Persisted; toggled from the settings panel.
     pub resume_last_session: bool,
@@ -339,6 +356,10 @@ impl Default for ComicApp {
             show_history: false,
             history_dirty: false,
             history_last_saved: std::time::Instant::now(),
+            bookmarks: Bookmarks::default(),
+            show_bookmarks: false,
+            toolbar_edit_mode: false,
+            toolbar_pending_edit: None,
             resume_last_session: true,
             resume_to_page: None,
             pending_pick: None,
@@ -392,6 +413,9 @@ impl ComicApp {
         }
         if let Ok(history) = History::load() {
             self.history = history;
+        }
+        if let Ok(bookmarks) = Bookmarks::load() {
+            self.bookmarks = bookmarks;
         }
     }
 
@@ -461,6 +485,27 @@ impl ComicApp {
         }
     }
 
+    /// Applies and clears any toolbar drag-and-drop move/removal queued
+    /// during the *previous* frame — must run before any toolbar row
+    /// renders this frame (`ui::header::draw_header`,
+    /// `ui::footer::draw_footer`), which is why `main.rs` calls it first
+    /// thing. See `ui::toolbar::PendingToolbarEdit` for why the mutation is
+    /// deferred at all rather than applied the instant the drop happens.
+    pub fn apply_pending_toolbar_edit(&mut self) {
+        if let Some(edit) = self.toolbar_pending_edit.take() {
+            edit.apply(self);
+        }
+    }
+
+    /// Whether a modal-ish panel (Settings, History, Bookmarks) is open.
+    /// These are plain `egui::Window`s (`Order::Middle`), which a floating
+    /// header/footer (`Order::Foreground` — always drawn above `Middle`,
+    /// regardless of call order) would otherwise draw right over, masking
+    /// whatever of the panel it overlaps.
+    pub fn any_modal_panel_open(&self) -> bool {
+        self.show_settings || self.show_history || self.show_bookmarks
+    }
+
     /// Advances from wherever the peek offset currently has us looking (not
     /// from the un-offset spread boundary, so a peek — `shift_right`/
     /// `shift_left` — carries forward instead of being discarded) to the
@@ -496,6 +541,33 @@ impl ComicApp {
         self.page_transition = None;
         self.reset_zoom_for_new_page();
         self.mark_history_dirty();
+    }
+
+    /// Whether the currently displayed spread has a bookmark — drives the
+    /// header's bookmark toggle button. `false` on the empty-state screen.
+    pub fn is_current_page_bookmarked(&self) -> bool {
+        match &self.current_path {
+            Some(path) => self.bookmarks.contains(path, self.effective_position()),
+            None => false,
+        }
+    }
+
+    /// Adds or removes a bookmark for the currently displayed spread — the
+    /// header's bookmark toggle button. No-op on the empty-state screen.
+    pub fn toggle_bookmark(&mut self) {
+        if self.apply_toggle_bookmark() && let Err(err) = self.bookmarks.save() {
+            tracing::warn!("Failed to save bookmarks: {err}");
+        }
+    }
+
+    /// The mutating half of `toggle_bookmark`, split out so it can be
+    /// exercised without the accompanying disk write. Returns whether it
+    /// actually did anything (`false` on the empty-state screen).
+    fn apply_toggle_bookmark(&mut self) -> bool {
+        let Some(path) = self.current_path.clone() else { return false };
+        let page = self.effective_position();
+        self.bookmarks.toggle(&path, &self.filename, page, self.total_pages);
+        true
     }
 
     /// Moves to the next spread without starting any transition — the
@@ -914,6 +986,16 @@ impl ComicApp {
         self.load_preview = None;
         self.preview_texture = None;
         self.pending_load = Some(crate::comic::loader::spawn_file_load(path));
+    }
+
+    /// Like `start_loading_path`, but jumps straight to `page` once loading
+    /// finishes instead of the beginning — used by the bookmarks panel to
+    /// open a book directly at a saved spot. Reuses the same mechanism
+    /// session-resume already uses (`resume_to_page`, consumed in
+    /// `poll_loading`'s `LoadEvent::Finished` handler).
+    pub fn start_loading_path_at(&mut self, path: PathBuf, page: usize) {
+        self.resume_to_page = Some(page);
+        self.start_loading_path(path);
     }
 
     /// Pops the next queued file (if any) and starts loading it.
@@ -1745,6 +1827,41 @@ mod tests {
         assert!(!app.is_zoomed());
         app.zoom_right = zoomed(1.5, egui::Vec2::ZERO);
         assert!(app.is_zoomed());
+    }
+
+    #[test]
+    fn toggle_bookmark_is_a_no_op_with_no_book_open() {
+        let mut app = app_with(6, &[]);
+        assert!(!app.apply_toggle_bookmark());
+        assert!(app.bookmarks.entries.is_empty());
+    }
+
+    #[test]
+    fn toggle_bookmark_marks_and_unmarks_the_current_spread() {
+        let mut app = app_with(6, &[]);
+        app.current_path = Some(PathBuf::from("/tmp/book.cbz"));
+        app.filename = "book.cbz".to_string();
+
+        assert!(!app.is_current_page_bookmarked());
+        assert!(app.apply_toggle_bookmark());
+        assert!(app.is_current_page_bookmarked());
+
+        assert!(app.apply_toggle_bookmark());
+        assert!(!app.is_current_page_bookmarked());
+    }
+
+    #[test]
+    fn bookmark_is_specific_to_the_spread_it_was_added_on() {
+        let mut app = app_with(6, &[]);
+        app.current_path = Some(PathBuf::from("/tmp/book.cbz"));
+        app.filename = "book.cbz".to_string();
+        app.apply_toggle_bookmark();
+
+        app.next_spread();
+        assert!(!app.is_current_page_bookmarked());
+
+        app.prev_spread();
+        assert!(app.is_current_page_bookmarked());
     }
 
     #[test]

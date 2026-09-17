@@ -1,6 +1,6 @@
 use crate::app::{ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode, ZoomTarget};
 use crate::input::keybindings::{Action, Preset};
-use crate::ui::layout::LayoutConfig;
+use crate::ui::layout::{LayoutConfig, MIN_MENU_BUTTON_OPACITY};
 use crate::ui::theme::ThemePreset;
 use egui::{Color32, Context};
 use std::time::Duration;
@@ -32,9 +32,11 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
     let mut open = true;
     egui::Window::new("⚙ Settings")
         .open(&mut open)
-        .resizable(false)
+        .resizable(true)
         .collapsible(false)
+        .default_height(520.0)
         .show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.heading("Reading Direction");
             ui.horizontal(|ui| {
                 if ui.selectable_label(app.reading_mode == ReadingMode::LTR, "➡ LTR (Western)").clicked() {
@@ -277,6 +279,27 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                 ui.label("Fade speed (ms)");
                 layout_changed |= ui.add(egui::Slider::new(&mut app.layout.fade_duration_ms, 50..=1000)).changed();
             });
+            if ui
+                .checkbox(&mut app.layout.header_floats_over_reader, "Float the top bar over the page")
+                .on_hover_text(
+                    "When shown, the top bar draws over the page instead of shrinking it to make room. \
+                     The bottom bar already works this way.",
+                )
+                .changed()
+            {
+                layout_changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Menu background opacity");
+                layout_changed |= ui.add(egui::Slider::new(&mut app.layout.menu_bg_opacity, 0.0..=1.0)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Menu button opacity");
+                layout_changed |= ui
+                    .add(egui::Slider::new(&mut app.layout.menu_button_opacity, MIN_MENU_BUTTON_OPACITY..=1.0))
+                    .on_hover_text("Capped at a minimum so buttons stay legible over the page.")
+                    .changed();
+            });
             ui.horizontal(|ui| {
                 ui.label("Page transition speed (ms)");
                 layout_changed |=
@@ -291,9 +314,30 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             }
 
             ui.separator();
+            ui.heading("Toolbar");
+            ui.label(
+                "Customize the header and footer bars — add rows, group controls into left/center/\
+                 right blocks, or move controls to a footer bar pinned to the bottom of the window.",
+            );
+            let book_open = !app.pages.is_empty();
+            let edit_toolbar_clicked = ui
+                .add_enabled(book_open, egui::Button::new("Edit Toolbar Layout"))
+                .on_disabled_hover_text("Open a comic first — the toolbar only shows in the reading view.")
+                .clicked();
+            if edit_toolbar_clicked {
+                app.toolbar_edit_mode = true;
+                app.show_settings = false;
+            }
+            if ui.button("Reset toolbar to default").clicked() {
+                app.layout.toolbar_items = LayoutConfig::default_toolbar_items();
+                app.save_config();
+            }
+
+            ui.separator();
             if ui.button("Close").clicked() {
                 app.show_settings = false;
             }
+        });
         });
 
     if !open {

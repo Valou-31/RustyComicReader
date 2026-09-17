@@ -15,6 +15,35 @@ use std::path::PathBuf;
 
 const LOGO_BYTES: &[u8] = include_bytes!("logo.ico");
 
+/// Appends every panic (message, location, and a forced backtrace) to
+/// `crash.log` next to `config.json`, in addition to letting the default
+/// hook still print to stderr as usual. A panic in a GUI app launched
+/// outside a terminal (double-click, `Finder`, a bundled `.app`) leaves no
+/// trace anywhere else — the window just disappears — so this is the only
+/// way to actually diagnose one after the fact.
+fn install_crash_log_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let Some(config_dir) = dirs::config_dir() else { return };
+        let log_path = config_dir.join("comic-reader").join("crash.log");
+        let Some(parent) = log_path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = format!("\n--- crash at unix time {timestamp} ---\n{info}\n{backtrace}\n");
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = file.write_all(entry.as_bytes());
+        }
+    }));
+}
+
 /// Decodes the embedded logo into raw RGBA bytes plus its dimensions, shared
 /// by both the OS window/taskbar icon and the in-app splash texture.
 fn load_logo_rgba() -> (Vec<u8>, u32, u32) {
@@ -42,6 +71,7 @@ fn opened_files() -> Vec<PathBuf> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    install_crash_log_hook();
     let (rgba, width, height) = load_logo_rgba();
     let options = eframe::NativeOptions {
         // `app_id` is what Wayland compositors (KWin, GNOME Shell...) use to
@@ -70,6 +100,9 @@ impl eframe::App for ComicApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {  // ✅ Changé : &mut Ui au lieu de Context
+        // Must run before the header/footer render any toolbar row this
+        // frame — see `ComicApp::apply_pending_toolbar_edit`.
+        self.apply_pending_toolbar_edit();
         self.theme_preset.theme().apply(ui.ctx());
         self.poll_picking();
         self.poll_loading();
@@ -96,6 +129,7 @@ impl eframe::App for ComicApp {
         input::scroll::handle_scroll(self, ui.ctx());
         ui::settings::draw_settings(ui.ctx(), self);
         ui::history::draw_history(ui.ctx(), self);
+        ui::bookmarks::draw_bookmarks(ui.ctx(), self);
 
         if !self.pages.is_empty() {
             let moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
@@ -166,7 +200,7 @@ impl eframe::App for ComicApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
                 }
                 ui.label("Chargez un fichier pour commencer");
-                if ui.button("Load File").clicked() {
+                if ui.button("📂 Load File").clicked() {
                     self.start_loading_file();
                 }
                 ui.add_space(8.0);
@@ -179,17 +213,36 @@ impl eframe::App for ComicApp {
                 if ui.button("🕘 History").clicked() {
                     self.show_history = true;
                 }
+                if ui.button("📑 Bookmarks").clicked() {
+                    self.show_bookmarks = true;
+                }
                 ui::header::draw_update_indicator(ui, self);
             });
+        } else if self.toolbar_edit_mode {
+            // Replaces the header/reader/footer entirely rather than
+            // squeezing into the header's usual compact space above the
+            // page — editing isn't reading, so there's no reason to
+            // preserve room for it (see `ui::toolbar::draw_toolbar_editor`).
+            ui::toolbar::draw_toolbar_editor(ui, self);
+        } else if self.layout.header_floats_over_reader {
+            // The page fills the whole window and the header draws over it
+            // afterward, in its own floating layer — instead of `draw_header`
+            // reserving its own space above the page (shrinking it to fit).
+            ui::reader::draw_double_page(ui, self);
+            ui::header::draw_header_overlay(ui.ctx(), self);
+            ui::footer::draw_footer(ui.ctx(), self);
         } else {
             ui::header::draw_header(ui, self);
             ui::reader::draw_double_page(ui, self);
+            ui::footer::draw_footer(ui.ctx(), self);
         }
 
         // Warm-tint overlay for the blue light filter — painted last, above
         // everything else, on a dedicated foreground layer so it never
         // intercepts clicks meant for the header or the reader below it.
-        if let Some(color) = self.blue_light_overlay_color() {
+        // Skipped while editing: there's no page underneath to tint, just
+        // the editor itself.
+        if !self.toolbar_edit_mode && let Some(color) = self.blue_light_overlay_color() {
             let screen_rect = ui.ctx().input(|i| i.viewport_rect());
             ui.ctx()
                 .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("blue_light_filter")))

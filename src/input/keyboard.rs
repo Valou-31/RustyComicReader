@@ -30,6 +30,16 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
         return;
     }
 
+    // The toolbar editor replaces the reader entirely (see `main.rs`), so
+    // there's no page underneath for arrow keys etc. to turn — same
+    // Escape-only pattern as the settings window above.
+    if app.toolbar_edit_mode {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.toolbar_edit_mode = false;
+        }
+        return;
+    }
+
     // Normal reading navigation.
     ctx.input(|input| {
         for event in &input.events {
