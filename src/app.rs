@@ -58,6 +58,10 @@ pub struct PageTransition {
 pub enum ReadingMode {
     LTR, // Left-to-Right
     RTL, // Right-to-Left
+    /// One page on screen at a time — `pages_for_position` never pairs a
+    /// second page alongside it, so every turn moves by exactly one page
+    /// instead of two.
+    Single,
 }
 
 impl ReadingMode {
@@ -65,6 +69,7 @@ impl ReadingMode {
         match self {
             ReadingMode::LTR => "➡ LTR (Western)",
             ReadingMode::RTL => "⬅ RTL (Manga)",
+            ReadingMode::Single => "📄 Single Page",
         }
     }
 }
@@ -384,11 +389,12 @@ impl ComicApp {
 
     /// Which side the *next* spread visually enters from: `+1.0` (right) in
     /// traditional (LTR) mode, `-1.0` (left) in manga (RTL) mode — matches
-    /// the trackpad scroll direction convention in `input::scroll`.
-    /// `prev_spread` uses the opposite sign.
+    /// the trackpad scroll direction convention in `input::scroll`. Single
+    /// Page mode slides the same way as LTR. `prev_spread` uses the
+    /// opposite sign.
     fn forward_entry_sign(&self) -> f32 {
         match self.reading_mode {
-            ReadingMode::LTR => 1.0,
+            ReadingMode::LTR | ReadingMode::Single => 1.0,
             ReadingMode::RTL => -1.0,
         }
     }
@@ -414,7 +420,8 @@ impl ComicApp {
     }
 
     /// `left_page()`/`right_page()` (in that order) for the spread starting
-    /// at `position`. A double-page spread (its own image spanning a whole
+    /// at `position`. In Single Page mode `position` is always shown alone.
+    /// Otherwise, a double-page spread (its own image spanning a whole
     /// opening — see `PageMeta::is_spread`) occupies `position` alone, with
     /// `None` on the other side; so does a page whose would-be partner is
     /// one, since it can't be paired into a normal two-page spread either.
@@ -423,13 +430,17 @@ impl ComicApp {
         if position >= self.total_pages {
             return (None, None);
         }
+        if self.reading_mode == ReadingMode::Single {
+            return (Some(position), None);
+        }
         let partner = position + 1;
         if self.is_double_page(position) || partner >= self.total_pages || self.is_double_page(partner) {
             return (Some(position), None);
         }
-        match self.reading_mode {
-            ReadingMode::LTR => (Some(position), Some(partner)),
-            ReadingMode::RTL => (Some(partner), Some(position)),
+        if self.reading_mode == ReadingMode::RTL {
+            (Some(partner), Some(position))
+        } else {
+            (Some(position), Some(partner))
         }
     }
 
@@ -442,12 +453,13 @@ impl ComicApp {
 
     /// The leading page index of the spread immediately before the one
     /// starting at `position`, or `None` if `position` is already the
-    /// book's first page. Mirrors `pages_for_position`'s forward pairing
-    /// rule applied backwards: a page pairs with the one before it only if
+    /// book's first page. In Single Page mode this is always `position - 1`.
+    /// Otherwise it mirrors `pages_for_position`'s forward pairing rule
+    /// applied backwards: a page pairs with the one before it only if
     /// neither is a double-page spread.
     fn prev_spread_start(&self, position: usize) -> Option<usize> {
         let prev = position.checked_sub(1)?;
-        if prev == 0 || self.is_double_page(prev) {
+        if self.reading_mode == ReadingMode::Single || prev == 0 || self.is_double_page(prev) {
             return Some(prev);
         }
         let prev2 = prev - 1;
@@ -640,13 +652,42 @@ impl ComicApp {
         self.last_mouse_move.elapsed()
     }
 
+    /// Cycles LTR → RTL → Single Page → LTR — used by the single reading-
+    /// mode button in the header/empty-state screen, which shows the
+    /// current mode's own label and advances to the next one on each click.
     pub fn toggle_reading_mode(&mut self) {
-        self.reading_mode = match self.reading_mode {
+        self.set_reading_mode(Self::next_reading_mode(self.reading_mode));
+    }
+
+    fn next_reading_mode(mode: ReadingMode) -> ReadingMode {
+        match mode {
             ReadingMode::LTR => ReadingMode::RTL,
-            ReadingMode::RTL => ReadingMode::LTR,
-        };
+            ReadingMode::RTL => ReadingMode::Single,
+            ReadingMode::Single => ReadingMode::LTR,
+        }
+    }
+
+    /// Switches directly to `mode` — used by Settings' three explicit
+    /// reading-direction buttons. No-op (skips the offset reset and save)
+    /// if already in `mode`, so clicking the already-selected option is
+    /// harmless.
+    pub fn set_reading_mode(&mut self, mode: ReadingMode) {
+        if self.apply_reading_mode(mode) {
+            self.save_config();
+        }
+    }
+
+    /// The mutating half of `set_reading_mode`, split out so it can be
+    /// exercised without the accompanying disk write: switches to `mode`
+    /// and resets any active peek offset. Returns whether anything actually
+    /// changed (`false` if already in `mode`).
+    fn apply_reading_mode(&mut self, mode: ReadingMode) -> bool {
+        if self.reading_mode == mode {
+            return false;
+        }
+        self.reading_mode = mode;
         self.page_offset = 0;
-        self.save_config();
+        true
     }
 
     /// Largest offset for which the spread's left page still stays in bounds.
@@ -1021,6 +1062,73 @@ mod tests {
         let mut app = app_with(4, &[]);
         app.reading_mode = ReadingMode::RTL;
         assert_eq!((app.left_page(), app.right_page()), (Some(1), Some(0)));
+    }
+
+    #[test]
+    fn single_page_mode_shows_one_page_and_turns_one_at_a_time() {
+        let mut app = app_with(5, &[]);
+        app.reading_mode = ReadingMode::Single;
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), None));
+
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(1), None));
+
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), None));
+
+        app.prev_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(1), None));
+
+        app.prev_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), None));
+
+        // Already at the first page: nothing further back to step to.
+        app.prev_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), None));
+    }
+
+    #[test]
+    fn single_page_mode_ignores_double_page_pairing_rules() {
+        // Pages: 0(single) 1(DOUBLE) 2(single) 3(single) — in LTR/RTL mode
+        // page 0 would be orphaned solo because it can't pair with the
+        // double page at 1, but Single Page mode never pairs anything, so
+        // stepping through is uniform regardless of what's a double page.
+        let mut app = app_with(4, &[1]);
+        app.reading_mode = ReadingMode::Single;
+
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(1), None));
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), None));
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(3), None));
+    }
+
+    #[test]
+    fn reading_mode_cycles_ltr_rtl_single_ltr() {
+        // Exercises the pure cycling logic directly rather than through
+        // `toggle_reading_mode`, which also calls `save_config` (writes the
+        // user's real config file) — not something a unit test should do.
+        assert_eq!(ComicApp::next_reading_mode(ReadingMode::LTR), ReadingMode::RTL);
+        assert_eq!(ComicApp::next_reading_mode(ReadingMode::RTL), ReadingMode::Single);
+        assert_eq!(ComicApp::next_reading_mode(ReadingMode::Single), ReadingMode::LTR);
+    }
+
+    #[test]
+    fn apply_reading_mode_resets_peek_offset_and_reports_change() {
+        // Exercises `set_reading_mode`'s pure mutation half directly, since
+        // the public method also calls `save_config` (writes the user's
+        // real config file) — not something a unit test should do.
+        let mut app = app_with(4, &[]);
+        app.shift_right();
+        assert_eq!(app.page_offset, 1);
+
+        assert!(app.apply_reading_mode(ReadingMode::Single));
+        assert_eq!(app.page_offset, 0);
+        assert_eq!(app.reading_mode, ReadingMode::Single);
+
+        // Re-applying the same mode is a no-op and reports no change.
+        assert!(!app.apply_reading_mode(ReadingMode::Single));
     }
 
     /// Steps `app`'s transition at a fixed 60fps timestep until it's fully

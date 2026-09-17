@@ -37,19 +37,18 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
         .show(ctx, |ui| {
             ui.heading("Reading Direction");
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(app.reading_mode == ReadingMode::LTR, "➡ LTR (Western)")
-                    .clicked()
-                    && app.reading_mode != ReadingMode::LTR
-                {
-                    app.toggle_reading_mode();
+                if ui.selectable_label(app.reading_mode == ReadingMode::LTR, "➡ LTR (Western)").clicked() {
+                    app.set_reading_mode(ReadingMode::LTR);
+                }
+                if ui.selectable_label(app.reading_mode == ReadingMode::RTL, "⬅ RTL (Manga)").clicked() {
+                    app.set_reading_mode(ReadingMode::RTL);
                 }
                 if ui
-                    .selectable_label(app.reading_mode == ReadingMode::RTL, "⬅ RTL (Manga)")
+                    .selectable_label(app.reading_mode == ReadingMode::Single, "📄 Single Page")
+                    .on_hover_text("Shows one page at a time; each turn moves by a single page instead of two.")
                     .clicked()
-                    && app.reading_mode != ReadingMode::RTL
                 {
-                    app.toggle_reading_mode();
+                    app.set_reading_mode(ReadingMode::Single);
                 }
             });
 

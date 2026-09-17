@@ -1,4 +1,4 @@
-use crate::app::ComicApp;
+use crate::app::{ComicApp, ReadingMode};
 use crate::comic::archive::{ComicArchive, PageMeta};
 use egui::{Align, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use std::collections::HashMap;
@@ -59,6 +59,7 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
 
     let current_left = app.left_page();
     let current_right = app.right_page();
+    let single_page_mode = app.reading_mode == ReadingMode::Single;
 
     // This frame's transition state, if any: visual progress, which side
     // the new spread enters from, and the two spreads involved.
@@ -84,17 +85,17 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     // flush against the left edge of its — both meet at `mid_x` (or the
     // configured gap around it), so the spread reads as one continuous book
     // opening rather than two independently centered pages with a gap. A
-    // lone double-page spread instead spans the full width, centered.
-    // Each spread's seam travels with it, so both are drawn at their
-    // shifted `mid_x` while sliding.
+    // lone double-page spread — or any page at all in Single Page mode —
+    // instead spans the full width, centered. Each spread's seam travels
+    // with it, so both are drawn at their shifted `mid_x` while sliding.
     let seams: [Option<SpreadSeam>; 2] = if let Some((progress, entry_sign, old_left, old_right, new_left, new_right)) = sliding {
         ui.ctx().request_repaint();
         let width = available_rect.width();
         let new_shift = Vec2::new(entry_sign * (1.0 - progress) * width, 0.0);
         let old_shift = Vec2::new(-entry_sign * progress * width, 0.0);
 
-        let old_full = old_right.is_none() && is_double_page(old_left, ctx.page_meta);
-        let new_full = new_right.is_none() && is_double_page(new_left, ctx.page_meta);
+        let old_full = old_right.is_none() && (single_page_mode || is_double_page(old_left, ctx.page_meta));
+        let new_full = new_right.is_none() && (single_page_mode || is_double_page(new_left, ctx.page_meta));
         draw_spread(ui, &columns, old_shift, old_left, old_right, old_full, &mut ctx);
         draw_spread(ui, &columns, new_shift, new_left, new_right, new_full, &mut ctx);
 
@@ -103,7 +104,7 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
             Some(SpreadSeam { mid_x: mid_x + new_shift.x, left_idx: new_left, right_idx: new_right, full_spread: new_full }),
         ]
     } else {
-        let full_spread = current_right.is_none() && is_double_page(current_left, ctx.page_meta);
+        let full_spread = current_right.is_none() && (single_page_mode || is_double_page(current_left, ctx.page_meta));
         draw_spread(ui, &columns, Vec2::ZERO, current_left, current_right, full_spread, &mut ctx);
 
         [Some(SpreadSeam { mid_x, left_idx: current_left, right_idx: current_right, full_spread }), None]

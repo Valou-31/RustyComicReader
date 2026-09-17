@@ -79,11 +79,12 @@ pub fn handle_scroll(app: &mut ComicApp, ctx: &egui::Context) {
 }
 
 /// Whether a horizontal delta (positive = left-to-right, already adjusted
-/// for `scroll_inverted`) means "advance" for the given reading mode.
+/// for `scroll_inverted`) means "advance" for the given reading mode. Single
+/// Page mode follows the same convention as LTR.
 fn wants_forward(delta_x: f32, reading_mode: ReadingMode) -> bool {
     let left_to_right = delta_x > 0.0;
     match reading_mode {
         ReadingMode::RTL => left_to_right,
-        ReadingMode::LTR => !left_to_right,
+        ReadingMode::LTR | ReadingMode::Single => !left_to_right,
     }
 }
