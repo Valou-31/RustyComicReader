@@ -138,6 +138,30 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                     app.save_config();
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Swipe sensitivity");
+                if ui
+                    .add(egui::Slider::new(&mut app.scroll_sensitivity, 0.5..=2.5))
+                    .on_hover_text(
+                        "How little trackpad movement a full page turn takes. Higher is more \
+                         sensitive (less movement needed).",
+                    )
+                    .changed()
+                {
+                    app.save_config();
+                }
+            });
+            if ui
+                .checkbox(&mut app.one_turn_per_swipe, "One page turn per swipe")
+                .on_hover_text(
+                    "Cap a single trackpad swipe — including its momentum tail — to one page \
+                     turn, so a big or fast swipe can't skip several spreads at once. Turn off \
+                     to let a strong swipe chain through more than one.",
+                )
+                .changed()
+            {
+                app.save_config();
+            }
 
             ui.separator();
             ui.heading("Session");

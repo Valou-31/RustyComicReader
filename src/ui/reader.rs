@@ -52,30 +52,21 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
         right: Rect::from_min_max(Pos2::new(mid_x + half_gap, available_rect.top()), available_rect.right_bottom()),
     };
 
+    // Steps any in-flight page-turn spring by this frame's delta time — a
+    // no-op while idle. Clears `page_transition` itself once the spring's at
+    // rest, so there's no separate "is it finished" check to do here after.
+    app.step_transition(ui.ctx().input(|i| i.stable_dt));
+
     let current_left = app.left_page();
     let current_right = app.right_page();
 
-    // Resolves this frame's visual progress along the transition (live drag
-    // position, or eased animation toward its decided outcome), and whether
-    // it's done — a finished one is dropped here rather than left for the
-    // next navigation to overwrite.
-    let sliding = app.page_transition.as_ref().map(|t| {
-        let (progress, finished) = match &t.anim {
-            Some(anim) if !anim.duration.is_zero() && anim.started_at.elapsed() < anim.duration => {
-                let raw = anim.started_at.elapsed().as_secs_f32() / anim.duration.as_secs_f32();
-                (anim.from + (anim.to - anim.from) * ease_out_cubic(raw), false)
-            }
-            Some(anim) => (anim.to, true),
-            None => (t.progress, false),
-        };
-        (progress, finished, t.entry_sign, t.old_left, t.old_right, t.new_left, t.new_right)
-    });
-    if sliding.is_none_or(|(_, finished, ..)| finished) {
-        app.page_transition = None;
-    }
+    // This frame's transition state, if any: visual progress, which side
+    // the new spread enters from, and the two spreads involved.
+    let sliding =
+        app.page_transition.as_ref().map(|t| (t.progress, t.entry_sign, t.old_left, t.old_right, t.new_left, t.new_right));
 
     let keep_alive = [current_left, current_right].into_iter().flatten().chain(sliding.into_iter().flat_map(
-        |(_, _, _, old_left, old_right, new_left, new_right)| {
+        |(_, _, old_left, old_right, new_left, new_right)| {
             [old_left, old_right, new_left, new_right].into_iter().flatten()
         },
     ));
@@ -96,7 +87,7 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     // lone double-page spread instead spans the full width, centered.
     // Each spread's seam travels with it, so both are drawn at their
     // shifted `mid_x` while sliding.
-    let seams: [Option<SpreadSeam>; 2] = if let Some((progress, _, entry_sign, old_left, old_right, new_left, new_right)) = sliding {
+    let seams: [Option<SpreadSeam>; 2] = if let Some((progress, entry_sign, old_left, old_right, new_left, new_right)) = sliding {
         ui.ctx().request_repaint();
         let width = available_rect.width();
         let new_shift = Vec2::new(entry_sign * (1.0 - progress) * width, 0.0);
@@ -306,12 +297,6 @@ fn fit_to_height(size: Vec2, height: f32) -> Vec2 {
         return Vec2::ZERO;
     }
     size * (height / size.y)
-}
-
-/// Eases a page-turn slide's `0..=1` progress so it starts fast and settles
-/// in gently, instead of moving at a constant speed.
-fn ease_out_cubic(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(3)
 }
 
 /// Whether `idx`'s own image is a double-page spread (as opposed to merely

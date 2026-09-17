@@ -26,8 +26,10 @@ pub struct LayoutConfig {
     pub page_gap: f32,
     /// Duration in milliseconds of the header show/hide fade.
     pub fade_duration_ms: u64,
-    /// Duration in milliseconds of a full page-turn slide (keyboard/queue
-    /// navigation, or a trackpad drag's commit/cancel settle).
+    /// Baseline speed, in milliseconds, of a page-turn settle spring
+    /// (`ComicApp::step_transition`) — lower is faster. Since it's a spring
+    /// rather than a fixed-length animation, this scales stiffness and
+    /// damping together rather than literally bounding how long it runs.
     pub page_transition_ms: u64,
 }
 
@@ -49,10 +51,6 @@ impl Default for LayoutConfig {
 impl LayoutConfig {
     pub fn fade_duration(&self) -> Duration {
         Duration::from_millis(self.fade_duration_ms)
-    }
-
-    pub fn page_transition_duration(&self) -> Duration {
-        Duration::from_millis(self.page_transition_ms)
     }
 
     /// Records `color` as the most recently used spine color, moving it to

@@ -24,21 +24,15 @@ pub const HISTORY_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// saving per page.
 pub const DOWNSCALE_MAX_DIMENSION: u32 = 2400;
 
-/// A page-turn slide animating from `from` to `to` (progress, `0.0..=1.0`),
-/// eased over `duration`. Drives a `PageTransition`'s `progress` once a
-/// trackpad drag has ended (committed or cancelled) or for a keyboard-
-/// triggered turn, which animates the full `0.0..=1.0` range immediately.
-pub struct TransitionAnim {
-    pub from: f32,
-    pub to: f32,
-    pub started_at: Instant,
-    pub duration: Duration,
-}
-
-/// A page turn in progress, either a live trackpad drag (`anim: None`,
-/// `progress` set directly by `drag_page_by` each frame) or an eased
-/// animation toward a decided outcome (`anim: Some`, from a keyboard turn or
-/// a drag that just committed/cancelled at gesture end).
+/// A page-turn slide in progress, either a live trackpad drag (`dragging:
+/// true`, `progress` set directly by `drag_page_by` each frame) or a
+/// physical damped spring pulling `progress` toward `target`, stepped once
+/// per frame by `ComicApp::step_transition` — for a keyboard-triggered turn
+/// (`target` is `1.0` from the start) or a drag that just committed/cancelled
+/// at gesture end (`target` flips to `1.0`/`0.0`, carrying over the drag's
+/// last velocity so the settle continues the gesture's motion instead of
+/// starting from rest). Cleared automatically once the spring comes to
+/// rest — there's no fixed duration to wait out.
 ///
 /// `old_left`/`old_right` are the spread being left; `new_left`/`new_right`
 /// the spread being entered — captured once up front since, during a live
@@ -55,7 +49,9 @@ pub struct PageTransition {
     pub new_left: Option<usize>,
     pub new_right: Option<usize>,
     pub progress: f32,
-    pub anim: Option<TransitionAnim>,
+    pub velocity: f32,
+    pub target: f32,
+    pub dragging: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +113,24 @@ pub struct ComicApp {
     /// the base mapping already depends on `reading_mode`, this is purely a
     /// per-user trackpad preference (like macOS's own "natural scrolling").
     pub scroll_inverted: bool,
+    /// Multiplier on how much a two-finger trackpad swipe counts toward a
+    /// full page turn — `1.0` is the default feel, higher means less
+    /// physical movement is needed for the same amount of turn.
+    pub scroll_sensitivity: f32,
+    /// When on, a trackpad swipe that has already committed or bounced back
+    /// won't start another page-turn until a fresh gesture begins (see
+    /// `swipe_locked`) — caps one big or fast swipe, momentum tail included,
+    /// to a single page turn instead of chaining through several.
+    pub one_turn_per_swipe: bool,
+    /// Set by `end_page_drag` right after a swipe resolves, while
+    /// `one_turn_per_swipe` is on; cleared by `input::scroll` the moment it
+    /// sees a fresh `TouchPhase::Start`. While `true`, `input::scroll`
+    /// ignores incoming wheel deltas outright — this is what stops a
+    /// strong swipe's momentum (which keeps sending `Move`-phase deltas
+    /// with no new `Start` in between) from being mistaken for a deliberate
+    /// second swipe. Not persisted: purely a within-session, frame-to-frame
+    /// signal, reset fresh on every launch.
+    pub swipe_locked: bool,
     /// The action currently waiting for its next key press to be bound to it.
     pub remapping_action: Option<Action>,
     pub textures: HashMap<usize, egui::TextureHandle>,
@@ -169,7 +183,7 @@ pub struct ComicApp {
     decode_queue: DecodeQueue,
     decode_result_rx: std::sync::mpsc::Receiver<crate::comic::prefetch::DecodedPage>,
     /// Set by `next_spread`/`prev_spread` or an in-progress trackpad drag,
-    /// consumed and cleared by the reader once fully settled.
+    /// consumed and cleared once fully settled.
     pub page_transition: Option<PageTransition>,
     /// When the spine color picker was last changed — the settings panel
     /// waits for this to go quiet before recording the color into
@@ -203,6 +217,9 @@ impl Default for ComicApp {
             layout: LayoutConfig::default(),
             blue_light_filter: 0.0,
             scroll_inverted: false,
+            scroll_sensitivity: 1.0,
+            one_turn_per_swipe: true,
+            swipe_locked: false,
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
@@ -250,6 +267,8 @@ impl ComicApp {
             self.layout = config.layout;
             self.blue_light_filter = config.blue_light_filter;
             self.scroll_inverted = config.scroll_inverted;
+            self.scroll_sensitivity = config.scroll_sensitivity;
+            self.one_turn_per_swipe = config.one_turn_per_swipe;
             self.downscale_large_pages = config.downscale_large_pages;
             self.resume_last_session = config.resume_last_session;
             self.auto_check_updates = config.auto_check_updates;
@@ -308,6 +327,8 @@ impl ComicApp {
             layout: self.layout.clone(),
             blue_light_filter: self.blue_light_filter,
             scroll_inverted: self.scroll_inverted,
+            scroll_sensitivity: self.scroll_sensitivity,
+            one_turn_per_swipe: self.one_turn_per_swipe,
             downscale_large_pages: self.downscale_large_pages,
             resume_last_session: self.resume_last_session,
             auto_check_updates: self.auto_check_updates,
@@ -326,21 +347,21 @@ impl ComicApp {
     pub fn next_spread(&mut self) {
         let old = (self.left_page(), self.right_page());
         if self.advance_forward() {
-            self.begin_transition(self.forward_entry_sign(), true, old, 0.0, 1.0);
+            self.begin_transition(self.forward_entry_sign(), true, old);
         }
     }
 
     pub fn prev_spread(&mut self) {
         let old = (self.left_page(), self.right_page());
         if self.advance_backward() {
-            self.begin_transition(-self.forward_entry_sign(), false, old, 0.0, 1.0);
+            self.begin_transition(-self.forward_entry_sign(), false, old);
         }
     }
 
     /// Moves to the next spread without starting any transition — the
     /// mutation half of `next_spread`, reused by a trackpad drag committing
-    /// at gesture end (which animates itself, from wherever the drag left
-    /// off, rather than a fresh `0.0..=1.0`).
+    /// at gesture end (which settles the spring from wherever the drag left
+    /// off, rather than a fresh `0.0`).
     fn advance_forward(&mut self) -> bool {
         let position = self.effective_position();
         let next = position + self.spread_width(position);
@@ -363,8 +384,8 @@ impl ComicApp {
 
     /// Which side the *next* spread visually enters from: `+1.0` (right) in
     /// traditional (LTR) mode, `-1.0` (left) in manga (RTL) mode — matches
-    /// the trackpad scroll direction convention in `input::scroll`. `prev_spread`
-    /// uses the opposite sign.
+    /// the trackpad scroll direction convention in `input::scroll`.
+    /// `prev_spread` uses the opposite sign.
     fn forward_entry_sign(&self) -> f32 {
         match self.reading_mode {
             ReadingMode::LTR => 1.0,
@@ -442,9 +463,8 @@ impl ComicApp {
         self.page_meta.get(&page_idx).is_some_and(|m| m.is_spread)
     }
 
-    fn begin_transition(&mut self, entry_sign: f32, forward: bool, old: (Option<usize>, Option<usize>), from: f32, to: f32) {
+    fn begin_transition(&mut self, entry_sign: f32, forward: bool, old: (Option<usize>, Option<usize>)) {
         let new = (self.left_page(), self.right_page());
-        let duration = self.layout.page_transition_duration().mul_f32((to - from).abs());
         self.page_transition = Some(PageTransition {
             entry_sign,
             forward,
@@ -452,30 +472,59 @@ impl ComicApp {
             old_right: old.1,
             new_left: new.0,
             new_right: new.1,
-            progress: from,
-            anim: Some(TransitionAnim { from, to, started_at: Instant::now(), duration }),
+            progress: 0.0,
+            velocity: 0.0,
+            target: 1.0,
+            dragging: false,
         });
     }
 
     /// True while a trackpad drag is live (its outcome not decided yet) —
     /// as opposed to settled/settling toward one.
     pub fn is_dragging(&self) -> bool {
-        matches!(&self.page_transition, Some(t) if t.anim.is_none())
+        matches!(&self.page_transition, Some(t) if t.dragging)
     }
 
     /// Whether an in-progress drag would commit to `next_spread` (`true`) or
     /// `prev_spread` (`false`) if released now, or `None` if there's no live
     /// drag.
     pub fn dragging_forward(&self) -> Option<bool> {
-        self.page_transition.as_ref().filter(|t| t.anim.is_none()).map(|t| t.forward)
+        self.page_transition.as_ref().filter(|t| t.dragging).map(|t| t.forward)
     }
 
     /// Starts a finger-driven drag toward the adjacent spread in `forward`'s
-    /// direction. No-op if a transition is already in flight or there's no
-    /// adjacent spread that way (start of book going back, end going forward).
+    /// direction.
+    ///
+    /// If a bounce-back is still mid-flight (a previous drag that fell short
+    /// and is settling back to the current spread, `target == 0.0`) and
+    /// happens to be heading the same direction, grabs it instead of waiting
+    /// it out — resumes live control from wherever its progress/velocity
+    /// currently are, so retrying a swipe that didn't quite make it
+    /// interrupts the bounce-back rather than queuing up behind it. Its
+    /// `old`/`new` pair is still exactly right to resume, since nothing has
+    /// actually moved yet.
+    ///
+    /// Any other settle — one that already *committed* (`target == 1.0`,
+    /// from a keyboard turn or a drag that made it past halfway) — is left
+    /// to finish on its own and replaced outright by a fresh drag peeked
+    /// from wherever navigation now stands, same/forward direction or not:
+    /// `current_page` already moved when it committed, so grabbing its
+    /// stale `old`/`new` pair instead would replay the transition that
+    /// already happened rather than advancing further, and the eventual
+    /// commit would then jump an extra spread past what the animation
+    /// showed. An already-live drag is simply left alone.
+    ///
+    /// No-op if there's no adjacent spread that way (start of book going
+    /// back, end going forward).
     pub fn start_page_drag(&mut self, forward: bool) {
-        if self.page_transition.is_some() {
-            return;
+        if let Some(t) = self.page_transition.as_mut() {
+            if t.dragging {
+                return;
+            }
+            if t.forward == forward && t.target == 0.0 {
+                t.dragging = true;
+                return;
+            }
         }
         let Some(new) = self.peek_adjacent_pages(forward) else { return };
         let entry_sign = if forward { self.forward_entry_sign() } else { -self.forward_entry_sign() };
@@ -487,41 +536,102 @@ impl ComicApp {
             new_left: new.0,
             new_right: new.1,
             progress: 0.0,
-            anim: None,
+            velocity: 0.0,
+            target: 0.0,
+            dragging: true,
         });
     }
 
     /// Moves a live drag's progress by `delta` (positive = further toward
-    /// the new spread), clamped to `0.0..=1.0`. No-op once the drag has
-    /// settled (`anim` is `Some`).
-    pub fn drag_page_by(&mut self, delta: f32) {
-        if let Some(t) = self.page_transition.as_mut().filter(|t| t.anim.is_none()) {
+    /// the new spread), clamped to `0.0..=1.0`. Also updates the drag's
+    /// current velocity from `delta / dt`, exponentially smoothed so one
+    /// noisy frame (trackpad wheel deltas arrive in uneven bursts) can't
+    /// swing it wildly — used both for `end_page_drag`'s fling detection and,
+    /// carried over into the settle spring at gesture end, so a fast flick
+    /// keeps its momentum instead of the settle starting dead still. No-op
+    /// once the drag has settled (`dragging` is `false`).
+    pub fn drag_page_by(&mut self, delta: f32, dt: f32) {
+        const VELOCITY_SMOOTHING: f32 = 0.3;
+
+        if let Some(t) = self.page_transition.as_mut().filter(|t| t.dragging) {
             t.progress = (t.progress + delta).clamp(0.0, 1.0);
+            if dt > 0.0 {
+                let sample = delta / dt;
+                t.velocity += (sample - t.velocity) * VELOCITY_SMOOTHING;
+            }
         }
     }
 
-    /// Ends a live drag: commits to the new spread if it passed the halfway
-    /// point, or settles back to the current one otherwise — either way
-    /// animating the remaining distance rather than snapping. No-op if
+    /// Ends a live drag: commits to the new spread either because it passed
+    /// the halfway point (a slow, deliberate drag) or because it was
+    /// released while moving fast toward it (a quick flick, regardless of
+    /// how little distance it covered) — like a real page, it responds to
+    /// either a long slow push or a short sharp one. Otherwise settles back
+    /// to the current spread. Either way hands off to the settle spring
+    /// (`step_transition`) for the remaining distance rather than snapping.
+    /// If `one_turn_per_swipe` is on, also sets `swipe_locked` so this
+    /// swipe's resolution (commit or cancel) is final — a momentum tail
+    /// still trickling in afterward won't chain into another one. No-op if
     /// there's no live drag.
     pub fn end_page_drag(&mut self) {
         const COMMIT_THRESHOLD: f32 = 0.5;
+        /// Progress-units-per-second (`progress` is `0.0..=1.0` across a
+        /// full drag, see `input::scroll::DRAG_FULL_DISTANCE`) fast enough
+        /// to count as a flick — comfortably above a slow full-width drag
+        /// (~1.0/s) and below an actual quick flick (~5+/s).
+        const FLING_VELOCITY: f32 = 3.0;
 
-        let Some((progress, forward)) =
-            self.page_transition.as_ref().filter(|t| t.anim.is_none()).map(|t| (t.progress, t.forward))
+        let Some((progress, velocity, forward)) =
+            self.page_transition.as_ref().filter(|t| t.dragging).map(|t| (t.progress, t.velocity, t.forward))
         else {
             return;
         };
 
-        let commit = progress >= COMMIT_THRESHOLD;
+        let commit =
+            if velocity.abs() >= FLING_VELOCITY { velocity > 0.0 } else { progress >= COMMIT_THRESHOLD };
         if commit {
             if forward { self.advance_forward() } else { self.advance_backward() };
         }
 
-        let to = if commit { 1.0 } else { 0.0 };
-        let duration = self.layout.page_transition_duration().mul_f32((to - progress).abs());
         if let Some(t) = self.page_transition.as_mut() {
-            t.anim = Some(TransitionAnim { from: progress, to, started_at: Instant::now(), duration });
+            t.dragging = false;
+            t.target = if commit { 1.0 } else { 0.0 };
+        }
+
+        if self.one_turn_per_swipe {
+            self.swipe_locked = true;
+        }
+    }
+
+    /// Advances an in-flight page-turn slide by one frame (`dt` seconds) —
+    /// call unconditionally, once per frame; a no-op while nothing is
+    /// turning or while a trackpad drag is still live (its `progress` is
+    /// driven directly by `drag_page_by` instead). The motion is a plain
+    /// damped spring (`progress` toward `target`), tuned close to critically
+    /// damped so it settles briskly with only the faintest overshoot rather
+    /// than a linear or eased slide. `LayoutConfig::page_transition_ms`
+    /// scales both stiffness and damping together, so raising or lowering it
+    /// changes speed without changing how bouncy it feels. Clears
+    /// `page_transition` once the spring is close enough to at rest that
+    /// continuing to animate it wouldn't read as motion.
+    pub fn step_transition(&mut self, dt: f32) {
+        const BASE_STIFFNESS: f32 = 280.0;
+        const BASE_DAMPING: f32 = 26.0;
+        const BASELINE_MS: f32 = 220.0;
+        const REST_VELOCITY: f32 = 0.02;
+        const REST_DISTANCE: f32 = 0.003;
+
+        let speed = (BASELINE_MS / self.layout.page_transition_ms.max(1) as f32).clamp(0.3, 3.0);
+        let stiffness = BASE_STIFFNESS * speed * speed;
+        let damping = BASE_DAMPING * speed;
+
+        let Some(t) = self.page_transition.as_mut().filter(|t| !t.dragging) else { return };
+        let force = -stiffness * (t.progress - t.target) - damping * t.velocity;
+        t.velocity += force * dt;
+        t.progress += t.velocity * dt;
+
+        if t.velocity.abs() < REST_VELOCITY && (t.progress - t.target).abs() < REST_DISTANCE {
+            self.page_transition = None;
         }
     }
 
@@ -911,5 +1021,226 @@ mod tests {
         let mut app = app_with(4, &[]);
         app.reading_mode = ReadingMode::RTL;
         assert_eq!((app.left_page(), app.right_page()), (Some(1), Some(0)));
+    }
+
+    /// Steps `app`'s transition at a fixed 60fps timestep until it's fully
+    /// settled (`page_transition` cleared) or `max_steps` is hit — used to
+    /// check the settle spring actually converges instead of oscillating or
+    /// drifting forever, which a mistuned stiffness/damping pair easily can.
+    fn run_transition_to_rest(app: &mut ComicApp, max_steps: usize) -> usize {
+        const DT: f32 = 1.0 / 60.0;
+        for step in 0..max_steps {
+            if app.page_transition.is_none() {
+                return step;
+            }
+            app.step_transition(DT);
+        }
+        max_steps
+    }
+
+    #[test]
+    fn settle_spring_converges_from_rest() {
+        let mut app = app_with(4, &[]);
+        app.page_transition = Some(PageTransition {
+            entry_sign: 1.0,
+            forward: true,
+            old_left: Some(0),
+            old_right: Some(1),
+            new_left: Some(2),
+            new_right: Some(3),
+            progress: 0.0,
+            velocity: 0.0,
+            target: 1.0,
+            dragging: false,
+        });
+
+        let steps = run_transition_to_rest(&mut app, 600); // 10s at 60fps
+        assert!(steps < 600, "settle spring never came to rest");
+        assert!(app.page_transition.is_none());
+    }
+
+    #[test]
+    fn next_and_prev_spread_animate_and_settle() {
+        let mut app = app_with(6, &[]);
+        app.next_spread();
+        assert!(app.page_transition.is_some());
+        let steps = run_transition_to_rest(&mut app, 600);
+        assert!(steps < 600, "page-turn spring never came to rest");
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    /// Applies `total_delta` progress to `app`'s live drag spread evenly
+    /// over `frames` calls at a fixed 60fps timestep — simulates a gesture
+    /// unfolding at a steady, realistic pace (as opposed to one giant
+    /// instantaneous delta, which `drag_page_by`'s velocity smoothing would
+    /// read as an implausibly fast flick regardless of `total_delta`).
+    fn drag_over_frames(app: &mut ComicApp, total_delta: f32, frames: u32) {
+        const DT: f32 = 1.0 / 60.0;
+        for _ in 0..frames {
+            app.drag_page_by(total_delta / frames as f32, DT);
+        }
+    }
+
+    #[test]
+    fn slow_drag_past_halfway_then_released_commits_to_next_spread() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(true);
+        assert!(app.is_dragging());
+        drag_over_frames(&mut app, 0.6, 60); // ~0.6 progress over 1s: well under fling speed
+        // Still mid-gesture: nothing committed yet.
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), Some(1)));
+
+        app.end_page_drag();
+        assert!(!app.is_dragging());
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+
+        let steps = run_transition_to_rest(&mut app, 600);
+        assert!(steps < 600, "post-commit settle spring never came to rest");
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn slow_drag_short_of_halfway_then_released_snaps_back() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.3, 60); // ~0.3 progress over 1s: well under fling speed
+
+        app.end_page_drag();
+        assert!(!app.is_dragging());
+        // Cancelled: current spread hasn't moved.
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), Some(1)));
+
+        let steps = run_transition_to_rest(&mut app, 600);
+        assert!(steps < 600, "post-cancel settle spring never came to rest");
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn quick_flick_commits_despite_covering_little_distance() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(true);
+        // A short, sharp swipe: well short of halfway, but fast enough to
+        // read as a flick — should commit anyway, like a real page would
+        // respond to a quick flick as readily as a long slow push.
+        app.drag_page_by(0.25, 1.0 / 60.0);
+        assert!(app.page_transition.as_ref().unwrap().progress < 0.5);
+
+        app.end_page_drag();
+        assert!(!app.is_dragging());
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn drag_at_start_of_book_cannot_go_backward() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(false);
+        assert!(!app.is_dragging());
+        assert!(app.page_transition.is_none());
+    }
+
+    #[test]
+    fn resolving_a_swipe_locks_out_further_turns_when_one_turn_per_swipe_is_on() {
+        let mut app = app_with(6, &[]);
+        assert!(app.one_turn_per_swipe); // on by default
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.6, 60);
+        app.end_page_drag();
+        assert!(app.swipe_locked);
+
+        // Locked out: a fresh swipe attempt (e.g. momentum still trickling
+        // in after the fingers lifted) is ignored by `input::scroll` before
+        // it ever reaches `start_page_drag` — but even calling it directly
+        // here, the page shouldn't move any further than the one commit.
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn resolving_a_swipe_does_not_lock_when_one_turn_per_swipe_is_off() {
+        let mut app = app_with(6, &[]);
+        app.one_turn_per_swipe = false;
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.6, 60);
+        app.end_page_drag();
+        assert!(!app.swipe_locked);
+    }
+
+    #[test]
+    fn resolving_a_cancelled_swipe_also_locks_when_one_turn_per_swipe_is_on() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.2, 60); // short of halfway: cancels
+        app.end_page_drag();
+        assert!(app.swipe_locked);
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn retrying_same_direction_mid_bounce_grabs_the_settle_instead_of_queuing() {
+        let mut app = app_with(6, &[]);
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.3, 60); // slow: stays under fling speed
+        app.end_page_drag();
+        // Cancelled: now settling back toward the current spread, without
+        // having stepped the spring at all yet.
+        assert!(!app.is_dragging());
+        let progress_at_bounce_start = app.page_transition.as_ref().unwrap().progress;
+        assert!(progress_at_bounce_start > 0.0);
+
+        // Swiping forward again immediately should grab that settle from
+        // wherever it currently is, not get dropped until it finishes.
+        app.start_page_drag(true);
+        assert!(app.is_dragging());
+        assert_eq!(app.page_transition.as_ref().unwrap().progress, progress_at_bounce_start);
+
+        drag_over_frames(&mut app, 0.3, 60); // push the rest of the way, slowly
+        app.end_page_drag();
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn retrying_opposite_direction_mid_bounce_replaces_it() {
+        let mut app = app_with(6, &[]);
+        app.next_spread();
+        assert!(run_transition_to_rest(&mut app, 600) < 600);
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+
+        app.start_page_drag(true);
+        drag_over_frames(&mut app, 0.2, 60); // slow: stays under fling speed
+        app.end_page_drag();
+        assert!(!app.is_dragging());
+        assert!(app.page_transition.as_ref().unwrap().forward);
+
+        // Swiping backward instead discards that still-settling forward
+        // bounce-back and starts a fresh backward drag from scratch.
+        app.start_page_drag(false);
+        assert!(app.is_dragging());
+        let t = app.page_transition.as_ref().unwrap();
+        assert!(!t.forward);
+        assert_eq!(t.progress, 0.0);
+
+        drag_over_frames(&mut app, 0.6, 60);
+        app.end_page_drag();
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn retrying_same_direction_during_a_commit_settle_advances_further_instead_of_replaying_it() {
+        let mut app = app_with(8, &[]);
+        app.next_spread(); // commits immediately: (0,1) -> (2,3), settling
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+        assert_eq!(app.page_transition.as_ref().unwrap().target, 1.0);
+
+        // Swiping forward again before that settle finishes must NOT grab
+        // its stale (0,1)->(2,3) pair — it already happened — but instead
+        // peek from wherever navigation now stands, toward (4,5).
+        app.start_page_drag(true);
+        assert!(app.is_dragging());
+        let t = app.page_transition.as_ref().unwrap();
+        assert_eq!((t.old_left, t.old_right), (Some(2), Some(3)));
+        assert_eq!((t.new_left, t.new_right), (Some(4), Some(5)));
+
+        drag_over_frames(&mut app, 0.6, 60);
+        app.end_page_drag();
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
     }
 }
