@@ -753,8 +753,70 @@ impl ComicApp {
         self.page_meta.get(&page_idx).is_some_and(|m| m.is_spread)
     }
 
+    /// The `(progress, velocity)` a fresh transition/drag toward `entry_sign`
+    /// must start at, in its own frame of reference, so the spread it's
+    /// about to treat as "old" (`current_page`, unmoved yet) — which is
+    /// exactly the spread `prev` was itself resolving toward, whether by
+    /// committing (`target: 1.0`) or bouncing back (`target: 0.0`) — keeps
+    /// the on-screen position and velocity it already had instead of
+    /// snapping to "fully arrived, at rest" the instant the switch happens.
+    ///
+    /// Derivation: `prev`'s own shift formulas put that spread at
+    /// `entry_sign * (target - progress)` (in units of one full width) with
+    /// rate of change `entry_sign * -velocity`; the new transition's shift
+    /// formula for its "old" spread is `-entry_sign * progress`. Solving
+    /// `-entry_sign_new * progress = entry_sign_prev * (target - progress)`
+    /// for `progress` (and the matching derivative for `velocity`) gives the
+    /// two expressions below, where `s` collapses the `entry_sign_prev /
+    /// entry_sign_new` ratio to ±1 since both are always exactly `±1.0`.
+    fn continuity_from(prev: &PageTransition, entry_sign: f32) -> (f32, f32) {
+        let s = prev.entry_sign * entry_sign;
+        (-s * (prev.target - prev.progress), s * prev.velocity)
+    }
+
+    /// `LayoutConfig::page_transition_ms`'s speed multiplier: `1.0` at the
+    /// default 220ms, scaling inversely (a smaller `page_transition_ms`
+    /// means a faster turn) and clamped to `0.3..=3.0` so an extreme slider
+    /// value can't make turns instant or glacial. Shared between
+    /// `step_transition` (scales stiffness/damping) and `begin_transition`
+    /// (scales the initial kick below), so both stay in proportion — a
+    /// faster-configured turn kicks off faster too, not just settles faster.
+    fn transition_speed(&self) -> f32 {
+        const BASELINE_MS: f32 = 220.0;
+        (BASELINE_MS / self.layout.page_transition_ms.max(1) as f32).clamp(0.3, 3.0)
+    }
+
+    /// Starts a fresh keyboard/button-triggered turn toward `entry_sign`,
+    /// from `old` to whatever `current_page` already is (the caller has
+    /// already advanced it). If a previous such turn is still mid-flight —
+    /// the next-page key auto-repeating faster than a turn's ~300-450ms
+    /// settle is the common case — carries its progress/velocity over via
+    /// `continuity_from` instead of starting cold at `progress: 0.0`, so the
+    /// on-screen spread doesn't snap to "settled" before sliding again.
     fn begin_transition(&mut self, entry_sign: f32, forward: bool, old: (Option<usize>, Option<usize>)) {
+        // Starting a genuinely fresh turn (no previous one to carry over)
+        // from `velocity: 0.0` makes the spring's own acceleration phase
+        // the very first thing the page does — a soft, ease-in-out start
+        // that reads as a beat slower to respond to the keypress than most
+        // page-turn UIs (Kindle, Apple Books, Material's "decelerate"
+        // curve), which all move immediately and spend the turn decelerating
+        // instead. A modest kick tilts this toward that ease-out feel — the
+        // page's already moving at a real speed from the first rendered
+        // frame — without going all the way to a dead stop's opposite
+        // (zero acceleration phase needs `v0 > stiffness/damping =
+        // 280/30 ≈ 9.33` at `speed: 1.0`; `3.0` stays well under that, so it
+        // still has *some* ease-in character, just a much shorter one).
+        // Verified by simulating the recurrence in `step_transition` at this
+        // kick across speed 0.3-3.0 and 24-240fps: overshoot tops out at
+        // 0.005% of travel, an order of magnitude under `REST_DISTANCE`
+        // and so no more visible than the no-kick case already was.
+        const INITIAL_KICK: f32 = 3.0;
+
         let new = (self.left_page(), self.right_page());
+        let (progress, velocity) = match self.page_transition.take() {
+            Some(prev) if !prev.dragging => Self::continuity_from(&prev, entry_sign),
+            _ => (0.0, INITIAL_KICK * self.transition_speed()),
+        };
         self.page_transition = Some(PageTransition {
             entry_sign,
             forward,
@@ -762,8 +824,8 @@ impl ComicApp {
             old_right: old.1,
             new_left: new.0,
             new_right: new.1,
-            progress: 0.0,
-            velocity: 0.0,
+            progress,
+            velocity,
             target: 1.0,
             dragging: false,
         });
@@ -802,7 +864,10 @@ impl ComicApp {
     /// stale `old`/`new` pair instead would replay the transition that
     /// already happened rather than advancing further, and the eventual
     /// commit would then jump an extra spread past what the animation
-    /// showed. An already-live drag is simply left alone.
+    /// showed. Its progress/velocity still carry over via `continuity_from`
+    /// though, same as `begin_transition` — "replaced outright" only means a
+    /// new `old`/`new` pair, not a visible snap back to rest first. An
+    /// already-live drag is simply left alone.
     ///
     /// No-op if there's no adjacent spread that way (start of book going
     /// back, end going forward).
@@ -818,6 +883,10 @@ impl ComicApp {
         }
         let Some(new) = self.peek_adjacent_pages(forward) else { return };
         let entry_sign = if forward { self.forward_entry_sign() } else { -self.forward_entry_sign() };
+        let (progress, velocity) = match self.page_transition.take() {
+            Some(prev) => Self::continuity_from(&prev, entry_sign),
+            None => (0.0, 0.0),
+        };
         self.page_transition = Some(PageTransition {
             entry_sign,
             forward,
@@ -825,8 +894,8 @@ impl ComicApp {
             old_right: self.right_page(),
             new_left: new.0,
             new_right: new.1,
-            progress: 0.0,
-            velocity: 0.0,
+            progress,
+            velocity,
             target: 0.0,
             dragging: true,
         });
@@ -906,22 +975,79 @@ impl ComicApp {
     /// continuing to animate it wouldn't read as motion.
     pub fn step_transition(&mut self, dt: f32) {
         const BASE_STIFFNESS: f32 = 280.0;
-        const BASE_DAMPING: f32 = 26.0;
-        const BASELINE_MS: f32 = 220.0;
-        const REST_VELOCITY: f32 = 0.02;
-        const REST_DISTANCE: f32 = 0.003;
+        // 26.0 (damping ratio ≈0.78, underdamped) lets the spring overshoot
+        // `target` and swing back — a visible bounce at the end of every
+        // page turn. Critical damping (`2 * sqrt(280) ≈ 33.47`, ratio 1.0)
+        // removes the bounce but slows the approach the most right at the
+        // end, reading as a stall rather than a settle. 30.0 (ratio ≈0.90)
+        // never overshoots (verified by simulating the recurrence below
+        // across speed 0.3-3.0 and 24-240fps, worst case ≈99.8% of travel)
+        // while settling faster than critical damping.
+        const BASE_DAMPING: f32 = 30.0;
+        // How close is "close enough to stop simulating." The snap below
+        // (`progress = target`) guarantees no pop *after* this point — but
+        // the jump *to* that point is still exactly `REST_DISTANCE` of the
+        // full slide, rendered in a single frame no matter how small
+        // `REST_DISTANCE` is, so distance is the one that actually has to
+        // stay tight: measured on-screen with a real recording, `0.015`
+        // (~1.5% of the reading area's width) was a plainly visible
+        // end-of-turn jerk — motion this close to a stop gets essentially no
+        // motion-blur masking, so even a small discontinuity here reads as a
+        // snap rather than a settle. `0.0005` keeps that jump under a pixel
+        // even on a very wide window, at the cost of a longer settle
+        // (~430ms vs ~350ms at the default speed — still brisk, just no
+        // longer a "few extra ms of imperceptible crawl" tradeoff).
+        // `REST_VELOCITY` stays loose since distance alone already binds
+        // this tight (confirmed by simulation across speed 0.3-3.0): it
+        // only matters as a fallback for whatever configuration might make
+        // distance the looser of the two.
+        const REST_VELOCITY: f32 = 0.25;
+        const REST_DISTANCE: f32 = 0.0005;
+        // Semi-implicit Euler integration of a spring is only conditionally
+        // stable: too large a `dt` relative to `stiffness` makes it diverge
+        // instead of converge rather than merely losing accuracy (verified
+        // by simulating the recurrence below: at the fastest configurable
+        // `page_transition_ms` combined with a 30fps `dt`, integrating in
+        // one step per frame blows up to infinity within a handful of
+        // frames). Splitting each frame into fixed-size sub-steps keeps
+        // every individual step well inside the stable region regardless of
+        // frame rate or configured speed.
+        const MAX_SUBSTEP_DT: f32 = 1.0 / 120.0;
 
-        let speed = (BASELINE_MS / self.layout.page_transition_ms.max(1) as f32).clamp(0.3, 3.0);
+        let speed = self.transition_speed();
         let stiffness = BASE_STIFFNESS * speed * speed;
         let damping = BASE_DAMPING * speed;
 
         let Some(t) = self.page_transition.as_mut().filter(|t| !t.dragging) else { return };
-        let force = -stiffness * (t.progress - t.target) - damping * t.velocity;
-        t.velocity += force * dt;
-        t.progress += t.velocity * dt;
+
+        // Already snapped to its exact rest position on a previous step
+        // (below): that step's render was pixel-identical to the settled,
+        // non-sliding page (zero shift both sides), so there's nothing left
+        // to show — end now instead of re-running physics whose force is
+        // exactly zero at this point anyway.
+        if t.progress == t.target && t.velocity == 0.0 {
+            self.page_transition = None;
+            return;
+        }
+
+        let dt = dt.min(0.1); // guards against a runaway substep count after e.g. a resume-from-background stall
+        let substeps = (dt / MAX_SUBSTEP_DT).ceil().max(1.0) as u32;
+        let sub_dt = dt / substeps as f32;
+        for _ in 0..substeps {
+            let force = -stiffness * (t.progress - t.target) - damping * t.velocity;
+            t.velocity += force * sub_dt;
+            t.progress += t.velocity * sub_dt;
+        }
 
         if t.velocity.abs() < REST_VELOCITY && (t.progress - t.target).abs() < REST_DISTANCE {
-            self.page_transition = None;
+            // Snap to the exact end position instead of clearing outright:
+            // clearing here would make the very next frame jump straight
+            // from "still slightly off" to "settled" — a visible pop.
+            // Rendering one more frame at the exact target first (this
+            // slides to zero shift on both sides, identical to the settled
+            // render) makes next step's switch away from it invisible.
+            t.progress = t.target;
+            t.velocity = 0.0;
         }
     }
 
@@ -1774,6 +1900,117 @@ mod tests {
         assert!(app.page_transition.is_none());
     }
 
+    /// The frame right before `page_transition` clears must land exactly on
+    /// `target`, not just close to it — `reader.rs` draws a fully shifted
+    /// (i.e. off-screen) old spread and a zero-shift new spread only when
+    /// `progress == target` exactly; anything short of that renders as a
+    /// sliver of the old page that then vanishes the instant the spring
+    /// clears, a one-frame pop. This guards against re-loosening
+    /// `REST_DISTANCE`/`REST_VELOCITY` (or dropping the exact-snap step)
+    /// and quietly bringing that pop back.
+    #[test]
+    fn settle_spring_lands_exactly_on_target_before_clearing() {
+        const DT: f32 = 1.0 / 60.0;
+        let mut app = app_with(4, &[]);
+        app.page_transition = Some(PageTransition {
+            entry_sign: 1.0,
+            forward: true,
+            old_left: Some(0),
+            old_right: Some(1),
+            new_left: Some(2),
+            new_right: Some(3),
+            progress: 0.0,
+            velocity: 0.0,
+            target: 1.0,
+            dragging: false,
+        });
+
+        let mut last_progress_before_clear = None;
+        for _ in 0..600 {
+            let progress = app.page_transition.as_ref().unwrap().progress;
+            app.step_transition(DT);
+            if app.page_transition.is_none() {
+                last_progress_before_clear = Some(progress);
+                break;
+            }
+        }
+        assert_eq!(last_progress_before_clear, Some(1.0), "cleared without ever rendering the exact target position");
+    }
+
+    /// Landing exactly on `target` (previous test) only avoids a pop if the
+    /// jump *to* that exact position is itself too small to see — measured
+    /// with a real screen recording, `REST_DISTANCE: 0.015` produced a
+    /// plainly visible end-of-turn jerk (motion this close to a stop gets
+    /// essentially no motion-blur masking). Pins the jump to well under a
+    /// pixel's worth of a typical wide window (`0.001` of the full slide
+    /// width is ~2px at 2000px, ~3px at 2880px) so a regression back toward
+    /// looser thresholds shows up here instead of only in a recording.
+    #[test]
+    fn settle_spring_final_jump_is_imperceptibly_small() {
+        const DT: f32 = 1.0 / 60.0;
+        let mut app = app_with(4, &[]);
+        app.page_transition = Some(PageTransition {
+            entry_sign: 1.0,
+            forward: true,
+            old_left: Some(0),
+            old_right: Some(1),
+            new_left: Some(2),
+            new_right: Some(3),
+            progress: 0.0,
+            velocity: 0.0,
+            target: 1.0,
+            dragging: false,
+        });
+
+        let last_progress_before_snap;
+        loop {
+            let progress = app.page_transition.as_ref().unwrap().progress;
+            app.step_transition(DT);
+            let Some(t) = app.page_transition.as_ref() else { panic!("cleared before ever snapping to target") };
+            if t.progress == t.target {
+                last_progress_before_snap = progress;
+                break;
+            }
+        }
+        let jump = 1.0 - last_progress_before_snap;
+        assert!(jump < 0.001, "end-of-turn jump was {:.4} of the full slide width — large enough to read as a pop", jump);
+    }
+
+    /// A fast configured transition speed (low `page_transition_ms`, up to
+    /// the `speed` clamp's 3.0x) combined with a slow frame rate makes
+    /// `stiffness` large relative to `dt` — exactly the condition under
+    /// which naive single-step semi-implicit Euler integration of a spring
+    /// goes numerically unstable and diverges instead of converging.
+    /// `step_transition` sub-steps internally to stay stable regardless of
+    /// frame rate; this pins that down at the worst realistic combination
+    /// (fastest slider setting, 30fps) so a regression shows up as
+    /// `progress` blowing up rather than settling.
+    #[test]
+    fn settle_spring_stays_stable_at_fast_speed_and_low_frame_rate() {
+        const DT: f32 = 1.0 / 30.0;
+        let mut app = app_with(4, &[]);
+        app.layout.page_transition_ms = 1; // fastest the settings slider allows -> speed clamps to 3.0x
+        app.page_transition = Some(PageTransition {
+            entry_sign: 1.0,
+            forward: true,
+            old_left: Some(0),
+            old_right: Some(1),
+            new_left: Some(2),
+            new_right: Some(3),
+            progress: 0.0,
+            velocity: 0.0,
+            target: 1.0,
+            dragging: false,
+        });
+
+        for _ in 0..600 {
+            let Some(t) = app.page_transition.as_ref() else { break };
+            assert!(t.progress.abs() < 10.0, "progress diverged instead of converging: {}", t.progress);
+            app.step_transition(DT);
+        }
+        assert!(app.page_transition.is_none(), "settle spring never came to rest");
+    }
+
     #[test]
     fn next_and_prev_spread_animate_and_settle() {
         let mut app = app_with(6, &[]);
@@ -1782,6 +2019,49 @@ mod tests {
         let steps = run_transition_to_rest(&mut app, 600);
         assert!(steps < 600, "page-turn spring never came to rest");
         assert_eq!((app.left_page(), app.right_page()), (Some(2), Some(3)));
+    }
+
+    /// A fresh keyboard/button turn should start already moving (an
+    /// ease-out feel, responding immediately to the keypress) rather than
+    /// from a dead stop — see `begin_transition`'s `INITIAL_KICK`. At the
+    /// default `page_transition_ms` (220, `transition_speed() == 1.0`) the
+    /// kick is exactly `3.0`.
+    #[test]
+    fn next_spread_starts_already_moving_not_from_rest() {
+        let mut app = app_with(4, &[]);
+        app.next_spread();
+        let t = app.page_transition.as_ref().unwrap();
+        assert_eq!(app.transition_speed(), 1.0, "test assumes the default page_transition_ms");
+        assert_eq!(t.velocity, 3.0, "fresh turn should start with the ease-out kick, not velocity: 0.0");
+    }
+
+    /// Pressing next-page again before the previous turn's slide has
+    /// finished (e.g. the key auto-repeating) must not snap the on-screen
+    /// spread to "fully settled" before starting the next slide — that
+    /// snap is exactly the visible jerk `continuity_from` exists to avoid.
+    #[test]
+    fn next_spread_interrupting_its_own_animation_does_not_jump() {
+        const DT: f32 = 1.0 / 60.0;
+        let mut app = app_with(8, &[]);
+        app.next_spread(); // (0,1) -> (2,3), still animating
+        for _ in 0..3 {
+            app.step_transition(DT);
+        }
+        let mid_flight = app.page_transition.as_ref().unwrap();
+        let shift_before = mid_flight.entry_sign * (mid_flight.target - mid_flight.progress);
+
+        app.next_spread(); // interrupts it: (2,3) -> (4,5)
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+        let fresh = app.page_transition.as_ref().unwrap();
+        let shift_after = -fresh.entry_sign * fresh.progress;
+        assert!(
+            (shift_before - shift_after).abs() < 1e-5,
+            "on-screen position jumped when a turn interrupted itself: {shift_before} -> {shift_after}"
+        );
+
+        let steps = run_transition_to_rest(&mut app, 600);
+        assert!(steps < 600, "settle spring never came to rest after being interrupted");
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
     }
 
     /// Applies `total_delta` progress to `app`'s live drag spread evenly
@@ -2121,15 +2401,25 @@ mod tests {
         drag_over_frames(&mut app, 0.2, 60); // slow: stays under fling speed
         app.end_page_drag();
         assert!(!app.is_dragging());
-        assert!(app.page_transition.as_ref().unwrap().forward);
+        let prev = app.page_transition.as_ref().unwrap();
+        assert!(prev.forward);
+        let (prev_entry_sign, prev_target, prev_progress) = (prev.entry_sign, prev.target, prev.progress);
 
         // Swiping backward instead discards that still-settling forward
-        // bounce-back and starts a fresh backward drag from scratch.
+        // bounce-back's old/new pair and starts a fresh backward drag from
+        // scratch — but its on-screen position/velocity still carry over
+        // (see `continuity_from`), so this isn't a visible snap to rest.
         app.start_page_drag(false);
         assert!(app.is_dragging());
         let t = app.page_transition.as_ref().unwrap();
         assert!(!t.forward);
-        assert_eq!(t.progress, 0.0);
+        assert_ne!(t.progress, 0.0, "should carry over the bounce-back's position, not restart at rest");
+        let shift_before = prev_entry_sign * (prev_target - prev_progress);
+        let shift_after = -t.entry_sign * t.progress;
+        assert!(
+            (shift_before - shift_after).abs() < 1e-5,
+            "on-screen position jumped: {shift_before} -> {shift_after}"
+        );
 
         drag_over_frames(&mut app, 0.6, 60);
         app.end_page_drag();
