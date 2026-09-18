@@ -1,5 +1,6 @@
 pub mod theme;
 pub mod layout;
+pub mod fore_edge;
 pub mod reader;
 pub mod header;
 pub mod footer;

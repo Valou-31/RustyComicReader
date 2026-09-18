@@ -189,6 +189,15 @@ pub struct ComicApp {
     /// unloads whatever was already cached. The progress bar itself (fill,
     /// hover marker, click-to-jump) is unaffected either way.
     pub show_page_preview: bool,
+    /// Whether opening a book samples and shows the fore-edge "book
+    /// thickness" bars (`ui::fore_edge`) at all. On by default; with it
+    /// off, `spawn_file_load` skips the extra sampling entirely during the
+    /// archive read (see `comic::archive::ComicArchive::load`'s
+    /// `compute_fore_edge`), so the cost is zero rather than merely hidden.
+    /// Toggling it off mid-session also drops whatever composite the
+    /// current book already built; toggling it on takes effect from the
+    /// next book opened, since the sampling only happens during a load.
+    pub show_fore_edge: bool,
     /// `ZoomTarget::Spread`'s magnification/pan — the whole two-page layout
     /// scaled and shifted together. Driven by pinch/ctrl(-or-Cmd)-scroll and
     /// click-drag in `ui::reader`. Resets to `PageZoom::NONE` on every page
@@ -228,6 +237,22 @@ pub struct ComicApp {
     /// expensive per page than `thumbnail_textures`, so this is capped
     /// (`THUMBNAIL_HIRES_CACHE_CAP`) rather than kept for the whole book.
     pub thumbnail_hires_textures: HashMap<usize, egui::TextureHandle>,
+    /// The book's fore-edge composite — `comic::fore_edge::EDGE_SAMPLE_WIDTH`
+    /// columns per page, `comic::fore_edge::FORE_EDGE_HEIGHT` tall. Built
+    /// once a book finishes loading (`build_fore_edge_texture`) from
+    /// `LoadResult::fore_edge_columns` — whatever `ComicArchive::load`
+    /// managed to sample concurrently with the archive read by the time it
+    /// returned; `fore_edge_tail` fills in the rest as it lands. Drawn by
+    /// `ui::fore_edge`. `None` before any book has loaded, or if
+    /// `show_fore_edge` was off for the current load.
+    pub fore_edge_texture: Option<egui::TextureHandle>,
+    /// Fore-edge sampling still in flight for the current book — see
+    /// `comic::archive::ComicArchive::fore_edge_tail`. Drained once per
+    /// frame by `poll_fore_edge`, which writes each arriving page's columns
+    /// into `fore_edge_texture` and clears this once the tail reports it's
+    /// done. `None` once fully drained, or if there was nothing left in
+    /// flight to begin with.
+    fore_edge_tail: Option<crate::comic::archive::ForeEdgeTail>,
     pub loading: bool,
     pub load_error: Option<String>,
     /// Full path of the archive currently loaded, if any — `None` on the
@@ -338,6 +363,7 @@ impl Default for ComicApp {
             one_turn_per_swipe: true,
             swipe_locked: false,
             show_page_preview: true,
+            show_fore_edge: true,
             zoom_spread: PageZoom::NONE,
             zoom_left: PageZoom::NONE,
             zoom_right: PageZoom::NONE,
@@ -348,6 +374,8 @@ impl Default for ComicApp {
             page_meta: HashMap::new(),
             thumbnail_textures: HashMap::new(),
             thumbnail_hires_textures: HashMap::new(),
+            fore_edge_texture: None,
+            fore_edge_tail: None,
             loading: false,
             load_error: None,
             current_path: None,
@@ -402,6 +430,7 @@ impl ComicApp {
             self.scroll_sensitivity = config.scroll_sensitivity;
             self.one_turn_per_swipe = config.one_turn_per_swipe;
             self.show_page_preview = config.show_page_preview;
+            self.show_fore_edge = config.show_fore_edge;
             self.zoom_spread.scale = config.zoom_spread;
             self.zoom_left.scale = config.zoom_left;
             self.zoom_right.scale = config.zoom_right;
@@ -471,6 +500,7 @@ impl ComicApp {
             scroll_sensitivity: self.scroll_sensitivity,
             one_turn_per_swipe: self.one_turn_per_swipe,
             show_page_preview: self.show_page_preview,
+            show_fore_edge: self.show_fore_edge,
             zoom_spread: self.zoom_spread.scale,
             zoom_left: self.zoom_left.scale,
             zoom_right: self.zoom_right.scale,
@@ -985,7 +1015,7 @@ impl ComicApp {
         self.load_progress = (0, 0);
         self.load_preview = None;
         self.preview_texture = None;
-        self.pending_load = Some(crate::comic::loader::spawn_file_load(path));
+        self.pending_load = Some(crate::comic::loader::spawn_file_load(path, self.show_fore_edge));
     }
 
     /// Like `start_loading_path`, but jumps straight to `page` once loading
@@ -1032,7 +1062,7 @@ impl ComicApp {
 
     /// Call once per frame: drains every background-load event queued since
     /// the last poll (progress ticks can arrive faster than frames).
-    pub fn poll_loading(&mut self) {
+    pub fn poll_loading(&mut self, ctx: &egui::Context) {
         use crate::comic::loader::LoadEvent;
         use std::sync::mpsc::TryRecvError;
 
@@ -1059,6 +1089,15 @@ impl ComicApp {
                     self.pages = result.pages;
                     self.filename = result.filename;
                     self.current_path = Some(result.path.clone());
+                    // Whatever `ComicArchive::load` managed to sample
+                    // concurrently with the archive read by the time it
+                    // returned — one texture upload lays that out; anything
+                    // still in flight (`fore_edge_tail`) fills in the rest
+                    // as `poll_fore_edge` drains it, frame by frame, rather
+                    // than `load` blocking on it (see `spawn_file_load`'s
+                    // `compute_fore_edge`).
+                    self.fore_edge_texture = build_fore_edge_texture(ctx, &result.fore_edge_columns);
+                    self.fore_edge_tail = result.fore_edge_tail;
 
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
                     self.page_offset = 0;
@@ -1242,6 +1281,39 @@ impl ComicApp {
             if decoded.generation != self.load_generation {
                 continue; // stale — belonged to a since-replaced archive
             }
+            if decoded.tier == ThumbnailTier::Low {
+                // A Low-tier decode is exactly the resolution the fore-edge
+                // composite wants (`comic::fore_edge::FORE_EDGE_HEIGHT` ==
+                // `LOW_RES_MAX_DIMENSION`) — patch it in whenever one
+                // arrives and the composite exists. This is what actually
+                // rebuilds the composite when `set_show_fore_edge`
+                // re-enables it for a book already open
+                // (`rebuild_fore_edge_for_current_book` queues every page
+                // at this tier); the *first* time a book loads,
+                // `ComicArchive::load`'s own faster, concurrent sampling
+                // gets there first for most pages, so this mostly no-ops
+                // then rather than doing the work twice.
+                if let Some(fore_edge_texture) = &mut self.fore_edge_texture {
+                    use crate::comic::fore_edge::{EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT, edge_on_right, sample_side};
+                    let x = decoded.page_idx * EDGE_SAMPLE_WIDTH;
+                    if x < fore_edge_texture.size()[0] {
+                        let columns = sample_side(&decoded.image, edge_on_right(decoded.page_idx));
+                        let patch = egui::ColorImage::new([EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT], columns);
+                        fore_edge_texture.set_partial([x, 0], patch, egui::TextureOptions::LINEAR);
+                    }
+                }
+                if !self.show_page_preview {
+                    // Nobody's queuing Low-tier work for the progress-bar
+                    // preview itself right now — either `warm_thumbnail_cache`
+                    // (gated on `show_page_preview`) or
+                    // `rebuild_fore_edge_for_current_book` (not) asked for
+                    // this decode, and the fore-edge patch above is all
+                    // *this* case wants from it — so skip uploading (and
+                    // keeping) a thumbnail texture nobody will show.
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
             let texture = ctx.load_texture(
                 format!("thumb_{}_{:?}", decoded.page_idx, decoded.tier),
                 decoded.image,
@@ -1260,6 +1332,39 @@ impl ComicApp {
             }
             // The whole point of decoding off-thread is to show the preview
             // the instant it's ready — don't wait for the next mouse move.
+            ctx.request_repaint();
+        }
+    }
+
+    /// Call once per frame: applies whatever fore-edge samples
+    /// (`comic::archive::ForeEdgeTail`) have finished decoding since the
+    /// last poll, and drops the tail once it reports there's nothing left
+    /// to ever hear from. Cheap no-op once there's no tail (nothing loaded,
+    /// `show_fore_edge` off, or already fully drained).
+    pub fn poll_fore_edge(&mut self, ctx: &egui::Context) {
+        let Some(tail) = &mut self.fore_edge_tail else { return };
+        let (updates, finished) = tail.poll();
+
+        if !updates.is_empty()
+            && let Some(texture) = &mut self.fore_edge_texture
+        {
+            use crate::comic::fore_edge::{EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT};
+            let width = texture.size()[0];
+            for (page_idx, columns) in updates {
+                let x = page_idx * EDGE_SAMPLE_WIDTH;
+                if x < width {
+                    let patch = egui::ColorImage::new([EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT], columns);
+                    texture.set_partial([x, 0], patch, egui::TextureOptions::LINEAR);
+                }
+            }
+        }
+
+        if finished {
+            self.fore_edge_tail = None;
+        } else {
+            // Keep the UI actively repainting while sampling is still in
+            // flight, rather than waiting for the next unrelated repaint
+            // (mouse move, animation, ...) to pick up each new strip.
             ctx.request_repaint();
         }
     }
@@ -1320,6 +1425,61 @@ impl ComicApp {
         let pages = &self.pages;
         let requests = wanted
             .into_iter()
+            .filter_map(|page_idx| {
+                pages.get(page_idx).map(|data| crate::comic::thumbnail::ThumbnailRequest {
+                    generation,
+                    page_idx,
+                    tier: crate::comic::thumbnail::ThumbnailTier::Low,
+                    max_dimension: crate::comic::thumbnail::LOW_RES_MAX_DIMENSION,
+                    data: data.clone(),
+                })
+            })
+            .collect();
+        self.thumbnail_queue.extend_low_priority(requests);
+    }
+
+    /// Turns the fore-edge "book thickness" feature on or off, from
+    /// Settings. Turning it off drops the current composite immediately, so
+    /// the bars disappear right away. Turning it back on with a book
+    /// already open rebuilds it for that book right then — a blank
+    /// composite plus a whole-book low-res decode request (see
+    /// `poll_thumbnails`'s fore-edge patch-in) — rather than only taking
+    /// effect from the *next* book opened, since by then the archive's own
+    /// bytes are already sitting in `pages` with nothing left to extract.
+    /// No-op (skips the save) if already in that state.
+    pub fn set_show_fore_edge(&mut self, enabled: bool, ctx: &egui::Context) {
+        if self.show_fore_edge == enabled {
+            return;
+        }
+        self.show_fore_edge = enabled;
+        if enabled {
+            self.rebuild_fore_edge_for_current_book(ctx);
+        } else {
+            self.fore_edge_texture = None;
+            self.fore_edge_tail = None;
+        }
+        self.save_config();
+    }
+
+    /// Allocates a blank fore-edge composite sized for the currently open
+    /// book (no-op if none is open) and queues every page for a low-res
+    /// decode to fill it in — see `poll_thumbnails`'s fore-edge patch-in.
+    /// Used by `set_show_fore_edge` to rebuild for a book that's already
+    /// loaded, since `ComicArchive::load`'s own (faster, concurrent)
+    /// sampling only ever runs once, during the load itself.
+    fn rebuild_fore_edge_for_current_book(&mut self, ctx: &egui::Context) {
+        if self.total_pages == 0 {
+            return;
+        }
+        use crate::comic::fore_edge::{EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT};
+        let placeholder =
+            egui::ColorImage::filled([self.total_pages * EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT], egui::Color32::TRANSPARENT);
+        self.fore_edge_texture = Some(ctx.load_texture("fore_edge", placeholder, egui::TextureOptions::LINEAR));
+        self.fore_edge_tail = None;
+
+        let generation = self.load_generation;
+        let pages = &self.pages;
+        let requests = (0..self.total_pages)
             .filter_map(|page_idx| {
                 pages.get(page_idx).map(|data| crate::comic::thumbnail::ThumbnailRequest {
                     generation,
@@ -1417,6 +1577,33 @@ impl ComicApp {
             Err(TryRecvError::Disconnected) => self.pending_update_apply = None,
         }
     }
+}
+
+/// Builds the fore-edge composite texture (see `ui::fore_edge`) in one
+/// upload from `columns` — `LoadResult::fore_edge_columns`, already sampled
+/// and in final page order by `ComicArchive::load` itself, concurrently
+/// with the archive read (see `comic::archive::ComicArchive::load`'s
+/// `compute_fore_edge`), so there's no further background decode to do
+/// here, just laying the already-known pixels out into one image. `None`
+/// if there's nothing to show: an empty book, or `columns` itself empty
+/// (the "book thickness" setting was off for this load).
+fn build_fore_edge_texture(ctx: &egui::Context, columns: &[Vec<egui::Color32>]) -> Option<egui::TextureHandle> {
+    use crate::comic::fore_edge::{EDGE_SAMPLE_WIDTH, FORE_EDGE_HEIGHT};
+
+    if columns.is_empty() {
+        return None;
+    }
+    let width = columns.len() * EDGE_SAMPLE_WIDTH;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; width * FORE_EDGE_HEIGHT];
+    for (page_idx, page_columns) in columns.iter().enumerate() {
+        for (i, &color) in page_columns.iter().enumerate() {
+            let row = i / EDGE_SAMPLE_WIDTH;
+            let col_in_page = i % EDGE_SAMPLE_WIDTH;
+            pixels[row * width + page_idx * EDGE_SAMPLE_WIDTH + col_in_page] = color;
+        }
+    }
+    let image = egui::ColorImage::new([width, FORE_EDGE_HEIGHT], pixels);
+    Some(ctx.load_texture("fore_edge", image, egui::TextureOptions::LINEAR))
 }
 
 #[cfg(test)]

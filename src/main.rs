@@ -105,9 +105,10 @@ impl eframe::App for ComicApp {
         self.apply_pending_toolbar_edit();
         self.theme_preset.theme().apply(ui.ctx());
         self.poll_picking();
-        self.poll_loading();
+        self.poll_loading(ui.ctx());
         self.poll_decoded_pages(ui.ctx());
         self.poll_thumbnails(ui.ctx());
+        self.poll_fore_edge(ui.ctx());
         self.poll_history_save();
         self.poll_update_check();
         self.poll_update_apply();

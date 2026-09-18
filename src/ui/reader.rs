@@ -18,6 +18,7 @@ struct DecodeCtx<'a> {
     textures: &'a mut HashMap<usize, TextureHandle>,
     page_meta: &'a mut HashMap<usize, PageMeta>,
     max_dimension: Option<u32>,
+    fore_edge: ForeEdgeCtx<'a>,
 }
 
 /// The three rects a spread can render into: split `left`/`right` columns
@@ -49,6 +50,33 @@ struct SpreadSeam {
 struct SideZoom {
     left: Option<(f32, Vec2)>,
     right: Option<(f32, Vec2)>,
+}
+
+/// What `draw_fore_edge_slot` needs to paint a page's own fore-edge bar —
+/// bundled separately from `DecodeCtx` (rather than just passing `app`)
+/// because it's built from a disjoint borrow of `ComicApp::fore_edge_texture`
+/// taken *before* `DecodeCtx` takes its own mutable borrows of `textures`/
+/// `page_meta`; the two can then coexist for the rest of the frame.
+struct ForeEdgeCtx<'a> {
+    texture: Option<&'a TextureHandle>,
+    total_pages: usize,
+    /// Whether the pages already read pile up on the screen's left side —
+    /// true for LTR/Single, false for RTL (manga), where the book opens
+    /// from the right.
+    read_on_left: bool,
+}
+
+impl ForeEdgeCtx<'_> {
+    /// What fraction of the book `page_idx` is into, `0.0`..=`1.0` by
+    /// 1-based page number — `None` if there's no page here or the book is
+    /// too short (one page) for a read/unread split to mean anything.
+    fn read_fraction(&self, page_idx: Option<usize>) -> Option<f32> {
+        if self.total_pages <= 1 {
+            return None;
+        }
+        let number = page_idx? + 1;
+        Some((number as f32 / self.total_pages as f32).clamp(0.0, 1.0))
+    }
 }
 
 pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
@@ -121,8 +149,17 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     }
 
     let max_dimension = app.decode_max_dimension();
-    let mut ctx =
-        DecodeCtx { pages: &app.pages, textures: &mut app.textures, page_meta: &mut app.page_meta, max_dimension };
+    let mut ctx = DecodeCtx {
+        pages: &app.pages,
+        textures: &mut app.textures,
+        page_meta: &mut app.page_meta,
+        max_dimension,
+        fore_edge: ForeEdgeCtx {
+            texture: app.fore_edge_texture.as_ref(),
+            total_pages: app.total_pages,
+            read_on_left: app.reading_mode != ReadingMode::RTL,
+        },
+    };
 
     // Left page flush against the right edge of its column, right page
     // flush against the left edge of its — both meet at `mid_x` (or the
@@ -189,6 +226,48 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
                 [Pos2::new(seam.mid_x, layout_rect.top()), Pos2::new(seam.mid_x, layout_rect.bottom())],
                 Stroke::new(app.layout.spine_width, spine_color),
             );
+        }
+    }
+
+}
+
+/// Paints `page_idx`'s own fore-edge bar(s) — see `ui::fore_edge::paint_bar`
+/// — immediately outward from wherever it actually renders within `column`,
+/// mirroring `draw_page_slot`'s own fit-to-height placement math so the bar
+/// sits exactly where the page's own paper would continue. Called right
+/// alongside `draw_page_slot` for the very same `column`/`align`/`page_idx`
+/// (see `draw_spread`), so the bar is positioned, translated during a
+/// page-turn slide, and clipped exactly like the page itself, with no
+/// separate fallback needed for any of that. `Align::Max`/`Align::Min` (the
+/// normal two-page-spread columns) each get one bar, on whichever side
+/// faces away from the spine — the spine side is already handled by the
+/// gap/shadow/line drawn in `draw_double_page`. `Align::Center` (a lone
+/// double-page spread) gets one on each side, since both its edges face
+/// outward. No-op if the page's texture hasn't decoded yet (nothing to
+/// anchor the bar to) or the fore-edge composite itself isn't ready.
+fn draw_fore_edge_slot(ui: &Ui, ctx: &DecodeCtx, column: Rect, align: Align, page_idx: Option<usize>) {
+    let Some(texture) = ctx.fore_edge.texture else { return };
+    let Some(read_fraction) = ctx.fore_edge.read_fraction(page_idx) else { return };
+    let Some(size) = page_idx.and_then(|idx| ctx.textures.get(&idx)).map(|t| t.size_vec2()) else { return };
+
+    let display_size = fit_to_height(size, column.height());
+    let x_min = match align {
+        Align::Min => column.left(),
+        Align::Max => column.right() - display_size.x,
+        Align::Center => column.center().x - display_size.x / 2.0,
+    };
+    let x_max = x_min + display_size.x;
+
+    // `extends_left` (the bar grows further left, away from the page) also
+    // says which screen side this bar is on, which is exactly what decides
+    // whether it's the "read" or "unread" half against `read_on_left`.
+    let read_on_left = ctx.fore_edge.read_on_left;
+    match align {
+        Align::Max => crate::ui::fore_edge::paint_bar(ui, texture, column, x_min, true, read_on_left, read_fraction),
+        Align::Min => crate::ui::fore_edge::paint_bar(ui, texture, column, x_max, false, read_on_left, read_fraction),
+        Align::Center => {
+            crate::ui::fore_edge::paint_bar(ui, texture, column, x_min, true, read_on_left, read_fraction);
+            crate::ui::fore_edge::paint_bar(ui, texture, column, x_max, false, read_on_left, read_fraction);
         }
     }
 }
@@ -318,10 +397,17 @@ fn draw_spread(
 ) {
     let (left_idx, right_idx) = pages;
     if full_spread {
-        draw_page_slot(ui, columns.full.translate(shift), Align::Center, left_idx, zoom.left.or(zoom.right), ctx);
+        let column = columns.full.translate(shift);
+        draw_page_slot(ui, column, Align::Center, left_idx, zoom.left.or(zoom.right), ctx);
+        draw_fore_edge_slot(ui, ctx, column, Align::Center, left_idx);
     } else {
-        draw_page_slot(ui, columns.left.translate(shift), Align::Max, left_idx, zoom.left, ctx);
-        draw_page_slot(ui, columns.right.translate(shift), Align::Min, right_idx, zoom.right, ctx);
+        let left_column = columns.left.translate(shift);
+        draw_page_slot(ui, left_column, Align::Max, left_idx, zoom.left, ctx);
+        draw_fore_edge_slot(ui, ctx, left_column, Align::Max, left_idx);
+
+        let right_column = columns.right.translate(shift);
+        draw_page_slot(ui, right_column, Align::Min, right_idx, zoom.right, ctx);
+        draw_fore_edge_slot(ui, ctx, right_column, Align::Min, right_idx);
     }
 }
 

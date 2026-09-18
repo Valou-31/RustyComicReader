@@ -1,5 +1,8 @@
+use crate::comic::fore_edge;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, mpsc};
 
 /// An opened comic archive. Pages are kept as their original *compressed*
 /// bytes (a few hundred KB each, typically) rather than decoded pixels —
@@ -9,7 +12,26 @@ use std::path::Path;
 /// only when they're about to display it.
 pub struct ComicArchive {
     pub pages: Vec<Vec<u8>>,
+    /// Every page's fore-edge strip (see `comic::fore_edge`) that had
+    /// already finished sampling by the time `load` returned — resolved to
+    /// the correct side, in final (sorted) page order, transparent
+    /// placeholders standing in for whatever hadn't finished yet. Empty if
+    /// `load` was called with `compute_fore_edge: false`.
+    pub fore_edge_columns: Vec<Vec<egui::Color32>>,
+    /// Whatever fore-edge sampling was still in flight when `load` returned
+    /// — `load` doesn't block on the full book finishing (that would delay
+    /// the archive being usable at all by however long the slowest pages
+    /// take), so on a longer book this is typically non-empty even though
+    /// sampling started back when extraction did. The caller keeps polling
+    /// it (see `ForeEdgeTail::poll`) to fill in the rest of
+    /// `fore_edge_columns`'s placeholders as they land.
+    pub fore_edge_tail: Option<ForeEdgeTail>,
 }
+
+/// `sort_and_filter`'s result: pages in final order, their fore-edge
+/// columns (see `ComicArchive::fore_edge_columns`), and the name→final-index
+/// map a `ForeEdgeTail` needs to resolve pages sampled after the fact.
+type SortedPagesWithForeEdge = (Vec<Vec<u8>>, Vec<Vec<egui::Color32>>, HashMap<String, usize>);
 
 /// Called after each page is extracted, in archive order (not final reading
 /// order — that's only known once every entry has been read and sorted).
@@ -18,26 +40,161 @@ pub struct ComicArchive {
 /// `None` for every entry after that.
 type ProgressFn<'a> = dyn FnMut(usize, usize, Option<&egui::ColorImage>) + 'a;
 
+/// One page's fore-edge sample, decoded once but keeping *both* possible
+/// sides (see `EdgeSamplePool`) since which one is wanted — the rule is by
+/// final, sorted page number (`comic::fore_edge::edge_on_right`) — isn't
+/// known until every archive entry has been read.
+struct EdgeSample {
+    left: Vec<egui::Color32>,
+    right: Vec<egui::Color32>,
+}
+
+impl EdgeSample {
+    fn from_image(image: &egui::ColorImage) -> Self {
+        Self { left: fore_edge::sample_side(image, false), right: fore_edge::sample_side(image, true) }
+    }
+}
+
+/// A small pool of worker threads that sample each page's fore-edge strip
+/// (see `EdgeSample`) as its bytes come off the archive, concurrently with
+/// the (I/O-bound, single-threaded) extraction loop still reading further
+/// entries — so this CPU-bound decode work overlaps the archive load
+/// instead of only starting once it's entirely done. `submit` is cheap
+/// (just queues a clone of the page's bytes) and never blocks extraction on
+/// decode; `finish` hands back whatever's already arrived plus a
+/// `ForeEdgeTail` for the rest — it does *not* wait for outstanding work,
+/// since blocking `load` until the slowest page finishes decoding would
+/// delay the archive becoming usable at all by however long that takes
+/// (measured on a real 259-page volume: roughly 1s to extract, but 2s more
+/// for every page's sample to finish decoding — `load` shouldn't make
+/// opening the book wait on the second number).
+struct EdgeSamplePool {
+    work_tx: mpsc::Sender<(String, Vec<u8>)>,
+    result_rx: mpsc::Receiver<(String, EdgeSample)>,
+}
+
+impl EdgeSamplePool {
+    fn spawn() -> Self {
+        let (work_tx, work_rx) = mpsc::channel::<(String, Vec<u8>)>();
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
+        for _ in 0..worker_count {
+            let work_rx = Arc::clone(&work_rx);
+            let result_tx = result_tx.clone();
+            // Not kept as a `JoinHandle`: these run to completion on their
+            // own (their queue is finite — `finish` closes it below — so
+            // they can't run forever), sending results into `result_rx`
+            // for as long as anyone's still receiving. If a newer book
+            // supersedes this one before that finishes, the receiving end
+            // (`ForeEdgeTail`) is simply dropped and these harmlessly fail
+            // to send the rest and exit once their queue drains.
+            std::thread::spawn(move || {
+                loop {
+                    let job = work_rx.lock().unwrap().recv();
+                    let Ok((name, data)) = job else { break };
+                    if let Ok(image) = ComicArchive::decode_image(&data, Some(fore_edge::FORE_EDGE_HEIGHT as u32)) {
+                        let _ = result_tx.send((name, EdgeSample::from_image(&image)));
+                    }
+                }
+            });
+        }
+
+        Self { work_tx, result_rx }
+    }
+
+    /// Queues `name`/`data` for background sampling — never blocks.
+    fn submit(&self, name: &str, data: &[u8]) {
+        let _ = self.work_tx.send((name.to_string(), data.to_vec()));
+    }
+
+    /// Closes the work queue (so workers exit once it drains) and does one
+    /// *non-blocking* sweep of whatever samples have already arrived —
+    /// typically a good chunk of the book, since these workers had a head
+    /// start throughout extraction. Returns those plus a `ForeEdgeTail` for
+    /// the rest, still being decoded by the now-detached workers.
+    fn finish(self) -> (HashMap<String, EdgeSample>, mpsc::Receiver<(String, EdgeSample)>) {
+        drop(self.work_tx);
+        let mut samples = HashMap::new();
+        while let Ok((name, sample)) = self.result_rx.try_recv() {
+            samples.insert(name, sample);
+        }
+        (samples, self.result_rx)
+    }
+}
+
+/// Fore-edge sampling still in flight when `ComicArchive::load` returned —
+/// see `EdgeSamplePool::finish`. The caller (`ComicApp::poll_fore_edge`)
+/// polls this once per frame until it reports it's done, applying each
+/// `(page index, columns)` pair to fill in the corresponding still-blank
+/// slot of the fore-edge composite texture.
+pub struct ForeEdgeTail {
+    result_rx: mpsc::Receiver<(String, EdgeSample)>,
+    /// Final (sorted) page index for every name the tail might still hear
+    /// about — built once, alongside the sort itself, so resolving a late
+    /// arrival to its column position is just a lookup.
+    index_by_name: HashMap<String, usize>,
+}
+
+impl ForeEdgeTail {
+    /// Non-blocking: every `(page index, columns)` pair that's landed since
+    /// this was last called, resolved to the side (`comic::fore_edge::
+    /// edge_on_right`) that index actually wants — ready to write straight
+    /// into the composite — plus whether every worker has now exited and
+    /// there's nothing left to ever report (in which case the caller can
+    /// drop this). Both come from the one drain so a message can't be lost
+    /// between a separate "any more?" check and the next `poll`.
+    pub fn poll(&mut self) -> (Vec<(usize, Vec<egui::Color32>)>, bool) {
+        let mut updates = Vec::new();
+        loop {
+            match self.result_rx.try_recv() {
+                Ok((name, sample)) => {
+                    if let Some(&page_idx) = self.index_by_name.get(&name) {
+                        updates.push((page_idx, if fore_edge::edge_on_right(page_idx) { sample.right } else { sample.left }));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return (updates, false),
+                Err(mpsc::TryRecvError::Disconnected) => return (updates, true),
+            }
+        }
+    }
+}
+
 impl ComicArchive {
+    /// `compute_fore_edge` gates the `EdgeSamplePool` above entirely — when
+    /// off (the user's "book thickness" setting is disabled), no extra
+    /// decoding happens at all and `fore_edge_columns` comes back empty.
     pub async fn load(
         path: &Path,
+        compute_fore_edge: bool,
         mut on_progress: impl FnMut(usize, usize, Option<&egui::ColorImage>),
     ) -> Result<Self> {
         let extension = path.extension().unwrap_or_default().to_str().unwrap_or("").to_lowercase();
 
+        let edge_pool = compute_fore_edge.then(EdgeSamplePool::spawn);
+
         let pages = match extension.as_str() {
-            "cbz" | "zip" => Self::load_zip(path, &mut on_progress).await?,
-            "cb7" | "7z" => Self::load_7z(path, &mut on_progress).await?,
-            "cbr" | "rar" => Self::load_rar(path, &mut on_progress).await?,
+            "cbz" | "zip" => Self::load_zip(path, &mut on_progress, edge_pool.as_ref()).await?,
+            "cb7" | "7z" => Self::load_7z(path, &mut on_progress, edge_pool.as_ref()).await?,
+            "cbr" | "rar" => Self::load_rar(path, &mut on_progress, edge_pool.as_ref()).await?,
             _ => anyhow::bail!("Format non supporté: {}", extension),
         };
 
-        Ok(ComicArchive {
-            pages: Self::sort_and_filter(pages),
-        })
+        let (edge_samples, edge_rx) = match edge_pool {
+            Some(pool) => {
+                let (samples, rx) = pool.finish();
+                (samples, Some(rx))
+            }
+            None => (HashMap::new(), None),
+        };
+        let (pages, fore_edge_columns, index_by_name) = Self::sort_and_filter(pages, edge_samples, edge_rx.is_some());
+        let fore_edge_tail = edge_rx.map(|result_rx| ForeEdgeTail { result_rx, index_by_name });
+
+        Ok(ComicArchive { pages, fore_edge_columns, fore_edge_tail })
     }
 
-    async fn load_zip(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_zip(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
         let file = std::fs::File::open(path)?;
         let mut archive = zip::ZipArchive::new(file)?;
         let total = archive.file_names().filter(|n| Self::is_image_file(n)).count();
@@ -52,7 +209,11 @@ impl ComicArchive {
                     continue;
                 }
                 let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
-                images.push((file.name().to_string(), data));
+                let name = file.name().to_string();
+                if let Some(pool) = edge_pool {
+                    pool.submit(&name, &data);
+                }
+                images.push((name, data));
                 on_progress(images.len(), total, preview.as_ref());
             }
         }
@@ -60,7 +221,7 @@ impl ComicArchive {
         Ok(images)
     }
 
-    async fn load_7z(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_7z(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mut archive = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
@@ -81,7 +242,11 @@ impl ComicArchive {
                     reader.read_to_end(&mut data)?;
                     if Self::looks_like_image(&data) {
                         let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
-                        images.push((entry.name().to_string(), data));
+                        let name = entry.name().to_string();
+                        if let Some(pool) = edge_pool {
+                            pool.submit(&name, &data);
+                        }
+                        images.push((name, data));
                         on_progress(images.len(), total, preview.as_ref());
                     }
                 }
@@ -92,7 +257,7 @@ impl ComicArchive {
         Ok(images)
     }
 
-    async fn load_rar(path: &Path, on_progress: &mut ProgressFn<'_>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_rar(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
         let total = unrar::Archive::new(path)
             .open_for_listing()
             .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?
@@ -124,6 +289,9 @@ impl ComicArchive {
                     .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
                 if Self::looks_like_image(&data) {
                     let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
+                    if let Some(pool) = edge_pool {
+                        pool.submit(&name, &data);
+                    }
                     images.push((name, data));
                     on_progress(images.len(), total, preview.as_ref());
                 }
@@ -180,11 +348,49 @@ impl ComicArchive {
         ))
     }
 
-    fn sort_and_filter(mut images: Vec<(String, Vec<u8>)>) -> Vec<Vec<u8>> {
-        images.sort_by(|a, b| {
-            alphanumeric_sort::compare_str(&a.0, &b.0)
-        });
-        images.into_iter().map(|(_, data)| data).collect()
+    /// Sorts into final reading order and, alongside, resolves each page's
+    /// fore-edge sample (already decoded — see `EdgeSamplePool`) to the side
+    /// (`comic::fore_edge::edge_on_right`) its *final* index actually calls
+    /// for. A page missing from `edge_samples` (its own sample never
+    /// finished, or `compute_fore_edge` was off) falls back to a transparent
+    /// strip, keeping `fore_edge_columns` the same length/shape as `pages`
+    /// either way — except when `edge_samples` is empty, where it's skipped
+    /// entirely (nothing was asked for) and the result is an empty `Vec`.
+    /// Sorts into final reading order and, alongside, resolves each page's
+    /// already-finished fore-edge sample (if any — see `EdgeSamplePool`) to
+    /// the side its *final* index actually calls for. `compute_fore_edge`
+    /// (not merely whether `edge_samples` happens to be non-empty — nothing
+    /// may have finished decoding yet even when the feature is on, if
+    /// extraction was fast enough to outrun the sampling pool) says whether
+    /// to build `fore_edge_columns`/`index_by_name` at all; when it's off
+    /// both come back empty. A page missing from `edge_samples` falls back
+    /// to a transparent strip, filled in later if its sample turns up
+    /// through the returned name→index map (see `ForeEdgeTail`).
+    fn sort_and_filter(
+        mut images: Vec<(String, Vec<u8>)>,
+        edge_samples: HashMap<String, EdgeSample>,
+        compute_fore_edge: bool,
+    ) -> SortedPagesWithForeEdge {
+        images.sort_by(|a, b| alphanumeric_sort::compare_str(&a.0, &b.0));
+
+        if !compute_fore_edge {
+            return (images.into_iter().map(|(_, data)| data).collect(), Vec::new(), HashMap::new());
+        }
+
+        let transparent = || vec![egui::Color32::TRANSPARENT; fore_edge::EDGE_SAMPLE_WIDTH * fore_edge::FORE_EDGE_HEIGHT];
+        let mut pages = Vec::with_capacity(images.len());
+        let mut fore_edge_columns = Vec::with_capacity(images.len());
+        let mut index_by_name = HashMap::with_capacity(images.len());
+        for (page_idx, (name, data)) in images.into_iter().enumerate() {
+            let columns = edge_samples
+                .get(&name)
+                .map(|sample| if fore_edge::edge_on_right(page_idx) { sample.right.clone() } else { sample.left.clone() })
+                .unwrap_or_else(transparent);
+            fore_edge_columns.push(columns);
+            index_by_name.insert(name, page_idx);
+            pages.push(data);
+        }
+        (pages, fore_edge_columns, index_by_name)
     }
 }
 
@@ -313,5 +519,55 @@ mod tests {
         let edge = EdgeColors::sample(&image);
         assert_eq!(edge.left, egui::Color32::BLACK);
         assert_eq!(edge.right, egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn sort_and_filter_resolves_each_page_to_the_side_its_final_index_calls_for() {
+        let images = vec![
+            ("b.jpg".to_string(), vec![2u8]),
+            ("a.jpg".to_string(), vec![1u8]),
+        ];
+        let mut edge_samples = HashMap::new();
+        edge_samples.insert(
+            "a.jpg".to_string(),
+            EdgeSample { left: vec![egui::Color32::BLACK; 2], right: vec![egui::Color32::WHITE; 2] },
+        );
+        edge_samples.insert(
+            "b.jpg".to_string(),
+            EdgeSample { left: vec![egui::Color32::RED; 2], right: vec![egui::Color32::BLUE; 2] },
+        );
+
+        let (pages, columns, index_by_name) = ComicArchive::sort_and_filter(images, edge_samples, true);
+
+        // Sorted order is a.jpg (page_idx 0, odd displayed page -> left
+        // edge) then b.jpg (page_idx 1, even displayed page -> right edge).
+        assert_eq!(pages, vec![vec![1u8], vec![2u8]]);
+        assert_eq!(columns[0], vec![egui::Color32::BLACK; 2]);
+        assert_eq!(columns[1], vec![egui::Color32::BLUE; 2]);
+        assert_eq!(index_by_name.get("a.jpg"), Some(&0));
+        assert_eq!(index_by_name.get("b.jpg"), Some(&1));
+    }
+
+    #[test]
+    fn a_page_missing_from_edge_samples_falls_back_to_a_transparent_strip() {
+        let images = vec![("a.jpg".to_string(), vec![1u8]), ("b.jpg".to_string(), vec![2u8])];
+        let mut edge_samples = HashMap::new();
+        edge_samples.insert("a.jpg".to_string(), EdgeSample { left: vec![egui::Color32::BLACK; 2], right: vec![egui::Color32::WHITE; 2] });
+        // "b.jpg" hadn't finished decoding by the time `load` returned —
+        // still resolvable later through `index_by_name` via `ForeEdgeTail`.
+
+        let (_, columns, index_by_name) = ComicArchive::sort_and_filter(images, edge_samples, true);
+
+        assert_eq!(columns[1], vec![egui::Color32::TRANSPARENT; fore_edge::EDGE_SAMPLE_WIDTH * fore_edge::FORE_EDGE_HEIGHT]);
+        assert_eq!(index_by_name.get("b.jpg"), Some(&1));
+    }
+
+    #[test]
+    fn fore_edge_disabled_produces_empty_columns_and_index() {
+        let images = vec![("a.jpg".to_string(), vec![1u8])];
+        let (pages, columns, index_by_name) = ComicArchive::sort_and_filter(images, HashMap::new(), false);
+        assert_eq!(pages, vec![vec![1u8]]);
+        assert!(columns.is_empty());
+        assert!(index_by_name.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-use crate::comic::archive::ComicArchive;
+use crate::comic::archive::{ComicArchive, ForeEdgeTail};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -8,6 +8,15 @@ pub struct LoadResult {
     /// Each page's original compressed bytes, in reading order — decoded
     /// lazily by the UI as pages come into view.
     pub pages: Vec<Vec<u8>>,
+    /// Every page's fore-edge strip that had already finished sampling by
+    /// the time the archive finished loading — see
+    /// `comic::archive::ComicArchive::fore_edge_columns`. Empty when
+    /// `spawn_file_load`'s `compute_fore_edge` was `false`.
+    pub fore_edge_columns: Vec<Vec<egui::Color32>>,
+    /// Whatever fore-edge sampling was still in flight — see
+    /// `comic::archive::ComicArchive::fore_edge_tail`. The UI keeps polling
+    /// this to fill in `fore_edge_columns`'s remaining blanks as they land.
+    pub fore_edge_tail: Option<ForeEdgeTail>,
 }
 
 pub enum LoadEvent {
@@ -55,7 +64,12 @@ pub fn spawn_file_picker() -> Receiver<PickEvent> {
 /// Decodes the archive at `path` on a background thread. Used both after the
 /// file picker returns a path and whenever a path is already known (reading
 /// history, the multi-file queue, resuming last session, CLI arguments).
-pub fn spawn_file_load(path: PathBuf) -> Receiver<LoadEvent> {
+///
+/// `compute_fore_edge` (the user's "book thickness" setting) gates the
+/// fore-edge sampling `ComicArchive::load` does concurrently with
+/// extraction — when `false`, no extra decoding happens and
+/// `LoadResult::fore_edge_columns` comes back empty.
+pub fn spawn_file_load(path: PathBuf, compute_fore_edge: bool) -> Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
@@ -69,8 +83,14 @@ pub fn spawn_file_load(path: PathBuf) -> Receiver<LoadEvent> {
             let _ = progress_tx.send(LoadEvent::Progress { loaded, total, first_page: preview.cloned() });
         };
 
-        let event = match pollster::block_on(ComicArchive::load(&path, on_progress)) {
-            Ok(archive) => LoadEvent::Finished(LoadResult { path, filename, pages: archive.pages }),
+        let event = match pollster::block_on(ComicArchive::load(&path, compute_fore_edge, on_progress)) {
+            Ok(archive) => LoadEvent::Finished(LoadResult {
+                path,
+                filename,
+                pages: archive.pages,
+                fore_edge_columns: archive.fore_edge_columns,
+                fore_edge_tail: archive.fore_edge_tail,
+            }),
             Err(err) => LoadEvent::Failed(err.to_string()),
         };
         let _ = tx.send(event);

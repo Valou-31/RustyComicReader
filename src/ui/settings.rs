@@ -178,6 +178,18 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
             {
                 app.set_show_page_preview(show_page_preview);
             }
+            let mut show_fore_edge = app.show_fore_edge;
+            if ui
+                .checkbox(&mut show_fore_edge, "Show book thickness")
+                .on_hover_text(
+                    "Sample each page's outer edge into a fore-edge strip shown alongside the \
+                     pages, imitating how a physical book's page block shifts from one hand to \
+                     the other as you read.",
+                )
+                .changed()
+            {
+                app.set_show_fore_edge(show_fore_edge, ui.ctx());
+            }
 
             ui.separator();
             ui.heading("Zoom");
