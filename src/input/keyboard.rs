@@ -49,8 +49,7 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
                     match action {
                         Action::NextSpread => app.next_spread(),
                         Action::PrevSpread => app.prev_spread(),
-                        Action::ShiftRight => app.shift_right(),
-                        Action::ShiftLeft => app.shift_left(),
+                        Action::IsolatePage => app.toggle_isolate_current_page(),
                     }
                 }
             }

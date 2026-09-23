@@ -5,19 +5,17 @@ use std::collections::HashMap;
 pub enum Action {
     NextSpread,
     PrevSpread,
-    ShiftRight,
-    ShiftLeft,
+    IsolatePage,
 }
 
 impl Action {
-    pub const ALL: [Action; 4] = [Action::NextSpread, Action::PrevSpread, Action::ShiftRight, Action::ShiftLeft];
+    pub const ALL: [Action; 3] = [Action::NextSpread, Action::PrevSpread, Action::IsolatePage];
 
     pub fn label(&self) -> &'static str {
         match self {
             Action::NextSpread => "Next Spread",
             Action::PrevSpread => "Previous Spread",
-            Action::ShiftRight => "Shift Right (peek)",
-            Action::ShiftLeft => "Shift Left (peek)",
+            Action::IsolatePage => "Isolate Page (single view)",
         }
     }
 }
@@ -48,26 +46,22 @@ impl Preset {
             Preset::DualMode => {
                 bindings.insert(Action::NextSpread, vec!["ArrowRight".to_string(), "D".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["ArrowLeft".to_string(), "A".to_string()]);
-                bindings.insert(Action::ShiftRight, vec!["E".to_string()]);
-                bindings.insert(Action::ShiftLeft, vec!["Q".to_string()]);
+                bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
             }
             Preset::LeftHand => {
                 bindings.insert(Action::NextSpread, vec!["D".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["A".to_string()]);
-                bindings.insert(Action::ShiftRight, vec!["E".to_string()]);
-                bindings.insert(Action::ShiftLeft, vec!["Q".to_string()]);
+                bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
             }
             Preset::RightHand => {
                 bindings.insert(Action::NextSpread, vec!["ArrowRight".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["ArrowLeft".to_string()]);
-                bindings.insert(Action::ShiftRight, vec!["ArrowUp".to_string()]);
-                bindings.insert(Action::ShiftLeft, vec!["ArrowDown".to_string()]);
+                bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
             }
             Preset::Numpad => {
                 bindings.insert(Action::NextSpread, vec!["Num6".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["Num4".to_string()]);
-                bindings.insert(Action::ShiftRight, vec!["Num9".to_string()]);
-                bindings.insert(Action::ShiftLeft, vec!["Num7".to_string()]);
+                bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
             }
         }
         KeyBindings { bindings }

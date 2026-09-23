@@ -5,7 +5,7 @@ A desktop comic reader built with Rust and egui — dual-page spreads, remappabl
 ## Features
 
 - Dual-page spreads with LTR (Western) and RTL (Manga) modes
-- Peek at the next/previous page (`Q`/`E`) without losing your place
+- Isolate a page to display it alone instead of paired with its neighbor (`E`) — your reading mode (LTR/RTL/Single) is untouched; the mark just sticks to that page, even if you navigate away and back
 - Fully remappable keybindings, with presets (dual-mode, left-hand, right-hand, numpad)
 - Auto-hiding header, fullscreen mode
 - Themes (Dark, Light, Midnight, Sepia) and adjustable layout (page spacing, spine width/opacity, fade speed)
@@ -24,8 +24,7 @@ cargo run --release
 |---|---|---|
 | Next spread | `→` / `D` | Yes |
 | Previous spread | `←` / `A` | Yes |
-| Peek right | `E` | Yes |
-| Peek left | `Q` | Yes |
+| Isolate page (single view) | `E` | Yes |
 | Fullscreen | `F` | No |
 
 All keybindings, the theme, and layout can be changed from the in-app Settings panel.

@@ -3,7 +3,7 @@ use crate::ui::layout::{ToolbarArea, ToolbarItem};
 use egui::{Align2, Context, Ui};
 
 /// Draws the top bar in its normal, space-reserving form: a fixed
-/// filename/page-number/peek-badge line, then every row placed in
+/// filename/page-number line, then every row placed in
 /// `ToolbarArea::Header` (see `ui::toolbar`), then the page-progress bar —
 /// pushing the reader down to make room for it rather than floating over
 /// it (that's `draw_header_overlay`, used instead when
@@ -85,8 +85,8 @@ fn draw_header_content(ui: &mut Ui, app: &mut ComicApp, fade_alpha: f32) {
         ui.label(&app.filename);
         ui.colored_label(secondary, page_label(app));
 
-        if app.page_offset > 0 {
-            ui.colored_label(egui::Color32::from_rgb(230, 180, 40), format!("👁 peek +{}", app.page_offset));
+        if app.is_current_page_isolated() {
+            ui.colored_label(egui::Color32::from_rgb(230, 180, 40), "🔀 isolated");
         }
     });
 

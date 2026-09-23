@@ -72,6 +72,10 @@ fn opened_files() -> Vec<PathBuf> {
 
 fn main() -> Result<(), eframe::Error> {
     install_crash_log_hook();
+    // Must happen before `eframe::run_native` (and so before winit's
+    // `EventLoop::new`) ever runs — see `platform::macos` for why.
+    #[cfg(target_os = "macos")]
+    platform::macos::install_open_file_handler();
     let (rgba, width, height) = load_logo_rgba();
     let options = eframe::NativeOptions {
         // `app_id` is what Wayland compositors (KWin, GNOME Shell...) use to
@@ -104,6 +108,8 @@ impl eframe::App for ComicApp {
         // frame — see `ComicApp::apply_pending_toolbar_edit`.
         self.apply_pending_toolbar_edit();
         self.theme_preset.theme().apply(ui.ctx());
+        #[cfg(target_os = "macos")]
+        self.poll_macos_open_files();
         self.poll_picking();
         self.poll_loading(ui.ctx());
         self.poll_decoded_pages(ui.ctx());

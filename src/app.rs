@@ -82,8 +82,8 @@ impl PageZoom {
 ///
 /// `old_left`/`old_right` are the spread being left; `new_left`/`new_right`
 /// the spread being entered — captured once up front since, during a live
-/// drag, `current_page`/`page_offset` haven't moved yet, so `left_page`/
-/// `right_page` alone can't tell you what's being dragged towards.
+/// drag, `current_page` hasn't moved yet, so `left_page`/`right_page` alone
+/// can't tell you what's being dragged towards.
 /// `entry_sign` says which side the new spread slides in from (`+1.0`
 /// right, `-1.0` left); `forward` says whether committing means
 /// `next_spread` (`true`) or `prev_spread` (`false`).
@@ -146,7 +146,6 @@ pub struct ComicApp {
     /// itself, so spreads before it can shift this off the even/odd pattern.
     pub current_page: usize,
     pub total_pages: usize,
-    pub page_offset: usize,
     pub reading_mode: ReadingMode,
     pub filename: String,
     pub show_settings: bool,
@@ -224,6 +223,11 @@ pub struct ComicApp {
     /// Each decoded page's edge colors and double-page-spread flag,
     /// alongside its texture in `textures` — see `comic::archive::PageMeta`.
     pub page_meta: HashMap<usize, crate::comic::archive::PageMeta>,
+    /// Pages individually pinned to display alone via `E`
+    /// (`toggle_isolate_current_page`), independent of `reading_mode` — see
+    /// `is_isolated`. Indices into the currently loaded book; cleared
+    /// whenever a new book is opened.
+    pub isolated_pages: std::collections::HashSet<usize>,
     /// Cheap low-res previews for `ui::progress_bar`, one per page for the
     /// whole book — see `warm_thumbnail_cache`. Small enough to keep for the
     /// whole session (cleared only when a different book opens) without it
@@ -347,7 +351,6 @@ impl Default for ComicApp {
             pages: Vec::new(),
             current_page: 0,
             total_pages: 0,
-            page_offset: 0,
             reading_mode: ReadingMode::LTR,
             filename: "Aucun fichier".to_string(),
             show_settings: false,
@@ -372,6 +375,7 @@ impl Default for ComicApp {
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
+            isolated_pages: std::collections::HashSet::new(),
             thumbnail_textures: HashMap::new(),
             thumbnail_hires_textures: HashMap::new(),
             fore_edge_texture: None,
@@ -459,8 +463,9 @@ impl ComicApp {
             && entry.path.exists()
         {
             let path = entry.path.clone();
-            app.resume_to_page = Some(entry.last_page);
+            let last_page = entry.last_page;
             app.start_loading_path(path);
+            app.resume_to_page = Some(last_page);
         }
         if app.auto_check_updates {
             app.check_for_updates();
@@ -536,12 +541,9 @@ impl ComicApp {
         self.show_settings || self.show_history || self.show_bookmarks
     }
 
-    /// Advances from wherever the peek offset currently has us looking (not
-    /// from the un-offset spread boundary, so a peek — `shift_right`/
-    /// `shift_left` — carries forward instead of being discarded) to the
-    /// next spread — one page for a double-page spread, two for a normal
-    /// pair. Plays a full slide animation immediately (unlike a trackpad
-    /// drag, there's no gesture to follow first).
+    /// Advances to the next spread — one page for a double-page spread, two
+    /// for a normal pair. Plays a full slide animation immediately (unlike a
+    /// trackpad drag, there's no gesture to follow first).
     pub fn next_spread(&mut self) {
         let old = (self.left_page(), self.right_page());
         if self.advance_forward() {
@@ -558,16 +560,15 @@ impl ComicApp {
 
     /// Jumps straight to the spread starting at `page_idx` — used by
     /// `ui::progress_bar` when the progress bar is clicked. Clamped to a
-    /// valid index; drops any in-flight page-turn transition and clears the
-    /// peek offset, since an arbitrary jump has no adjacent spread to slide
-    /// in from. No pairing realignment: `page_idx` becomes the new spread's
-    /// own leading page, same as a history/session resume.
+    /// valid index; drops any in-flight page-turn transition, since an
+    /// arbitrary jump has no adjacent spread to slide in from. No pairing
+    /// realignment: `page_idx` becomes the new spread's own leading page,
+    /// same as a history/session resume.
     pub fn jump_to_page(&mut self, page_idx: usize) {
         if self.total_pages == 0 {
             return;
         }
         self.current_page = page_idx.min(self.total_pages - 1);
-        self.page_offset = 0;
         self.page_transition = None;
         self.reset_zoom_for_new_page();
         self.mark_history_dirty();
@@ -577,7 +578,7 @@ impl ComicApp {
     /// header's bookmark toggle button. `false` on the empty-state screen.
     pub fn is_current_page_bookmarked(&self) -> bool {
         match &self.current_path {
-            Some(path) => self.bookmarks.contains(path, self.effective_position()),
+            Some(path) => self.bookmarks.contains(path, self.current_page),
             None => false,
         }
     }
@@ -595,8 +596,7 @@ impl ComicApp {
     /// actually did anything (`false` on the empty-state screen).
     fn apply_toggle_bookmark(&mut self) -> bool {
         let Some(path) = self.current_path.clone() else { return false };
-        let page = self.effective_position();
-        self.bookmarks.toggle(&path, &self.filename, page, self.total_pages);
+        self.bookmarks.toggle(&path, &self.filename, self.current_page, self.total_pages);
         true
     }
 
@@ -605,12 +605,10 @@ impl ComicApp {
     /// at gesture end (which settles the spring from wherever the drag left
     /// off, rather than a fresh `0.0`).
     fn advance_forward(&mut self) -> bool {
-        let position = self.effective_position();
-        let next = position + self.spread_width(position);
+        let next = self.current_page + self.spread_width(self.current_page);
         let can_advance = next < self.total_pages;
         if can_advance {
             self.current_page = next;
-            self.page_offset = 0;
             self.reset_zoom_for_new_page();
             self.mark_history_dirty();
         }
@@ -618,9 +616,8 @@ impl ComicApp {
     }
 
     fn advance_backward(&mut self) -> bool {
-        let Some(prev) = self.prev_spread_start(self.effective_position()) else { return false };
+        let Some(prev) = self.prev_spread_start(self.current_page) else { return false };
         self.current_page = prev;
-        self.page_offset = 0;
         self.reset_zoom_for_new_page();
         self.mark_history_dirty();
         true
@@ -681,20 +678,13 @@ impl ComicApp {
     /// (`next_spread`) or backward (`prev_spread`), without mutating
     /// anything — `None` at a boundary where that move isn't possible.
     fn peek_adjacent_pages(&self, forward: bool) -> Option<(Option<usize>, Option<usize>)> {
-        let position = self.effective_position();
         let target = if forward {
-            let next = position + self.spread_width(position);
+            let next = self.current_page + self.spread_width(self.current_page);
             (next < self.total_pages).then_some(next)
         } else {
-            self.prev_spread_start(position)
+            self.prev_spread_start(self.current_page)
         }?;
         Some(self.pages_for_position(target))
-    }
-
-    /// The page index `left_page()`/`right_page()` are currently based on:
-    /// the current spread's leading page, shifted by any active peek.
-    fn effective_position(&self) -> usize {
-        self.current_page + self.page_offset
     }
 
     /// `left_page()`/`right_page()` (in that order) for the spread starting
@@ -702,8 +692,10 @@ impl ComicApp {
     /// Otherwise, a double-page spread (its own image spanning a whole
     /// opening — see `PageMeta::is_spread`) occupies `position` alone, with
     /// `None` on the other side; so does a page whose would-be partner is
-    /// one, since it can't be paired into a normal two-page spread either.
-    /// Otherwise pairs `position` with `position + 1`, swapped for RTL.
+    /// one, or a page either side of the pair has been isolated (`E`, see
+    /// `toggle_isolate_current_page`), since none of those can be paired
+    /// into a normal two-page spread either. Otherwise pairs `position` with
+    /// `position + 1`, swapped for RTL.
     fn pages_for_position(&self, position: usize) -> (Option<usize>, Option<usize>) {
         if position >= self.total_pages {
             return (None, None);
@@ -712,7 +704,12 @@ impl ComicApp {
             return (Some(position), None);
         }
         let partner = position + 1;
-        if self.is_double_page(position) || partner >= self.total_pages || self.is_double_page(partner) {
+        if self.is_double_page(position)
+            || self.is_isolated(position)
+            || partner >= self.total_pages
+            || self.is_double_page(partner)
+            || self.is_isolated(partner)
+        {
             return (Some(position), None);
         }
         if self.reading_mode == ReadingMode::RTL {
@@ -734,14 +731,18 @@ impl ComicApp {
     /// book's first page. In Single Page mode this is always `position - 1`.
     /// Otherwise it mirrors `pages_for_position`'s forward pairing rule
     /// applied backwards: a page pairs with the one before it only if
-    /// neither is a double-page spread.
+    /// neither is a double-page spread or isolated.
     fn prev_spread_start(&self, position: usize) -> Option<usize> {
         let prev = position.checked_sub(1)?;
-        if self.reading_mode == ReadingMode::Single || prev == 0 || self.is_double_page(prev) {
+        if self.reading_mode == ReadingMode::Single
+            || prev == 0
+            || self.is_double_page(prev)
+            || self.is_isolated(prev)
+        {
             return Some(prev);
         }
         let prev2 = prev - 1;
-        Some(if self.is_double_page(prev2) { prev } else { prev2 })
+        Some(if self.is_double_page(prev2) || self.is_isolated(prev2) { prev } else { prev2 })
     }
 
     /// Whether `page_idx`'s image is a double-page spread — `false` until
@@ -751,6 +752,13 @@ impl ComicApp {
     /// decode lands.
     fn is_double_page(&self, page_idx: usize) -> bool {
         self.page_meta.get(&page_idx).is_some_and(|m| m.is_spread)
+    }
+
+    /// Whether `page_idx` has been individually pinned to display alone via
+    /// `toggle_isolate_current_page`, regardless of `reading_mode`'s normal
+    /// pairing rules.
+    fn is_isolated(&self, page_idx: usize) -> bool {
+        self.isolated_pages.contains(&page_idx)
     }
 
     /// The `(progress, velocity)` a fresh transition/drag toward `entry_sign`
@@ -1072,9 +1080,8 @@ impl ComicApp {
     }
 
     /// Switches directly to `mode` — used by Settings' three explicit
-    /// reading-direction buttons. No-op (skips the offset reset and save)
-    /// if already in `mode`, so clicking the already-selected option is
-    /// harmless.
+    /// reading-direction buttons. No-op (skips the save) if already in
+    /// `mode`, so clicking the already-selected option is harmless.
     pub fn set_reading_mode(&mut self, mode: ReadingMode) {
         if self.apply_reading_mode(mode) {
             self.save_config();
@@ -1082,31 +1089,37 @@ impl ComicApp {
     }
 
     /// The mutating half of `set_reading_mode`, split out so it can be
-    /// exercised without the accompanying disk write: switches to `mode`
-    /// and resets any active peek offset. Returns whether anything actually
-    /// changed (`false` if already in `mode`).
+    /// exercised without the accompanying disk write. Returns whether
+    /// anything actually changed (`false` if already in `mode`).
     fn apply_reading_mode(&mut self, mode: ReadingMode) -> bool {
         if self.reading_mode == mode {
             return false;
         }
         self.reading_mode = mode;
-        self.page_offset = 0;
         true
     }
 
-    /// Largest offset for which the spread's left page still stays in bounds.
-    fn max_page_offset(&self) -> usize {
-        self.total_pages.saturating_sub(self.current_page + 1)
-    }
-
-    pub fn shift_right(&mut self) {
-        self.page_offset = (self.page_offset + 1).min(self.max_page_offset());
+    /// Toggles whether the current spread's leading page — the one read
+    /// first, regardless of which visual side it's on — displays alone
+    /// instead of paired with its neighbor. `reading_mode` (LTR/RTL/Single)
+    /// is untouched: this only marks one page index, in `isolated_pages`.
+    /// Unlike the old transient peek, the mark sticks — navigating away and
+    /// back later still shows that page isolated, until toggled off again
+    /// the same way. Bound to `E` by default (`Action::IsolatePage`).
+    pub fn toggle_isolate_current_page(&mut self) {
+        let page = self.current_page;
+        if !self.isolated_pages.remove(&page) {
+            self.isolated_pages.insert(page);
+        }
         self.mark_history_dirty();
     }
 
-    pub fn shift_left(&mut self) {
-        self.page_offset = self.page_offset.saturating_sub(1);
-        self.mark_history_dirty();
+    /// Whether the current spread's leading page is showing alone because of
+    /// `toggle_isolate_current_page` specifically — not because it's a
+    /// natural double-page spread or the book's trailing odd page. Drives
+    /// the header's isolation badge.
+    pub fn is_current_page_isolated(&self) -> bool {
+        self.is_isolated(self.current_page)
     }
 
     fn mark_history_dirty(&mut self) {
@@ -1116,11 +1129,11 @@ impl ComicApp {
     }
 
     pub fn left_page(&self) -> Option<usize> {
-        self.pages_for_position(self.effective_position()).0
+        self.pages_for_position(self.current_page).0
     }
 
     pub fn right_page(&self) -> Option<usize> {
-        self.pages_for_position(self.effective_position()).1
+        self.pages_for_position(self.current_page).1
     }
 
     /// Opens the native file picker (multi-select); once it returns,
@@ -1134,8 +1147,14 @@ impl ComicApp {
 
     /// Starts decoding an already-known path in the background — used by the
     /// file picker, reading history, the multi-file queue, session resume,
-    /// and files passed on the command line.
+    /// and files passed on the command line. Clears any pending
+    /// `resume_to_page` from a previous, still-in-flight `start_loading_path`
+    /// call (e.g. session resume interrupted by a file opened from the OS
+    /// before it finished) — otherwise that stale target page would get
+    /// applied to *this* book instead once its own load completes, landing
+    /// on some unrelated page (or past the end entirely).
     pub fn start_loading_path(&mut self, path: PathBuf) {
+        self.resume_to_page = None;
         self.loading = true;
         self.load_error = None;
         self.load_progress = (0, 0);
@@ -1148,16 +1167,31 @@ impl ComicApp {
     /// finishes instead of the beginning — used by the bookmarks panel to
     /// open a book directly at a saved spot. Reuses the same mechanism
     /// session-resume already uses (`resume_to_page`, consumed in
-    /// `poll_loading`'s `LoadEvent::Finished` handler).
+    /// `poll_loading`'s `LoadEvent::Finished` handler) — set after calling
+    /// `start_loading_path`, since that itself clears `resume_to_page`.
     pub fn start_loading_path_at(&mut self, path: PathBuf, page: usize) {
-        self.resume_to_page = Some(page);
         self.start_loading_path(path);
+        self.resume_to_page = Some(page);
     }
 
     /// Pops the next queued file (if any) and starts loading it.
     pub fn open_next_in_queue(&mut self) {
         if let Some(path) = self.file_queue.pop_front() {
             self.start_loading_path(path);
+        }
+    }
+
+    /// Call once per frame: loads any file macOS has handed us via a
+    /// Finder double-click/"Open With"/Dock drop while already running —
+    /// see `platform::macos`. A fresh launch instead goes through `main`'s
+    /// own CLI-arg path (`ComicApp::new_with_files`), since argv already has
+    /// the answer by the time this could fire. No-op if nothing arrived.
+    #[cfg(target_os = "macos")]
+    pub fn poll_macos_open_files(&mut self) {
+        let mut paths = crate::platform::macos::take_opened_files().into_iter();
+        if let Some(first) = paths.next() {
+            self.file_queue.extend(paths);
+            self.start_loading_path(first);
         }
     }
 
@@ -1207,6 +1241,7 @@ impl ComicApp {
                 Ok(LoadEvent::Finished(result)) => {
                     self.textures.clear();
                     self.page_meta.clear();
+                    self.isolated_pages.clear();
                     self.thumbnail_textures.clear();
                     self.thumbnail_hires_textures.clear();
                     self.thumbnail_pending = None;
@@ -1226,7 +1261,6 @@ impl ComicApp {
                     self.fore_edge_tail = result.fore_edge_tail;
 
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
-                    self.page_offset = 0;
                     self.reset_zoom_for_new_page();
 
                     self.loading = false;
@@ -1244,7 +1278,7 @@ impl ComicApp {
                         self.warm_thumbnail_cache();
                     }
 
-                    let last_page = self.effective_position();
+                    let last_page = self.current_page;
                     self.history.touch(&result.path, &self.filename, last_page, self.total_pages);
                     self.history_dirty = false;
                     self.history_last_saved = std::time::Instant::now();
@@ -1291,7 +1325,7 @@ impl ComicApp {
     /// nothing dirty — becomes a cheap no-op / redundant save.
     pub fn flush_history(&mut self) {
         if let Some(path) = &self.current_path {
-            let last_page = self.effective_position();
+            let last_page = self.current_page;
             self.history.update_page(path, last_page);
         }
         if let Err(err) = self.history.save() {
@@ -1544,7 +1578,7 @@ impl ComicApp {
     /// actually under the cursor.
     fn warm_thumbnail_cache(&mut self) {
         let generation = self.load_generation;
-        let current = self.effective_position();
+        let current = self.current_page;
         let cached: HashSet<usize> = self.thumbnail_textures.keys().copied().collect();
         let wanted = Self::thumbnail_preload_order(self.total_pages, current, &cached);
 
@@ -1739,8 +1773,8 @@ mod tests {
 
     /// A `ComicApp` with `total_pages` pages and no real archive bytes —
     /// enough to exercise the pure navigation math, which only touches
-    /// `current_page`/`page_offset`/`total_pages`/`page_meta`. Indices in
-    /// `doubles` are marked as double-page spreads.
+    /// `current_page`/`total_pages`/`page_meta`. Indices in `doubles` are
+    /// marked as double-page spreads.
     fn app_with(total_pages: usize, doubles: &[usize]) -> ComicApp {
         let mut app = ComicApp::default();
         app.total_pages = total_pages;
@@ -1848,20 +1882,63 @@ mod tests {
     }
 
     #[test]
-    fn apply_reading_mode_resets_peek_offset_and_reports_change() {
+    fn apply_reading_mode_switches_mode_and_reports_change() {
         // Exercises `set_reading_mode`'s pure mutation half directly, since
         // the public method also calls `save_config` (writes the user's
         // real config file) — not something a unit test should do.
         let mut app = app_with(4, &[]);
-        app.shift_right();
-        assert_eq!(app.page_offset, 1);
 
         assert!(app.apply_reading_mode(ReadingMode::Single));
-        assert_eq!(app.page_offset, 0);
         assert_eq!(app.reading_mode, ReadingMode::Single);
 
         // Re-applying the same mode is a no-op and reports no change.
         assert!(!app.apply_reading_mode(ReadingMode::Single));
+    }
+
+    #[test]
+    fn switching_to_single_mode_isolates_the_spread_s_leading_page() {
+        let mut app = app_with(10, &[]);
+        app.current_page = 4;
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+
+        assert!(app.apply_reading_mode(ReadingMode::Single));
+        assert_eq!(app.current_page, 4);
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), None));
+    }
+
+    #[test]
+    fn toggle_isolate_current_page_forces_the_leading_page_alone_without_changing_reading_mode() {
+        let mut app = app_with(10, &[]);
+        app.current_page = 4;
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+
+        app.toggle_isolate_current_page();
+        assert_eq!(app.reading_mode, ReadingMode::LTR);
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), None));
+
+        // Sticks across navigation: revisiting the page later still shows
+        // it isolated.
+        app.current_page = 6;
+        app.current_page = 4;
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), None));
+
+        // Toggling again restores normal pairing.
+        app.toggle_isolate_current_page();
+        assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+    }
+
+    #[test]
+    fn isolating_the_second_page_of_a_pair_also_forces_the_first_alone() {
+        let mut app = app_with(10, &[]);
+        app.current_page = 5;
+        app.toggle_isolate_current_page(); // isolates page 5, not 4
+
+        app.current_page = 4;
+        assert_eq!(
+            (app.left_page(), app.right_page()),
+            (Some(4), None),
+            "page 4 can't pair with an isolated page 5"
+        );
     }
 
     /// Steps `app`'s transition at a fixed 60fps timestep until it's fully
@@ -2148,14 +2225,12 @@ mod tests {
     }
 
     #[test]
-    fn jump_to_page_clears_peek_offset_and_any_in_flight_transition() {
+    fn jump_to_page_clears_any_in_flight_transition() {
         let mut app = app_with(10, &[]);
-        app.shift_right();
         app.next_spread(); // leaves an in-flight page_transition
         assert!(app.page_transition.is_some());
 
         app.jump_to_page(4);
-        assert_eq!(app.page_offset, 0);
         assert!(app.page_transition.is_none());
         assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
     }

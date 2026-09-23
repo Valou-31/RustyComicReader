@@ -35,6 +35,22 @@ winres = "0.1"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
 
+# Pinned to the same versions `eframe`'s own macOS backend already resolves
+# to, so this doesn't pull in a second copy of objc2/objc2-app-kit/
+# objc2-foundation — see `platform::macos` for what these are for.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
+version = "0.3.2"
+default-features = false
+features = ["std", "NSApplication", "NSResponder"]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.3.2"
+default-features = false
+features = ["std", "NSArray", "NSEnumerator", "NSString", "NSURL"]
+
 # Image decoding (jpeg-decoder, sevenz-rust, etc.) is unusably slow without
 # optimizations — a single archive load took 70-90s in plain debug mode.
 # Optimize dependencies while keeping our own crate's debug info/fast rebuilds.

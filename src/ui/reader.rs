@@ -165,17 +165,20 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     // flush against the left edge of its — both meet at `mid_x` (or the
     // configured gap around it), so the spread reads as one continuous book
     // opening rather than two independently centered pages with a gap. A
-    // lone double-page spread — or any page at all in Single Page mode —
-    // instead spans the full width, centered. Each spread's seam travels
-    // with it, so both are drawn at their shifted `mid_x` while sliding.
+    // lone double-page spread, an isolated page (`E`), or any page at all in
+    // Single Page mode instead spans the full width, centered. Each spread's
+    // seam travels with it, so both are drawn at their shifted `mid_x` while
+    // sliding.
     let seams: [Option<SpreadSeam>; 2] = if let Some((progress, entry_sign, old_left, old_right, new_left, new_right)) = sliding {
         ui.ctx().request_repaint();
         let width = layout_rect.width();
         let new_shift = Vec2::new(entry_sign * (1.0 - progress) * width, 0.0);
         let old_shift = Vec2::new(-entry_sign * progress * width, 0.0);
 
-        let old_full = old_right.is_none() && (single_page_mode || is_double_page(old_left, ctx.page_meta));
-        let new_full = new_right.is_none() && (single_page_mode || is_double_page(new_left, ctx.page_meta));
+        let old_full = old_right.is_none()
+            && (single_page_mode || is_double_page(old_left, ctx.page_meta) || is_isolated(old_left, &app.isolated_pages));
+        let new_full = new_right.is_none()
+            && (single_page_mode || is_double_page(new_left, ctx.page_meta) || is_isolated(new_left, &app.isolated_pages));
         // Never zoomed while sliding (see `sliding` above), so nothing to
         // pass here.
         draw_spread(ui, &columns, old_shift, (old_left, old_right), old_full, SideZoom::default(), &mut ctx);
@@ -186,7 +189,8 @@ pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
             Some(SpreadSeam { mid_x: mid_x + new_shift.x, left_idx: new_left, right_idx: new_right, full_spread: new_full }),
         ]
     } else {
-        let full_spread = current_right.is_none() && (single_page_mode || is_double_page(current_left, ctx.page_meta));
+        let full_spread = current_right.is_none()
+            && (single_page_mode || is_double_page(current_left, ctx.page_meta) || is_isolated(current_left, &app.isolated_pages));
         draw_spread(ui, &columns, Vec2::ZERO, (current_left, current_right), full_spread, SideZoom { left: left_zoom, right: right_zoom }, &mut ctx);
 
         [Some(SpreadSeam { mid_x, left_idx: current_left, right_idx: current_right, full_spread }), None]
@@ -565,6 +569,14 @@ fn fit_to_height(size: Vec2, height: f32) -> Vec2 {
 /// its normal column. `false` if `idx` is `None` or hasn't been decoded yet.
 fn is_double_page(idx: Option<usize>, page_meta: &HashMap<usize, PageMeta>) -> bool {
     idx.is_some_and(|i| page_meta.get(&i).is_some_and(|m| m.is_spread))
+}
+
+/// Whether `idx` has been individually pinned to display alone via `E`
+/// (`ComicApp::toggle_isolate_current_page`) — same centering treatment as
+/// an actual double-page spread, since it's just as much "one page taking
+/// up the whole opening" from a layout point of view.
+fn is_isolated(idx: Option<usize>, isolated_pages: &std::collections::HashSet<usize>) -> bool {
+    idx.is_some_and(|i| isolated_pages.contains(&i))
 }
 
 #[cfg(test)]

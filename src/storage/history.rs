@@ -11,8 +11,8 @@ const MAX_ENTRIES: usize = 50;
 pub struct HistoryEntry {
     pub path: PathBuf,
     pub filename: String,
-    /// `current_page + page_offset` at the time this was saved — the
-    /// left/base page of the spread being shown.
+    /// `current_page` at the time this was saved — the leading page of the
+    /// spread being shown.
     pub last_page: usize,
     pub total_pages: usize,
     pub last_opened_secs: u64,
