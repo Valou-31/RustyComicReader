@@ -125,7 +125,53 @@ fn apply(info: &UpdateInfo) -> Result<(), String> {
     std::fs::write(&temp_path, &binary).map_err(|e| e.to_string())?;
     let result = self_replace::self_replace(&temp_path);
     let _ = std::fs::remove_file(&temp_path);
-    result.map_err(|e| e.to_string())
+    result.map_err(|e| e.to_string())?;
+
+    // Swapping the executable in place breaks the `.app` bundle's code
+    // signature — `codesign --verify` on it afterward fails with "invalid
+    // Info.plist (plist or signature have been modified)", since the sealed
+    // hash no longer matches. That's not just cosmetic: Finder's Open
+    // With picker filters out apps that fail this check, so an
+    // auto-updated Comic Reader silently drops out of "Open With" for
+    // .cbz/.cb7/.cbr — re-signing (ad-hoc, same as the CI build does)
+    // reseals it. Best-effort: a failure here doesn't undo the update
+    // itself, which already succeeded.
+    #[cfg(target_os = "macos")]
+    resign_app_bundle_after_update();
+
+    Ok(())
+}
+
+/// Re-signs the `.app` bundle containing the just-updated executable, ad-hoc
+/// (`codesign --force --deep -s -`), matching how `release.yml` signs it
+/// originally. No-op if `current_exe()` isn't actually inside a `.app`
+/// bundle (e.g. a dev build run directly) — resigning some unrelated parent
+/// directory would be actively harmful, so this only proceeds once the path
+/// shape (`*.app/Contents/MacOS/<exe>`) is confirmed.
+#[cfg(target_os = "macos")]
+fn resign_app_bundle_after_update() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(bundle) = app_bundle_root(&exe) else { return };
+    match std::process::Command::new("codesign").args(["--force", "--deep", "-s", "-"]).arg(bundle).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!("codesign exited with {status} while re-signing after update"),
+        Err(err) => tracing::warn!("failed to run codesign while re-signing after update: {err}"),
+    }
+}
+
+/// The `.app` bundle root containing `exe`, if `exe`'s path actually has the
+/// shape `*.app/Contents/MacOS/<name>` — `None` otherwise (e.g. a dev build
+/// run directly, where resigning some unrelated parent directory would be
+/// actively harmful rather than just a no-op).
+#[cfg(target_os = "macos")]
+fn app_bundle_root(exe: &std::path::Path) -> Option<&std::path::Path> {
+    let macos_dir = exe.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    let bundle = contents_dir.parent()?;
+    let is_bundle = macos_dir.file_name().is_some_and(|n| n == "MacOS")
+        && contents_dir.file_name().is_some_and(|n| n == "Contents")
+        && bundle.extension().is_some_and(|e| e == "app");
+    is_bundle.then_some(bundle)
 }
 
 /// Release assets are well over ureq's default 10MB read limit.
@@ -228,6 +274,20 @@ mod tests {
         }
         let extracted = extract_from_tar_gz(&gz, "/rusty_comic_reader").unwrap();
         assert_eq!(extracted, b"fake elf bytes");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn app_bundle_root_matches_a_real_bundle_executable_path() {
+        let exe = std::path::Path::new("/Applications/Comic Reader.app/Contents/MacOS/rusty_comic_reader");
+        assert_eq!(app_bundle_root(exe), Some(std::path::Path::new("/Applications/Comic Reader.app")));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn app_bundle_root_is_none_for_a_dev_build_run_directly() {
+        let exe = std::path::Path::new("/Users/dev/RustyComicReader/target/debug/rusty_comic_reader");
+        assert_eq!(app_bundle_root(exe), None);
     }
 
     /// Hits the real GitHub API — not run by default (`cargo test`), only
