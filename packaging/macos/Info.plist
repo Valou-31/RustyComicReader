@@ -32,7 +32,10 @@
             <key>CFBundleTypeName</key>
             <string>Comic Book Archive (CBZ)</string>
             <key>LSItemContentTypes</key>
-            <array><string>com.rustycomicreader.cbz</string></array>
+            <array>
+                <string>com.rustycomicreader.cbz</string>
+                <string>public.zip-archive</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -42,7 +45,10 @@
             <key>CFBundleTypeName</key>
             <string>Comic Book Archive (CB7)</string>
             <key>LSItemContentTypes</key>
-            <array><string>com.rustycomicreader.cb7</string></array>
+            <array>
+                <string>com.rustycomicreader.cb7</string>
+                <string>org.7-zip.7-zip-archive</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -52,7 +58,10 @@
             <key>CFBundleTypeName</key>
             <string>Comic Book Archive (CBR)</string>
             <key>LSItemContentTypes</key>
-            <array><string>com.rustycomicreader.cbr</string></array>
+            <array>
+                <string>com.rustycomicreader.cbr</string>
+                <string>com.rarlab.rar-archive</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -67,7 +76,7 @@
             <key>UTTypeDescription</key>
             <string>Comic Book Archive (CBZ)</string>
             <key>UTTypeConformsTo</key>
-            <array><string>public.data</string></array>
+            <array><string>public.zip-archive</string></array>
             <key>UTTypeTagSpecification</key>
             <dict>
                 <key>public.filename-extension</key>
@@ -80,7 +89,7 @@
             <key>UTTypeDescription</key>
             <string>Comic Book Archive (CB7)</string>
             <key>UTTypeConformsTo</key>
-            <array><string>public.data</string></array>
+            <array><string>org.7-zip.7-zip-archive</string></array>
             <key>UTTypeTagSpecification</key>
             <dict>
                 <key>public.filename-extension</key>
@@ -93,7 +102,7 @@
             <key>UTTypeDescription</key>
             <string>Comic Book Archive (CBR)</string>
             <key>UTTypeConformsTo</key>
-            <array><string>public.data</string></array>
+            <array><string>com.rarlab.rar-archive</string></array>
             <key>UTTypeTagSpecification</key>
             <dict>
                 <key>public.filename-extension</key>
