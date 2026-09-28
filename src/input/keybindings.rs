@@ -6,16 +6,29 @@ pub enum Action {
     NextSpread,
     PrevSpread,
     IsolatePage,
+    /// Held (not pressed) to scroll the Webtoon strip upward — see
+    /// `input::keyboard::handle_keyboard`, which polls this every frame
+    /// rather than reacting to a single press.
+    WebtoonScrollUp,
+    WebtoonScrollDown,
 }
 
 impl Action {
-    pub const ALL: [Action; 3] = [Action::NextSpread, Action::PrevSpread, Action::IsolatePage];
+    pub const ALL: [Action; 5] = [
+        Action::NextSpread,
+        Action::PrevSpread,
+        Action::IsolatePage,
+        Action::WebtoonScrollUp,
+        Action::WebtoonScrollDown,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             Action::NextSpread => "Next Spread",
             Action::PrevSpread => "Previous Spread",
             Action::IsolatePage => "Isolate Page (single view)",
+            Action::WebtoonScrollUp => "Webtoon: Scroll Up",
+            Action::WebtoonScrollDown => "Webtoon: Scroll Down",
         }
     }
 }
@@ -47,21 +60,32 @@ impl Preset {
                 bindings.insert(Action::NextSpread, vec!["ArrowRight".to_string(), "D".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["ArrowLeft".to_string(), "A".to_string()]);
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
+                bindings.insert(Action::WebtoonScrollUp, vec!["ArrowUp".to_string()]);
+                bindings.insert(Action::WebtoonScrollDown, vec!["ArrowDown".to_string()]);
             }
             Preset::LeftHand => {
                 bindings.insert(Action::NextSpread, vec!["D".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["A".to_string()]);
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
+                // Keeps the hand on WASD rather than reaching for the arrows.
+                bindings.insert(Action::WebtoonScrollUp, vec!["W".to_string()]);
+                bindings.insert(Action::WebtoonScrollDown, vec!["S".to_string()]);
             }
             Preset::RightHand => {
                 bindings.insert(Action::NextSpread, vec!["ArrowRight".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["ArrowLeft".to_string()]);
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
+                bindings.insert(Action::WebtoonScrollUp, vec!["ArrowUp".to_string()]);
+                bindings.insert(Action::WebtoonScrollDown, vec!["ArrowDown".to_string()]);
             }
             Preset::Numpad => {
                 bindings.insert(Action::NextSpread, vec!["Num6".to_string()]);
                 bindings.insert(Action::PrevSpread, vec!["Num4".to_string()]);
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
+                // Matches the numpad's own up/down, alongside 4/6 for
+                // left/right.
+                bindings.insert(Action::WebtoonScrollUp, vec!["Num8".to_string()]);
+                bindings.insert(Action::WebtoonScrollDown, vec!["Num2".to_string()]);
             }
         }
         KeyBindings { bindings }

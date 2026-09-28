@@ -1,4 +1,4 @@
-use crate::app::{ReadingMode, ZoomTarget, ZOOM_MIN};
+use crate::app::{ReadingMode, WEBTOON_SCROLL_SPEED_DOC, ZoomTarget, ZOOM_MIN};
 use crate::input::keybindings::KeyBindings;
 use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
@@ -11,6 +11,10 @@ use std::path::PathBuf;
 pub struct Config {
     pub reading_mode: ReadingMode,
     pub webtoon_page_width_pct: f32,
+    pub webtoon_scroll_speed: f32,
+    pub webtoon_wheel_sensitivity: f32,
+    pub webtoon_scroll_inverted: bool,
+    pub webtoon_page_gap: f32,
     pub keybindings: KeyBindings,
     pub theme: ThemePreset,
     pub layout: LayoutConfig,
@@ -35,6 +39,10 @@ impl Default for Config {
         Self {
             reading_mode: ReadingMode::LTR,
             webtoon_page_width_pct: 70.0,
+            webtoon_scroll_speed: WEBTOON_SCROLL_SPEED_DOC,
+            webtoon_wheel_sensitivity: 1.0,
+            webtoon_scroll_inverted: false,
+            webtoon_page_gap: 0.0,
             keybindings: KeyBindings::default(),
             theme: ThemePreset::default(),
             layout: LayoutConfig::default(),

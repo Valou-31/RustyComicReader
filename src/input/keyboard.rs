@@ -1,5 +1,14 @@
-use crate::app::{ComicApp, ReadingMode, WEBTOON_SCROLL_SPEED_DOC};
+use crate::app::{ComicApp, ReadingMode};
 use crate::input::keybindings::Action;
+
+/// Whether any key currently bound to `action` is held down this frame —
+/// used for `WebtoonScrollUp`/`WebtoonScrollDown`, which read as a smooth
+/// scroll while held rather than a single per-press step (see
+/// `handle_keyboard`'s webtoon block).
+fn action_held(app: &ComicApp, ctx: &egui::Context, action: Action) -> bool {
+    let Some(keys) = app.keybindings.bindings.get(&action) else { return false };
+    ctx.input(|i| i.keys_down.iter().any(|down| keys.iter().any(|bound| bound.eq_ignore_ascii_case(&format!("{down:?}")))))
+}
 
 pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
     // Waiting for the next key press to bind to `action`.
@@ -53,19 +62,24 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
         return;
     }
 
-    // In Webtoon mode the up/down arrows scroll the continuous strip
-    // instead of turning a page — held-down (`key_down`, polled every
-    // frame) rather than a per-press step, so holding the key reads as a
-    // smooth scroll instead of a staircase. Actual clamping against the
-    // book's content height happens in `ui::reader::draw_webtoon`, which is
-    // the only place that knows the current layout; this just accumulates
-    // the raw delta.
+    // In Webtoon mode, whatever's bound to `WebtoonScrollUp`/
+    // `WebtoonScrollDown` (arrows by default — see `Preset::bindings`)
+    // scrolls the continuous strip instead of turning a page — held-down
+    // (polled every frame via `action_held`) rather than a per-press step,
+    // so holding the key reads as a smooth scroll instead of a staircase.
+    // Actual clamping against the book's content height happens in
+    // `ui::reader::draw_webtoon`, which is the only place that knows the
+    // current layout; this just accumulates the raw delta.
     if app.reading_mode == ReadingMode::Webtoon {
-        let (up, down) = ctx.input(|i| (i.key_down(egui::Key::ArrowUp), i.key_down(egui::Key::ArrowDown)));
+        let up = action_held(app, ctx, Action::WebtoonScrollUp);
+        let down = action_held(app, ctx, Action::WebtoonScrollDown);
         if up != down {
             let dt = ctx.input(|i| i.stable_dt);
-            let direction = if down { 1.0 } else { -1.0 };
-            app.webtoon_scroll += WEBTOON_SCROLL_SPEED_DOC * dt * direction;
+            let mut direction = if down { 1.0 } else { -1.0 };
+            if app.webtoon_scroll_inverted {
+                direction = -direction;
+            }
+            app.webtoon_scroll += app.webtoon_scroll_speed * dt * direction;
             ctx.request_repaint();
         }
     }
@@ -80,6 +94,9 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
                         Action::NextSpread => app.next_spread(),
                         Action::PrevSpread => app.prev_spread(),
                         Action::IsolatePage => app.toggle_isolate_current_page(),
+                        // Handled above via `action_held` (a held-key
+                        // scroll, not a per-press step).
+                        Action::WebtoonScrollUp | Action::WebtoonScrollDown => {}
                     }
                 }
             }

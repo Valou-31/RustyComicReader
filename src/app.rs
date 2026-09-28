@@ -45,12 +45,29 @@ pub const ZOOM_MAX: f32 = 5.0;
 pub const WEBTOON_WIDTH_PCT_MIN: f32 = 20.0;
 pub const WEBTOON_WIDTH_PCT_MAX: f32 = 100.0;
 
-/// How fast held-down arrow keys scroll the webtoon strip, in document
-/// units per second — see `ui::reader::WEBTOON_DOC_WIDTH` for what a
-/// document unit is. Tuned so a page roughly `1.4x` as tall as it is wide
-/// (a common webtoon panel proportion) scrolls past in a bit under two
-/// seconds, comfortably readable rather than a blur.
+/// Default for `ComicApp::webtoon_scroll_speed` — how fast holding a
+/// scroll key moves the webtoon strip, in document units per second (see
+/// `ui::reader::WEBTOON_DOC_WIDTH` for what a document unit is). Tuned so a
+/// page roughly `1.4x` as tall as it is wide (a common webtoon panel
+/// proportion) scrolls past in a bit under two seconds, comfortably
+/// readable rather than a blur.
 pub const WEBTOON_SCROLL_SPEED_DOC: f32 = 750.0;
+/// `ComicApp::webtoon_scroll_speed`'s allowed range in Settings.
+pub const WEBTOON_SCROLL_SPEED_MIN: f32 = 150.0;
+pub const WEBTOON_SCROLL_SPEED_MAX: f32 = 2500.0;
+
+/// `ComicApp::webtoon_wheel_sensitivity`'s allowed range in Settings — a
+/// multiplier applied to two-finger trackpad/mouse wheel scrolling in
+/// Webtoon mode, independent of `webtoon_scroll_speed` (which only affects
+/// holding a scroll key). `1.0` is the default 1:1 tracking with the wheel
+/// gesture.
+pub const WEBTOON_WHEEL_SENSITIVITY_MIN: f32 = 0.25;
+pub const WEBTOON_WHEEL_SENSITIVITY_MAX: f32 = 4.0;
+
+/// `ComicApp::webtoon_page_gap`'s allowed range in Settings, in the same
+/// document units as `ui::reader::WEBTOON_DOC_WIDTH`.
+pub const WEBTOON_PAGE_GAP_MIN: f32 = 0.0;
+pub const WEBTOON_PAGE_GAP_MAX: f32 = 100.0;
 
 /// Whether zooming magnifies the whole two-page spread together
 /// (`ComicApp::zoom_spread`), or each page independently
@@ -179,6 +196,27 @@ pub struct ComicApp {
     /// every page uncomfortably wide. Persisted; adjusted from the header's
     /// width slider, which only appears while `Webtoon` is the active mode.
     pub webtoon_page_width_pct: f32,
+    /// How fast holding a scroll key (`input::keybindings::Action::WebtoonScrollUp`/
+    /// `WebtoonScrollDown`) moves the webtoon strip, in document units per
+    /// second — see `WEBTOON_SCROLL_SPEED_DOC` for the default and
+    /// `WEBTOON_SCROLL_SPEED_MIN`/`MAX` for the Settings slider's range.
+    pub webtoon_scroll_speed: f32,
+    /// Multiplier applied to two-finger trackpad/mouse wheel scrolling in
+    /// Webtoon mode, independent of `webtoon_scroll_speed` above (which only
+    /// affects holding a scroll key) — see `WEBTOON_WHEEL_SENSITIVITY_MIN`/
+    /// `MAX` for the Settings slider's range. `1.0` tracks the wheel gesture
+    /// 1:1.
+    pub webtoon_wheel_sensitivity: f32,
+    /// Flips the direction of both the held scroll keys and two-finger/
+    /// wheel vertical scroll in Webtoon mode — independent of
+    /// `scroll_inverted`, which only affects the paginated view's
+    /// horizontal page-turn swipe.
+    pub webtoon_scroll_inverted: bool,
+    /// Extra vertical gap between consecutive pages in the webtoon strip,
+    /// in the same document units as `ui::reader::WEBTOON_DOC_WIDTH` — `0.0`
+    /// stacks pages with no gap at all, matching the original seamless-strip
+    /// design.
+    pub webtoon_page_gap: f32,
     /// Current scroll position of the webtoon strip, in the same document
     /// units as `ui::reader::WEBTOON_DOC_WIDTH` — top of the book is `0.0`,
     /// increasing downward. Not persisted (each session starts wherever
@@ -193,6 +231,18 @@ pub struct ComicApp {
     /// next `draw_webtoon` call, which is the only place that knows enough
     /// about the current layout to turn a page index into a scroll offset.
     pub(crate) webtoon_scroll_target: Option<usize>,
+    /// The page `ui::reader::draw_webtoon` last considered "at the top of
+    /// the viewport", together with its offset (in the same document units
+    /// as `webtoon_scroll`) as of that frame. A page's height is only a
+    /// guess (`WEBTOON_DEFAULT_ASPECT`) until it's actually decoded; when a
+    /// still-undecoded page above the anchor finishes decoding, every
+    /// offset from there down shifts, even though `webtoon_scroll` itself
+    /// hasn't moved. `draw_webtoon` compares the anchor page's offset each
+    /// frame against this stored value and carries `webtoon_scroll` by the
+    /// same delta, so that reflow doesn't yank the content out from under
+    /// the reader mid-scroll.
+    pub(crate) webtoon_anchor_page: Option<usize>,
+    pub(crate) webtoon_anchor_offset: f32,
     pub filename: String,
     /// Parsed from the current book's `ComicInfo.xml`, if it had one — see
     /// `comic::comic_info::ComicInfo`. Shown alongside the filename in the
@@ -425,8 +475,14 @@ impl Default for ComicApp {
             total_pages: 0,
             reading_mode: ReadingMode::LTR,
             webtoon_page_width_pct: 70.0,
+            webtoon_scroll_speed: WEBTOON_SCROLL_SPEED_DOC,
+            webtoon_wheel_sensitivity: 1.0,
+            webtoon_scroll_inverted: false,
+            webtoon_page_gap: 0.0,
             webtoon_scroll: 0.0,
             webtoon_scroll_target: None,
+            webtoon_anchor_page: None,
+            webtoon_anchor_offset: 0.0,
             filename: "Aucun fichier".to_string(),
             comic_info: None,
             show_settings: false,
@@ -507,6 +563,10 @@ impl ComicApp {
         if let Ok(config) = Config::load() {
             self.reading_mode = config.reading_mode;
             self.webtoon_page_width_pct = config.webtoon_page_width_pct;
+            self.webtoon_scroll_speed = config.webtoon_scroll_speed;
+            self.webtoon_wheel_sensitivity = config.webtoon_wheel_sensitivity;
+            self.webtoon_scroll_inverted = config.webtoon_scroll_inverted;
+            self.webtoon_page_gap = config.webtoon_page_gap;
             self.keybindings = config.keybindings;
             self.theme_preset = config.theme;
             self.layout = config.layout;
@@ -579,6 +639,10 @@ impl ComicApp {
         let config = Config {
             reading_mode: self.reading_mode,
             webtoon_page_width_pct: self.webtoon_page_width_pct,
+            webtoon_scroll_speed: self.webtoon_scroll_speed,
+            webtoon_wheel_sensitivity: self.webtoon_wheel_sensitivity,
+            webtoon_scroll_inverted: self.webtoon_scroll_inverted,
+            webtoon_page_gap: self.webtoon_page_gap,
             keybindings: self.keybindings.clone(),
             theme: self.theme_preset,
             layout: self.layout.clone(),

@@ -127,13 +127,18 @@ fn webtoon_page_height(idx: usize, page_meta: &HashMap<usize, PageMeta>) -> f32 
     WEBTOON_DOC_WIDTH / aspect.max(0.05)
 }
 
-/// Every page's own top offset (cumulative height of everything before it),
-/// in document units, plus the book's total height — see
-/// `webtoon_page_height`.
-fn webtoon_offsets(total_pages: usize, page_meta: &HashMap<usize, PageMeta>) -> (Vec<f32>, f32) {
+/// Every page's own top offset (cumulative height of everything before it,
+/// plus `gap` — `ComicApp::webtoon_page_gap` — between each pair), in
+/// document units, plus the book's total height — see `webtoon_page_height`.
+/// `gap` is only inserted *between* pages, never trailing after the last
+/// one, so it doesn't inflate the scrollable height for no reason.
+fn webtoon_offsets(total_pages: usize, page_meta: &HashMap<usize, PageMeta>, gap: f32) -> (Vec<f32>, f32) {
     let mut offsets = Vec::with_capacity(total_pages);
     let mut cursor = 0.0f32;
     for idx in 0..total_pages {
+        if idx > 0 {
+            cursor += gap;
+        }
         offsets.push(cursor);
         cursor += webtoon_page_height(idx, page_meta);
     }
@@ -201,27 +206,44 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     let scale = displayed_width / WEBTOON_DOC_WIDTH;
     let viewport_doc_height = base_rect.height() / scale;
 
-    let (offsets, total_doc_height) = webtoon_offsets(app.total_pages, &app.page_meta);
+    let (offsets, total_doc_height) = webtoon_offsets(app.total_pages, &app.page_meta, app.webtoon_page_gap);
+
+    // A page's height is only a guess (`WEBTOON_DEFAULT_ASPECT`) until it's
+    // actually decoded. If a page above the last known anchor finishes
+    // decoding between frames, its corrected height shifts every offset
+    // below it — including the anchor's own — even though `webtoon_scroll`
+    // didn't move. Carry the scroll by the same delta so the page on screen
+    // stays put instead of jumping as pages above it settle into their real
+    // size.
+    if let Some(anchor) = app.webtoon_anchor_page
+        && let Some(&new_offset) = offsets.get(anchor)
+    {
+        app.webtoon_scroll += new_offset - app.webtoon_anchor_offset;
+    }
 
     if let Some(target) = app.webtoon_scroll_target.take() {
         app.webtoon_scroll = offsets.get(target).copied().unwrap_or(0.0);
     }
 
     // Two-finger trackpad (or mouse wheel) vertical scroll — natural 1:1
-    // tracking with the content, same convention `egui::ScrollArea` itself
-    // uses (`offset -= scroll_delta`), so it feels like every other
-    // scrollable view in the app. `smooth_scroll_delta` is already in
-    // screen points, so dividing by `scale` converts it to the same
-    // document units `webtoon_scroll` is kept in (see `WEBTOON_DOC_WIDTH`);
-    // it's also already zeroed out by egui itself while the zoom modifier
-    // (Cmd/Ctrl) is held, so a pinch-zoom gesture doesn't also scroll.
-    // Skipped while a modal panel is open, so a scroll meant for Settings/
-    // History/Bookmarks underneath doesn't leak through — same guard
-    // `handle_zoom_and_pan` uses for the paginated view's own pan/zoom.
+    // tracking with the content by default, same convention
+    // `egui::ScrollArea` itself uses (`offset -= scroll_delta`), so it feels
+    // like every other scrollable view in the app; `webtoon_wheel_sensitivity`
+    // scales that tracking up or down (independent of `webtoon_scroll_speed`,
+    // which only affects holding a scroll key). `smooth_scroll_delta` is
+    // already in screen points, so dividing by `scale` converts it to the
+    // same document units `webtoon_scroll` is kept in (see
+    // `WEBTOON_DOC_WIDTH`); it's also already zeroed out by egui itself
+    // while the zoom modifier (Cmd/Ctrl) is held, so a pinch-zoom gesture
+    // doesn't also scroll. Skipped while a modal panel is open, so a scroll
+    // meant for Settings/History/Bookmarks underneath doesn't leak through —
+    // same guard `handle_zoom_and_pan` uses for the paginated view's own
+    // pan/zoom.
     if !(app.show_settings || app.show_history || app.show_bookmarks) {
         let wheel_delta_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
         if wheel_delta_y != 0.0 {
-            app.webtoon_scroll -= wheel_delta_y / scale;
+            let signed_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
+            app.webtoon_scroll += signed_delta * app.webtoon_wheel_sensitivity / scale;
             ui.ctx().request_repaint();
         }
     }
@@ -241,6 +263,8 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     let (keep_range, current_page) =
         webtoon_visible_range(&offsets, &app.page_meta, scroll, keep_top, keep_bottom);
     app.update_webtoon_position(current_page);
+    app.webtoon_anchor_page = Some(current_page);
+    app.webtoon_anchor_offset = offsets.get(current_page).copied().unwrap_or(0.0);
 
     let Some((low, high)) = keep_range else { return };
     app.textures.retain(|&idx, _| (low..=high).contains(&idx));
@@ -846,7 +870,7 @@ mod tests {
         page_meta.insert(0, page_meta_with_aspect(1.0)); // height == WEBTOON_DOC_WIDTH
         page_meta.insert(1, page_meta_with_aspect(2.0)); // height == WEBTOON_DOC_WIDTH / 2
 
-        let (offsets, total) = webtoon_offsets(3, &page_meta);
+        let (offsets, total) = webtoon_offsets(3, &page_meta, 0.0);
 
         assert_eq!(offsets.len(), 3);
         assert!((offsets[0] - 0.0).abs() < EPSILON);
@@ -859,8 +883,52 @@ mod tests {
     }
 
     #[test]
+    fn webtoon_offsets_inserts_the_gap_between_pages_but_not_after_the_last_one() {
+        let mut page_meta = HashMap::new();
+        page_meta.insert(0, page_meta_with_aspect(1.0)); // height == WEBTOON_DOC_WIDTH
+        page_meta.insert(1, page_meta_with_aspect(1.0)); // height == WEBTOON_DOC_WIDTH
+
+        let (offsets, total) = webtoon_offsets(2, &page_meta, 40.0);
+
+        assert!((offsets[0] - 0.0).abs() < EPSILON);
+        assert!((offsets[1] - (WEBTOON_DOC_WIDTH + 40.0)).abs() < EPSILON);
+        // No trailing gap after the last page.
+        assert!((total - (2.0 * WEBTOON_DOC_WIDTH + 40.0)).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_offsets_shift_when_a_page_above_finishes_decoding() {
+        // Reproduces the reflow `draw_webtoon`'s anchor correction guards
+        // against: page 0 is still using the default-aspect guess when the
+        // reader is sitting on page 1, then page 0 finishes decoding to a
+        // taller-than-guessed real aspect. Page 1's offset — and thus where
+        // its top actually is — moves even though nothing scrolled.
+        let mut page_meta = HashMap::new();
+        // Page 1 already decoded; page 0 hasn't yet, so it uses the guess.
+        page_meta.insert(1, page_meta_with_aspect(1.0));
+        let (offsets_before, _) = webtoon_offsets(2, &page_meta, 0.0);
+        let anchor_offset = offsets_before[1];
+
+        // Page 0 finishes decoding: much taller than the default guess.
+        page_meta.insert(0, page_meta_with_aspect(0.1));
+        let (offsets_after, _) = webtoon_offsets(2, &page_meta, 0.0);
+
+        assert!(
+            (offsets_after[1] - anchor_offset).abs() > EPSILON,
+            "the scenario should actually reflow, or this test proves nothing"
+        );
+        // The correction `draw_webtoon` applies is exactly this delta added
+        // to `webtoon_scroll`, which keeps page 1's top at the same screen
+        // position it was at before page 0 resolved its real height.
+        let correction = offsets_after[1] - anchor_offset;
+        let scroll_before = anchor_offset; // reader sitting right at page 1's top
+        let scroll_after = scroll_before + correction;
+        assert!((scroll_after - offsets_after[1]).abs() < EPSILON);
+    }
+
+    #[test]
     fn webtoon_offsets_of_an_empty_book_is_empty_with_zero_height() {
-        let (offsets, total) = webtoon_offsets(0, &HashMap::new());
+        let (offsets, total) = webtoon_offsets(0, &HashMap::new(), 0.0);
         assert!(offsets.is_empty());
         assert_eq!(total, 0.0);
     }
@@ -876,7 +944,7 @@ mod tests {
         for i in 0..5 {
             page_meta.insert(i, page_meta_with_aspect(1.0));
         }
-        let (offsets, _) = webtoon_offsets(5, &page_meta);
+        let (offsets, _) = webtoon_offsets(5, &page_meta, 0.0);
 
         let scroll = 2000.0;
         let (range, current) = webtoon_visible_range(&offsets, &page_meta, scroll, scroll - 900.0, scroll + 900.0);
@@ -891,7 +959,7 @@ mod tests {
         for i in 0..3 {
             page_meta.insert(i, page_meta_with_aspect(1.0));
         }
-        let (offsets, total) = webtoon_offsets(3, &page_meta);
+        let (offsets, total) = webtoon_offsets(3, &page_meta, 0.0);
 
         // Scrolled exactly to the bottom: no page's bottom edge is strictly
         // past `scroll` anymore, so `current` must still land on a valid

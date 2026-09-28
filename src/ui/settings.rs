@@ -1,4 +1,8 @@
-use crate::app::{ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode, ZoomTarget};
+use crate::app::{
+    ComicApp, DOWNSCALE_MAX_DIMENSION, ReadingMode, WEBTOON_PAGE_GAP_MAX, WEBTOON_PAGE_GAP_MIN,
+    WEBTOON_SCROLL_SPEED_MAX, WEBTOON_SCROLL_SPEED_MIN, WEBTOON_WHEEL_SENSITIVITY_MAX, WEBTOON_WHEEL_SENSITIVITY_MIN,
+    ZoomTarget,
+};
 use crate::input::keybindings::{Action, Preset};
 use crate::ui::layout::{LayoutConfig, MIN_MENU_BUTTON_OPACITY};
 use crate::ui::theme::ThemePreset;
@@ -63,9 +67,11 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                     app.set_reading_mode(ReadingMode::Webtoon);
                 }
             });
+            ui.separator();
+            ui.heading("Webtoon");
             if app.reading_mode == ReadingMode::Webtoon {
                 ui.horizontal(|ui| {
-                    ui.label("Webtoon page width");
+                    ui.label("Page width");
                     if ui
                         .add(
                             egui::Slider::new(
@@ -79,6 +85,62 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                         app.save_config();
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Page spacing");
+                    if ui
+                        .add(egui::Slider::new(&mut app.webtoon_page_gap, WEBTOON_PAGE_GAP_MIN..=WEBTOON_PAGE_GAP_MAX))
+                        .on_hover_text("Gap between consecutive pages in the strip. 0 stacks them with no seam.")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Keyboard scroll speed");
+                    if ui
+                        .add(egui::Slider::new(
+                            &mut app.webtoon_scroll_speed,
+                            WEBTOON_SCROLL_SPEED_MIN..=WEBTOON_SCROLL_SPEED_MAX,
+                        ))
+                        .on_hover_text("How fast holding a scroll key moves the strip.")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Wheel scroll speed");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut app.webtoon_wheel_sensitivity,
+                                WEBTOON_WHEEL_SENSITIVITY_MIN..=WEBTOON_WHEEL_SENSITIVITY_MAX,
+                            )
+                            .suffix("x"),
+                        )
+                        .on_hover_text("How fast two-finger trackpad or mouse wheel scrolling moves the strip.")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Scroll direction");
+                    if ui.selectable_label(!app.webtoon_scroll_inverted, "Natural").clicked()
+                        && app.webtoon_scroll_inverted
+                    {
+                        app.webtoon_scroll_inverted = false;
+                        app.save_config();
+                    }
+                    if ui.selectable_label(app.webtoon_scroll_inverted, "Inverted").clicked()
+                        && !app.webtoon_scroll_inverted
+                    {
+                        app.webtoon_scroll_inverted = true;
+                        app.save_config();
+                    }
+                });
+            } else {
+                ui.label("Switch to Webtoon mode above to configure these.");
             }
 
             ui.separator();
