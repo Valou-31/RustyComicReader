@@ -52,6 +52,14 @@ type ProgressFn<'a> = dyn FnMut(usize, usize, Option<&egui::ColorImage>) + 'a;
 /// commonly cap a texture's side at 8192px.
 const PREVIEW_MAX_DIMENSION: u32 = 400;
 
+/// Hard ceiling on either side of a decoded page, independent of
+/// `ComicApp::downscale_large_pages` — GPUs (Metal on Apple Silicon
+/// included) commonly refuse to create a texture with a side over 8192px,
+/// so `decode_image` must never hand back an image taller/wider than this
+/// no matter what the user's downscale preference is. Left with headroom
+/// under the actual 8192 limit.
+const MAX_TEXTURE_SIDE: u32 = 8000;
+
 /// One page's fore-edge sample, decoded once but keeping *both* possible
 /// sides (see `EdgeSamplePool`) since which one is wanted — the rule is by
 /// final, sorted page number (`comic::fore_edge::edge_on_right`) — isn't
@@ -377,14 +385,14 @@ impl ComicArchive {
         image::guess_format(data).is_ok()
     }
 
-    /// Decodes a page's compressed bytes into raw pixels. Called on demand,
-    /// right before a page's texture is uploaded — not for the whole archive
-    /// up front — so decoded (and GPU-uploaded) pages never outnumber the
-    /// handful actually near the current spread.
-    ///
-    /// `max_dimension`, when set, downscales the image so neither side
-    /// exceeds it (aspect ratio preserved) — trades a little sharpness on
-    /// very high-res scans for a lot less RAM/VRAM per page.
+    /// Decodes a page's compressed bytes into raw pixels, downscaled (aspect
+    /// ratio preserved, uniform box) so neither side exceeds `max_dimension`
+    /// when set. Used for thumbnails, fore-edge sampling and the
+    /// loading-screen preview — all of which only ever need a genuinely
+    /// small image, regardless of the source page's own aspect ratio, so
+    /// forcing *both* axes down to `max_dimension` is exactly what they
+    /// want. For a page that's actually about to be read at close to native
+    /// size, see `decode_page_image` instead.
     pub(crate) fn decode_image(data: &[u8], max_dimension: Option<u32>) -> anyhow::Result<egui::ColorImage> {
         let mut img = image::load_from_memory(data)?;
 
@@ -394,6 +402,50 @@ impl ComicArchive {
             img = img.resize(max_dimension, max_dimension, image::imageops::FilterType::Triangle);
         }
 
+        Self::to_color_image(img)
+    }
+
+    /// Decodes a page meant to actually be displayed at close to native
+    /// width — the page currently on screen in the paginated view or the
+    /// Webtoon strip. Called on demand, right before a page's texture is
+    /// uploaded — not for the whole archive up front — so decoded (and
+    /// GPU-uploaded) pages never outnumber the handful actually near the
+    /// current spread.
+    ///
+    /// Unlike `decode_image`'s uniform box, width and height are capped
+    /// independently: `max_dimension` (the "Downscale large pages"
+    /// preference, when set) bounds width, and `MAX_TEXTURE_SIDE` bounds
+    /// height unconditionally, regardless of that preference. A single
+    /// "longest side" box would be wrong here: some webtoon releases ship
+    /// an entire chapter as one already-narrow strip many thousands of
+    /// pixels tall (e.g. `1654x34859`) — running *that* through a box sized
+    /// for a typical page would treat its height as the "longest side" and
+    /// crush its already-modest width down to a sliver (~113px, in that
+    /// example) to match, for no memory benefit the width ever needed.
+    /// Capping each axis independently keeps a normal page's behavior
+    /// unchanged (width is almost always its binding dimension) while
+    /// leaving a tall strip's native width alone and only trimming its
+    /// height down to whatever the GPU will actually accept — capped
+    /// unconditionally, since with downscaling turned off entirely
+    /// (`max_dimension: None`) an oversized page must still never reach the
+    /// GPU at a height it will refuse to allocate.
+    pub(crate) fn decode_page_image(data: &[u8], max_dimension: Option<u32>) -> anyhow::Result<egui::ColorImage> {
+        let mut img = image::load_from_memory(data)?;
+
+        let width_cap = max_dimension.unwrap_or(MAX_TEXTURE_SIDE).min(MAX_TEXTURE_SIDE);
+        let scale = (width_cap as f32 / img.width() as f32)
+            .min(MAX_TEXTURE_SIDE as f32 / img.height() as f32)
+            .min(1.0);
+        if scale < 1.0 {
+            let new_width = ((img.width() as f32 * scale).round() as u32).max(1);
+            let new_height = ((img.height() as f32 * scale).round() as u32).max(1);
+            img = img.resize_exact(new_width, new_height, image::imageops::FilterType::Triangle);
+        }
+
+        Self::to_color_image(img)
+    }
+
+    fn to_color_image(img: image::DynamicImage) -> anyhow::Result<egui::ColorImage> {
         let rgba = img.to_rgba8();
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [rgba.width() as usize, rgba.height() as usize],

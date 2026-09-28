@@ -661,7 +661,7 @@ fn draw_page_slot(ui: &mut Ui, column: Rect, align: Align, page_idx: Option<usiz
             // texture yet — e.g. right after opening a file, or a jump to a
             // spread outside the prefetch window. Decoding here blocks this
             // frame, but it's the exception rather than the rule.
-            let image = match ComicArchive::decode_image(data, ctx.max_dimension) {
+            let image = match ComicArchive::decode_page_image(data, ctx.max_dimension) {
                 Ok(image) => image,
                 Err(err) => {
                     tracing::warn!("Failed to decode page {page_idx}: {err}");
