@@ -212,6 +212,7 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                 .changed()
             {
                 app.textures.clear();
+                app.webtoon_textures.clear();
                 app.save_config();
             }
 

@@ -445,6 +445,50 @@ impl ComicArchive {
         Self::to_color_image(img)
     }
 
+    /// Decodes a page for the Webtoon strip specifically, split into one or
+    /// more vertical slices so a page never has to trade away resolution
+    /// just to fit inside one GPU texture the way `decode_page_image` does.
+    /// `max_dimension` still caps *width* the same way (the "Downscale
+    /// large pages" preference) — width almost never needs more than one
+    /// texture's worth of pixels, so there's no reason to slice it, only
+    /// height. But once the page (after any width-driven downscale) is
+    /// still taller than `MAX_TEXTURE_SIDE`, instead of squeezing it down
+    /// to fit — as `decode_page_image` must, since it only ever hands back
+    /// one texture — it's cropped into consecutive horizontal bands, each
+    /// its own texture at full (post-downscale) resolution. `ui::reader::
+    /// draw_webtoon` stacks them back-to-back so they read as one seamless
+    /// page again.
+    ///
+    /// Returns the slices top-to-bottom, plus the whole page's aspect ratio
+    /// (width/height, after any width downscale — unaffected by slicing
+    /// itself) for `ui::reader`'s layout math, same role `PageMeta::aspect`
+    /// plays for `decode_page_image`.
+    pub(crate) fn decode_page_slices(data: &[u8], max_dimension: Option<u32>) -> anyhow::Result<(Vec<egui::ColorImage>, f32)> {
+        let mut img = image::load_from_memory(data)?;
+
+        let width_cap = max_dimension.unwrap_or(MAX_TEXTURE_SIDE).min(MAX_TEXTURE_SIDE);
+        if img.width() > width_cap {
+            let scale = width_cap as f32 / img.width() as f32;
+            let new_width = width_cap.max(1);
+            let new_height = ((img.height() as f32 * scale).round() as u32).max(1);
+            img = img.resize_exact(new_width, new_height, image::imageops::FilterType::Triangle);
+        }
+
+        let aspect = img.width() as f32 / img.height().max(1) as f32;
+
+        let total_height = img.height();
+        let mut slices = Vec::with_capacity((total_height / MAX_TEXTURE_SIDE + 1) as usize);
+        let mut y = 0u32;
+        while y < total_height {
+            let slice_height = (total_height - y).min(MAX_TEXTURE_SIDE);
+            let slice = img.crop_imm(0, y, img.width(), slice_height);
+            slices.push(Self::to_color_image(slice)?);
+            y += slice_height;
+        }
+
+        Ok((slices, aspect))
+    }
+
     fn to_color_image(img: image::DynamicImage) -> anyhow::Result<egui::ColorImage> {
         let rgba = img.to_rgba8();
         Ok(egui::ColorImage::from_rgba_unmultiplied(
@@ -567,25 +611,35 @@ pub struct PageMeta {
     /// exceeds height, unlike a normal comic page). Shown alone, spanning
     /// the full reader width, instead of being paired with another page.
     pub is_spread: bool,
-    /// Width divided by height — used by `ui::reader::draw_webtoon` to lay
-    /// out each page's own slot in the continuous vertical strip before a
-    /// texture (which also carries its own size) is necessarily resident.
-    pub aspect: f32,
 }
 
 impl PageMeta {
     pub fn sample(image: &egui::ColorImage) -> Self {
         let [w, h] = image.size;
-        Self { edge: EdgeColors::sample(image), is_spread: w > h, aspect: w as f32 / h.max(1) as f32 }
+        Self { edge: EdgeColors::sample(image), is_spread: w > h }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::DOWNSCALE_MAX_DIMENSION;
 
     fn solid_image(width: usize, height: usize, color: egui::Color32) -> egui::ColorImage {
         egui::ColorImage::new([width, height], vec![color; width * height])
+    }
+
+    /// PNG-encodes a solid-color image of the given native size — the raw
+    /// compressed bytes `decode_image`/`decode_page_image`/
+    /// `decode_page_slices` actually take, as opposed to `solid_image`'s
+    /// already-decoded pixels.
+    fn encode_solid_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([200, 100, 50, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
     }
 
     #[test]
@@ -678,5 +732,62 @@ mod tests {
         assert_eq!(pages, vec![vec![1u8]]);
         assert!(columns.is_empty());
         assert!(index_by_name.is_empty());
+    }
+
+    #[test]
+    fn decode_page_slices_of_a_normal_page_is_a_single_untouched_slice() {
+        let data = encode_solid_png(200, 300);
+        let (slices, aspect) = ComicArchive::decode_page_slices(&data, Some(DOWNSCALE_MAX_DIMENSION)).unwrap();
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].size, [200, 300]);
+        assert!((aspect - 200.0 / 300.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn decode_page_slices_splits_a_tall_strip_without_shrinking_its_width() {
+        // Mirrors a real webtoon chapter shipped as one merged strip: narrow
+        // enough that `decode_page_image`'s uniform "longest side" downscale
+        // would crush its width down to a sliver trying to also cap its
+        // height. Slicing should leave the width alone entirely (it was
+        // already under the cap) and only split the height.
+        let data = encode_solid_png(1000, 20000);
+        let (slices, aspect) = ComicArchive::decode_page_slices(&data, Some(DOWNSCALE_MAX_DIMENSION)).unwrap();
+
+        // ceil(20000 / MAX_TEXTURE_SIDE) slices, none over the GPU limit,
+        // stacking back up to the original height.
+        let expected_slice_count = (20000u32).div_ceil(MAX_TEXTURE_SIDE) as usize;
+        assert_eq!(slices.len(), expected_slice_count);
+        for slice in &slices {
+            assert_eq!(slice.size[0], 1000); // width untouched — under DOWNSCALE_MAX_DIMENSION already
+            assert!(slice.size[1] as u32 <= MAX_TEXTURE_SIDE);
+        }
+        let total_height: usize = slices.iter().map(|s| s.size[1]).sum();
+        assert_eq!(total_height, 20000);
+        assert!((aspect - 1000.0 / 20000.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn decode_page_slices_still_caps_width_when_downscaling_is_on() {
+        let data = encode_solid_png(6000, 4000);
+        let (slices, aspect) = ComicArchive::decode_page_slices(&data, Some(DOWNSCALE_MAX_DIMENSION)).unwrap();
+
+        assert_eq!(slices.len(), 1); // well under MAX_TEXTURE_SIDE after width downscale
+        assert_eq!(slices[0].size[0], DOWNSCALE_MAX_DIMENSION as usize);
+        // Aspect ratio preserved by the uniform width-driven downscale.
+        assert!((aspect - 6000.0 / 4000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn decode_page_slices_never_exceeds_the_gpu_limit_even_with_downscaling_off() {
+        let data = encode_solid_png(500, 10000);
+        let (slices, _) = ComicArchive::decode_page_slices(&data, None).unwrap();
+
+        for slice in &slices {
+            assert!(slice.size[0] as u32 <= MAX_TEXTURE_SIDE);
+            assert!(slice.size[1] as u32 <= MAX_TEXTURE_SIDE);
+        }
+        let total_height: usize = slices.iter().map(|s| s.size[1]).sum();
+        assert_eq!(total_height, 10000); // no downscale needed, just sliced
     }
 }

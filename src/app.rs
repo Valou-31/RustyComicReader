@@ -330,6 +330,26 @@ pub struct ComicApp {
     /// Each decoded page's edge colors and double-page-spread flag,
     /// alongside its texture in `textures` — see `comic::archive::PageMeta`.
     pub page_meta: HashMap<usize, crate::comic::archive::PageMeta>,
+    /// `ReadingMode::Webtoon`'s own texture cache — kept entirely separate
+    /// from `textures` because a page there can be more than one texture.
+    /// GPUs commonly refuse a texture taller than ~8192px, and some webtoon
+    /// releases ship an entire chapter as a single strip many times that
+    /// tall, so `comic::archive::ComicArchive::decode_page_image` (used by
+    /// `textures` above) has to squeeze such a page down to fit one
+    /// texture. `decode_page_slices` instead splits it into consecutive
+    /// full-quality vertical slices, each its own texture — this is where
+    /// those live, in top-to-bottom order. A page short enough to need only
+    /// one slice still gets a one-element `Vec` here, so `ui::reader::
+    /// draw_webtoon` doesn't need a separate single-vs-sliced case.
+    pub webtoon_textures: HashMap<usize, Vec<egui::TextureHandle>>,
+    /// Every sliced page's aspect ratio (width/height, after any
+    /// `downscale_large_pages`-driven width reduction — unaffected by how
+    /// many slices it was cut into) — `ui::reader::draw_webtoon`'s own
+    /// layout map, parallel to `page_meta` above but Webtoon-specific for
+    /// the same reason `webtoon_textures` is: slicing has nothing to do
+    /// with the paginated view's per-page metadata (fore-edge color,
+    /// spread detection) that `page_meta` also carries.
+    pub webtoon_aspect: HashMap<usize, f32>,
     /// Pages individually pinned to display alone via `E`
     /// (`toggle_isolate_current_page`), independent of `reading_mode` — see
     /// `is_isolated`. Indices into the currently loaded book; cleared
@@ -440,6 +460,12 @@ pub struct ComicApp {
     /// piling up behind a worker that can't keep up.
     decode_queue: DecodeQueue,
     decode_result_rx: std::sync::mpsc::Receiver<crate::comic::prefetch::DecodedPage>,
+    /// Same idea as `decode_queue`/`decode_result_rx` above, but for
+    /// `webtoon_textures`' sliced decode — see `comic::webtoon_decode`.
+    /// Separate worker/queue because a request here can produce more than
+    /// one texture's worth of pixels.
+    webtoon_decode_queue: crate::comic::webtoon_decode::WebtoonDecodeQueue,
+    webtoon_decode_result_rx: std::sync::mpsc::Receiver<crate::comic::webtoon_decode::WebtoonDecodedPage>,
     /// The background thumbnail worker's request queue and result channel —
     /// see `comic::thumbnail`. Decodes hover-preview thumbnails off the UI
     /// thread so showing one never blocks a frame.
@@ -468,6 +494,7 @@ pub struct ComicApp {
 impl Default for ComicApp {
     fn default() -> Self {
         let (decode_queue, decode_result_rx) = crate::comic::prefetch::spawn_decode_worker();
+        let (webtoon_decode_queue, webtoon_decode_result_rx) = crate::comic::webtoon_decode::spawn_webtoon_decode_worker();
         let (thumbnail_queue, thumbnail_result_rx) = crate::comic::thumbnail::spawn_thumbnail_worker();
         Self {
             pages: Vec::new(),
@@ -508,6 +535,8 @@ impl Default for ComicApp {
             remapping_action: None,
             textures: HashMap::new(),
             page_meta: HashMap::new(),
+            webtoon_textures: HashMap::new(),
+            webtoon_aspect: HashMap::new(),
             isolated_pages: std::collections::HashSet::new(),
             thumbnail_textures: HashMap::new(),
             thumbnail_hires_textures: HashMap::new(),
@@ -542,6 +571,8 @@ impl Default for ComicApp {
             load_generation: 0,
             decode_queue,
             decode_result_rx,
+            webtoon_decode_queue,
+            webtoon_decode_result_rx,
             thumbnail_queue,
             thumbnail_result_rx,
             thumbnail_pending: None,
@@ -1506,6 +1537,8 @@ impl ComicApp {
                 Ok(LoadEvent::Finished(result)) => {
                     self.textures.clear();
                     self.page_meta.clear();
+                    self.webtoon_textures.clear();
+                    self.webtoon_aspect.clear();
                     self.isolated_pages.clear();
                     self.thumbnail_textures.clear();
                     self.thumbnail_hires_textures.clear();
@@ -1536,6 +1569,7 @@ impl ComicApp {
                     // tell such a late result apart from one for this book.
                     self.load_generation += 1;
                     self.decode_queue.clear();
+                    self.webtoon_decode_queue.clear();
                     self.load_preview = None;
                     self.preview_texture = None;
                     self.pending_load = None;
@@ -1652,6 +1686,50 @@ impl ComicApp {
             self.page_meta.entry(decoded.page_idx).or_insert(decoded.meta);
             self.textures.entry(decoded.page_idx).or_insert_with(|| {
                 ctx.load_texture(format!("page_{}", decoded.page_idx), decoded.image, egui::TextureOptions::LINEAR)
+            });
+        }
+    }
+
+    /// Same idea as `request_prefetch`, for `ui::reader::draw_webtoon`'s own
+    /// `webtoon_textures` cache instead of `textures`.
+    pub fn request_webtoon_prefetch(&self, low: usize, high: usize) {
+        if self.pages.is_empty() {
+            return;
+        }
+        let max_dimension = self.decode_max_dimension();
+        let high = high.min(self.pages.len() - 1);
+        let generation = self.load_generation;
+        let pages = &self.pages;
+
+        let wanted: HashSet<usize> = (low..=high).filter(|idx| !self.webtoon_textures.contains_key(idx)).collect();
+        self.webtoon_decode_queue.reconcile(&wanted, |page_idx| crate::comic::webtoon_decode::WebtoonDecodeRequest {
+            generation,
+            data: pages[page_idx].clone(),
+            max_dimension,
+        });
+    }
+
+    /// Same idea as `poll_decoded_pages`, for `webtoon_textures`: uploads
+    /// every slice of a finished page as its own texture, in order.
+    pub fn poll_webtoon_decoded_pages(&mut self, ctx: &egui::Context) {
+        while let Ok(decoded) = self.webtoon_decode_result_rx.try_recv() {
+            if decoded.generation != self.load_generation {
+                continue; // stale — belonged to a since-replaced archive
+            }
+            self.webtoon_aspect.entry(decoded.page_idx).or_insert(decoded.aspect);
+            self.webtoon_textures.entry(decoded.page_idx).or_insert_with(|| {
+                decoded
+                    .slices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slice_idx, image)| {
+                        ctx.load_texture(
+                            format!("webtoon_{}_{slice_idx}", decoded.page_idx),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    })
+                    .collect()
             });
         }
     }
@@ -2063,7 +2141,7 @@ mod tests {
         app.total_pages = total_pages;
         let placeholder = EdgeColors { left: egui::Color32::WHITE, right: egui::Color32::WHITE };
         for &i in doubles {
-            app.page_meta.insert(i, PageMeta { edge: placeholder, is_spread: true, aspect: 2.0 });
+            app.page_meta.insert(i, PageMeta { edge: placeholder, is_spread: true });
         }
         app
     }

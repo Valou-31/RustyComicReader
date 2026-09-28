@@ -4,3 +4,4 @@ pub mod fore_edge;
 pub mod loader;
 pub mod prefetch;
 pub mod thumbnail;
+pub mod webtoon_decode;
