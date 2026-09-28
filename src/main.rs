@@ -58,16 +58,7 @@ fn load_logo_rgba() -> (Vec<u8>, u32, u32) {
 /// how the OS hands us a file on double-click/"Open With" on Windows and
 /// Linux (`%1`/`%f` in the registry/.desktop entry become plain argv).
 fn opened_files() -> Vec<PathBuf> {
-    std::env::args()
-        .skip(1)
-        .map(PathBuf::from)
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| comic::loader::SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .collect()
+    std::env::args().skip(1).map(PathBuf::from).filter(|path| comic::loader::is_supported_path(path)).collect()
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -111,6 +102,7 @@ impl eframe::App for ComicApp {
         #[cfg(target_os = "macos")]
         self.poll_macos_open_files();
         self.poll_picking();
+        self.poll_dropped_files(ui.ctx());
         self.poll_loading(ui.ctx());
         self.poll_decoded_pages(ui.ctx());
         self.poll_thumbnails(ui.ctx());
@@ -137,21 +129,24 @@ impl eframe::App for ComicApp {
         ui::settings::draw_settings(ui.ctx(), self);
         ui::history::draw_history(ui.ctx(), self);
         ui::bookmarks::draw_bookmarks(ui.ctx(), self);
+        ui::goto_page::draw_goto_page(ui.ctx(), self);
 
         if !self.pages.is_empty() {
-            let moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
-            if moved {
-                self.last_mouse_move = std::time::Instant::now();
-            }
+            self.update_ui_activity(ui.ctx());
 
-            // Keep repainting while the header is due to hide or mid-fade;
-            // once it's settled (fully shown or fully hidden) stop, and let
-            // the next real mouse-move event wake the loop back up.
-            let idle_for = self.idle_time();
-            if idle_for < UI_HIDE_DELAY {
-                ui.ctx().request_repaint_after(UI_HIDE_DELAY - idle_for);
-            } else if idle_for < UI_HIDE_DELAY + self.layout.fade_duration() {
-                ui.ctx().request_repaint();
+            // Keep repainting while either bar is due to hide or mid-fade;
+            // once both are settled (fully shown or fully hidden) stop, and
+            // let the cursor crossing into/out of a reveal zone wake the
+            // loop back up. `request_repaint_after` coalesces to whichever
+            // requested time is soonest, so scheduling both independently
+            // here is enough — no need to compute the minimum by hand.
+            let fade = self.layout.fade_duration();
+            for idle_for in [self.header_idle_time(), self.footer_idle_time()] {
+                if idle_for < UI_HIDE_DELAY {
+                    ui.ctx().request_repaint_after(UI_HIDE_DELAY - idle_for);
+                } else if idle_for < UI_HIDE_DELAY + fade {
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
@@ -235,12 +230,12 @@ impl eframe::App for ComicApp {
             // The page fills the whole window and the header draws over it
             // afterward, in its own floating layer — instead of `draw_header`
             // reserving its own space above the page (shrinking it to fit).
-            ui::reader::draw_double_page(ui, self);
+            ui::reader::draw_reader(ui, self);
             ui::header::draw_header_overlay(ui.ctx(), self);
             ui::footer::draw_footer(ui.ctx(), self);
         } else {
             ui::header::draw_header(ui, self);
-            ui::reader::draw_double_page(ui, self);
+            ui::reader::draw_reader(ui, self);
             ui::footer::draw_footer(ui.ctx(), self);
         }
 
@@ -254,6 +249,26 @@ impl eframe::App for ComicApp {
             ui.ctx()
                 .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("blue_light_filter")))
                 .rect_filled(screen_rect, 0.0, color);
+        }
+
+        // A file is being dragged over the window — there's no other visual
+        // sign that dropping it would do anything, so this fills the whole
+        // window while it's happening. Drawn last (on top of the blue light
+        // tint too) so it's never obscured. Shown regardless of what's
+        // currently on screen — empty state, loading, or mid-read — since a
+        // drop can land during any of those.
+        if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen_rect = ui.ctx().input(|i| i.viewport_rect());
+            let painter =
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(180));
+            painter.text(
+                screen_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "📂 Drop to open",
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
+            );
         }
     }
 

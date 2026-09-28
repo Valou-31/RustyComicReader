@@ -1,4 +1,6 @@
-use crate::app::{ComicApp, PageZoom, ReadingMode, ZOOM_MAX, ZOOM_MIN, ZoomTarget};
+use crate::app::{
+    ComicApp, PageZoom, ReadingMode, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, ZOOM_MAX, ZOOM_MIN, ZoomTarget,
+};
 use crate::comic::archive::{ComicArchive, PageMeta};
 use egui::{Align, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use std::collections::HashMap;
@@ -79,7 +81,200 @@ impl ForeEdgeCtx<'_> {
     }
 }
 
-pub fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
+/// Dispatches to the right reader implementation for `app.reading_mode` —
+/// the continuous vertical strip (`draw_webtoon`) for `ReadingMode::Webtoon`,
+/// the paginated spread view (`draw_double_page`) for everything else. The
+/// two are different enough (continuous scroll position vs. discrete
+/// spreads/transitions) that sharing one function would mean threading a
+/// mode check through nearly every helper in this module instead of just
+/// picking between two self-contained ones up front.
+pub fn draw_reader(ui: &mut Ui, app: &mut ComicApp) {
+    if app.reading_mode == ReadingMode::Webtoon {
+        draw_webtoon(ui, app);
+    } else {
+        draw_double_page(ui, app);
+    }
+}
+
+/// Reference width, in synthetic "document units", that `draw_webtoon` lays
+/// its cumulative page offsets out in — deliberately independent of actual
+/// screen pixels, so `ComicApp::webtoon_scroll` (also in these units) stays
+/// meaningful across a window resize or a page-width% change instead of
+/// needing to be rescaled every time either one does. The value itself is
+/// arbitrary; only its ratio to page heights (via each page's aspect ratio)
+/// matters.
+const WEBTOON_DOC_WIDTH: f32 = 1000.0;
+
+/// Fallback aspect ratio (width/height) reserved for a page's slot in the
+/// strip before it's actually been decoded — most webtoon/manga pages run
+/// taller than wide, so this keeps the not-yet-known layout close enough to
+/// the real thing that a page finishing decode doesn't visibly jerk the
+/// scroll position. Replaced by `PageMeta::aspect` the moment a page's
+/// texture is ready.
+const WEBTOON_DEFAULT_ASPECT: f32 = 0.7;
+
+/// How far beyond the visible viewport (in document units, each direction)
+/// pages are kept decoded and prefetched — see `ui::reader::draw_webtoon`.
+/// Generous relative to a typical viewport height so a normal reading pace
+/// never outruns the background decode worker; a page's decode has already
+/// started well before it scrolls into view.
+const WEBTOON_PRELOAD_MARGIN: f32 = 2000.0;
+
+/// One page's height in document units, from its known aspect ratio (once
+/// decoded, via `page_meta`) or `WEBTOON_DEFAULT_ASPECT` until then.
+fn webtoon_page_height(idx: usize, page_meta: &HashMap<usize, PageMeta>) -> f32 {
+    let aspect = page_meta.get(&idx).map_or(WEBTOON_DEFAULT_ASPECT, |m| m.aspect);
+    WEBTOON_DOC_WIDTH / aspect.max(0.05)
+}
+
+/// Every page's own top offset (cumulative height of everything before it),
+/// in document units, plus the book's total height — see
+/// `webtoon_page_height`.
+fn webtoon_offsets(total_pages: usize, page_meta: &HashMap<usize, PageMeta>) -> (Vec<f32>, f32) {
+    let mut offsets = Vec::with_capacity(total_pages);
+    let mut cursor = 0.0f32;
+    for idx in 0..total_pages {
+        offsets.push(cursor);
+        cursor += webtoon_page_height(idx, page_meta);
+    }
+    (offsets, cursor)
+}
+
+/// Which contiguous page-index range has any part of its own slot within
+/// `[keep_top, keep_bottom]` (see `WEBTOON_PRELOAD_MARGIN`) — `None` if
+/// `offsets` is empty — and which single page counts as "current": the
+/// first one whose bottom edge is below `scroll`, or the book's last page
+/// if `scroll` is at (or past) the very end. Offsets are monotonically
+/// increasing with page index (see `webtoon_offsets`), so the set of pages
+/// intersecting any contiguous vertical range is itself always a
+/// contiguous index range — hence returning bounds rather than a `Vec`.
+fn webtoon_visible_range(
+    offsets: &[f32],
+    page_meta: &HashMap<usize, PageMeta>,
+    scroll: f32,
+    keep_top: f32,
+    keep_bottom: f32,
+) -> (Option<(usize, usize)>, usize) {
+    let mut keep_range = None;
+    let mut current_page = offsets.len().saturating_sub(1);
+    let mut current_found = false;
+    for (idx, &page_top) in offsets.iter().enumerate() {
+        let page_bottom = page_top + webtoon_page_height(idx, page_meta);
+        if page_bottom >= keep_top && page_top <= keep_bottom {
+            keep_range = Some(match keep_range {
+                Some((low, _)) => (low, idx),
+                None => (idx, idx),
+            });
+        }
+        if !current_found && page_bottom > scroll {
+            current_page = idx;
+            current_found = true;
+        }
+    }
+    (keep_range, current_page)
+}
+
+/// Draws every page of the book as one continuous vertical strip —
+/// `ReadingMode::Webtoon`. Each page is scaled to `app.webtoon_page_width_pct`
+/// of the available width (preserving its own aspect ratio) and stacked
+/// directly against its neighbors with no gap and no per-page chrome, so a
+/// long vertical scroll reads as one unbroken image rather than a sequence
+/// of individually "turned" pages. Scrolling itself comes from two sources:
+/// `input::keyboard` (arrow keys, accumulated into `app.webtoon_scroll`
+/// every frame that key is held) and, read directly below, two-finger
+/// trackpad/mouse wheel scroll. This function turns that scroll position
+/// into what's actually on screen, and is also the only place that knows
+/// enough about the current layout to resolve `webtoon_scroll_target` (a
+/// pending jump from opening a book, switching into this mode, or the
+/// progress bar/bookmarks/"Go to Page") into an actual offset.
+fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
+    let base_rect = ui.available_rect_before_wrap();
+    ui.set_clip_rect(base_rect);
+
+    if app.total_pages == 0 || base_rect.width() <= 0.0 || base_rect.height() <= 0.0 {
+        return;
+    }
+
+    let width_fraction =
+        (app.webtoon_page_width_pct / 100.0).clamp(WEBTOON_WIDTH_PCT_MIN / 100.0, WEBTOON_WIDTH_PCT_MAX / 100.0);
+    let displayed_width = base_rect.width() * width_fraction;
+    let scale = displayed_width / WEBTOON_DOC_WIDTH;
+    let viewport_doc_height = base_rect.height() / scale;
+
+    let (offsets, total_doc_height) = webtoon_offsets(app.total_pages, &app.page_meta);
+
+    if let Some(target) = app.webtoon_scroll_target.take() {
+        app.webtoon_scroll = offsets.get(target).copied().unwrap_or(0.0);
+    }
+
+    // Two-finger trackpad (or mouse wheel) vertical scroll — natural 1:1
+    // tracking with the content, same convention `egui::ScrollArea` itself
+    // uses (`offset -= scroll_delta`), so it feels like every other
+    // scrollable view in the app. `smooth_scroll_delta` is already in
+    // screen points, so dividing by `scale` converts it to the same
+    // document units `webtoon_scroll` is kept in (see `WEBTOON_DOC_WIDTH`);
+    // it's also already zeroed out by egui itself while the zoom modifier
+    // (Cmd/Ctrl) is held, so a pinch-zoom gesture doesn't also scroll.
+    // Skipped while a modal panel is open, so a scroll meant for Settings/
+    // History/Bookmarks underneath doesn't leak through — same guard
+    // `handle_zoom_and_pan` uses for the paginated view's own pan/zoom.
+    if !(app.show_settings || app.show_history || app.show_bookmarks) {
+        let wheel_delta_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
+        if wheel_delta_y != 0.0 {
+            app.webtoon_scroll -= wheel_delta_y / scale;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    let max_scroll = (total_doc_height - viewport_doc_height).max(0.0);
+    app.webtoon_scroll = app.webtoon_scroll.clamp(0.0, max_scroll);
+    let scroll = app.webtoon_scroll;
+
+    // Which pages to keep decoded/resident and which to prefetch — anything
+    // whose own slot falls within `WEBTOON_PRELOAD_MARGIN` doc units of the
+    // visible viewport, ahead so approaching a page's end already has the
+    // next one ready (per the brief: preload before the reader gets there),
+    // behind so scrolling back up doesn't have to re-decode what was just
+    // shown.
+    let keep_top = scroll - WEBTOON_PRELOAD_MARGIN;
+    let keep_bottom = scroll + viewport_doc_height + WEBTOON_PRELOAD_MARGIN;
+    let (keep_range, current_page) =
+        webtoon_visible_range(&offsets, &app.page_meta, scroll, keep_top, keep_bottom);
+    app.update_webtoon_position(current_page);
+
+    let Some((low, high)) = keep_range else { return };
+    app.textures.retain(|&idx, _| (low..=high).contains(&idx));
+    app.page_meta.retain(|&idx, _| (low..=high).contains(&idx));
+    app.request_prefetch(low, high);
+
+    let max_dimension = app.decode_max_dimension();
+    let mut ctx = DecodeCtx {
+        pages: &app.pages,
+        textures: &mut app.textures,
+        page_meta: &mut app.page_meta,
+        max_dimension,
+        // No fore-edge strip in Webtoon mode — the whole point is a
+        // seamless strip with nothing painted alongside a page's own edge.
+        fore_edge: ForeEdgeCtx { texture: None, total_pages: app.total_pages, read_on_left: true },
+    };
+
+    let x_min = base_rect.center().x - displayed_width / 2.0;
+    for idx in low..=high {
+        let page_top = offsets[idx];
+        let height_doc = webtoon_page_height(idx, ctx.page_meta);
+        let page_bottom = page_top + height_doc;
+        // Kept resident (just decoded/prefetched) but currently scrolled
+        // out of view — nothing to paint for it this frame.
+        if page_bottom < scroll || page_top > scroll + viewport_doc_height {
+            continue;
+        }
+        let y_top = base_rect.top() + (page_top - scroll) * scale;
+        let column = Rect::from_min_size(Pos2::new(x_min, y_top), Vec2::new(displayed_width, height_doc * scale));
+        draw_page_slot(ui, column, Align::Center, Some(idx), None, &mut ctx);
+    }
+}
+
+fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
     let base_rect = ui.available_rect_before_wrap();
 
     // Reads pinch/ctrl(-or-Cmd)-scroll zoom and click-drag panning for this
@@ -622,5 +817,93 @@ mod tests {
         // cursor-offset correction.
         let pan = zoom_toward_point(Vec2::new(-40.0, 0.0), Vec2::new(40.0, 0.0), 2.0, 4.0);
         assert_vec2_approx(pan, Vec2::new(-120.0, 0.0));
+    }
+
+    fn page_meta_with_aspect(aspect: f32) -> PageMeta {
+        use crate::comic::archive::EdgeColors;
+        let placeholder = EdgeColors { left: Color32::WHITE, right: Color32::WHITE };
+        PageMeta { edge: placeholder, is_spread: false, aspect }
+    }
+
+    #[test]
+    fn webtoon_page_height_uses_the_known_aspect_ratio_once_decoded() {
+        let mut page_meta = HashMap::new();
+        // Square: height in doc units equals the doc width.
+        page_meta.insert(0, page_meta_with_aspect(1.0));
+        assert!((webtoon_page_height(0, &page_meta) - WEBTOON_DOC_WIDTH).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_page_height_falls_back_to_the_default_guess_when_not_yet_decoded() {
+        let page_meta = HashMap::new();
+        let expected = WEBTOON_DOC_WIDTH / WEBTOON_DEFAULT_ASPECT;
+        assert!((webtoon_page_height(0, &page_meta) - expected).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_offsets_stacks_pages_directly_on_top_of_each_other() {
+        let mut page_meta = HashMap::new();
+        page_meta.insert(0, page_meta_with_aspect(1.0)); // height == WEBTOON_DOC_WIDTH
+        page_meta.insert(1, page_meta_with_aspect(2.0)); // height == WEBTOON_DOC_WIDTH / 2
+
+        let (offsets, total) = webtoon_offsets(3, &page_meta);
+
+        assert_eq!(offsets.len(), 3);
+        assert!((offsets[0] - 0.0).abs() < EPSILON);
+        assert!((offsets[1] - WEBTOON_DOC_WIDTH).abs() < EPSILON);
+        let page1_height = WEBTOON_DOC_WIDTH / 2.0;
+        assert!((offsets[2] - (WEBTOON_DOC_WIDTH + page1_height)).abs() < EPSILON);
+        // Page 2 hasn't been decoded — falls back to the default aspect.
+        let page2_height = WEBTOON_DOC_WIDTH / WEBTOON_DEFAULT_ASPECT;
+        assert!((total - (WEBTOON_DOC_WIDTH + page1_height + page2_height)).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_offsets_of_an_empty_book_is_empty_with_zero_height() {
+        let (offsets, total) = webtoon_offsets(0, &HashMap::new());
+        assert!(offsets.is_empty());
+        assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn webtoon_visible_range_keeps_only_pages_within_the_margin() {
+        // Five same-height (WEBTOON_DOC_WIDTH each) pages stacked at 0,
+        // 1000, 2000, 3000, 4000 (so page `i` spans `[1000*i, 1000*(i+1))`).
+        // A viewport scrolled to 2000 with a margin of 900 (keep window
+        // [1100, 2900]) should keep only pages 1 and 2 — page 0 ends at
+        // 1000 (short of 1100) and page 3 starts at 3000 (past 2900).
+        let mut page_meta = HashMap::new();
+        for i in 0..5 {
+            page_meta.insert(i, page_meta_with_aspect(1.0));
+        }
+        let (offsets, _) = webtoon_offsets(5, &page_meta);
+
+        let scroll = 2000.0;
+        let (range, current) = webtoon_visible_range(&offsets, &page_meta, scroll, scroll - 900.0, scroll + 900.0);
+
+        assert_eq!(range, Some((1, 2)));
+        assert_eq!(current, 2); // page 2 spans [2000, 3000), its bottom is the first past `scroll`
+    }
+
+    #[test]
+    fn webtoon_visible_range_current_page_falls_back_to_the_last_page_at_the_very_end() {
+        let mut page_meta = HashMap::new();
+        for i in 0..3 {
+            page_meta.insert(i, page_meta_with_aspect(1.0));
+        }
+        let (offsets, total) = webtoon_offsets(3, &page_meta);
+
+        // Scrolled exactly to the bottom: no page's bottom edge is strictly
+        // past `scroll` anymore, so `current` must still land on a valid
+        // page (the last one) rather than an out-of-range fallback.
+        let (_, current) = webtoon_visible_range(&offsets, &page_meta, total, total - 100.0, total + 100.0);
+        assert_eq!(current, 2);
+    }
+
+    #[test]
+    fn webtoon_visible_range_of_an_empty_book_keeps_nothing() {
+        let (range, current) = webtoon_visible_range(&[], &HashMap::new(), 0.0, 0.0, 0.0);
+        assert_eq!(range, None);
+        assert_eq!(current, 0);
     }
 }

@@ -1,4 +1,4 @@
-use crate::app::{ComicApp, UI_HIDE_DELAY, UpdateStatus};
+use crate::app::{ComicApp, ReadingMode, UI_HIDE_DELAY, UpdateStatus, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN};
 use crate::ui::layout::{ToolbarArea, ToolbarItem};
 use egui::{Align2, Context, Ui};
 
@@ -8,8 +8,10 @@ use egui::{Align2, Context, Ui};
 /// pushing the reader down to make room for it rather than floating over
 /// it (that's `draw_header_overlay`, used instead when
 /// `app.layout.header_floats_over_reader` is on). Fades out after
-/// `UI_HIDE_DELAY` of no mouse movement and fades back in as soon as the
-/// mouse moves — skips layout entirely once fully hidden, so it doesn't
+/// `UI_HIDE_DELAY` of the cursor sitting outside its reveal zone (the top
+/// `UI_REVEAL_ZONE_FRACTION` of the window, or off the window entirely —
+/// see `ComicApp::update_ui_activity`) and fades back in as soon as it
+/// re-enters — skips layout entirely once fully hidden, so it doesn't
 /// intercept clicks meant for the reader below. Only ever called outside
 /// `app.toolbar_edit_mode` — editing has its own full-screen replacement
 /// for the header/reader/footer entirely, see
@@ -61,7 +63,7 @@ pub fn draw_header_overlay(ctx: &Context, app: &mut ComicApp) {
 /// `draw_header_overlay` so the two stay in lockstep (same timer, same
 /// `Id`, same early-out once fully hidden).
 fn header_fade_alpha(ctx: &Context, app: &ComicApp) -> Option<f32> {
-    let visible = app.idle_time() < UI_HIDE_DELAY;
+    let visible = app.header_idle_time() < UI_HIDE_DELAY;
     let alpha =
         ctx.animate_bool_with_time(egui::Id::new("header_fade"), visible, app.layout.fade_duration().as_secs_f32());
     (alpha > 0.01).then_some(alpha)
@@ -83,6 +85,9 @@ fn draw_header_content(ui: &mut Ui, app: &mut ComicApp, fade_alpha: f32) {
     let secondary = app.theme_preset.theme().text_secondary;
     ui.horizontal(|ui| {
         ui.label(&app.filename);
+        if let Some(label) = comic_info_label(app) {
+            ui.colored_label(secondary, label);
+        }
         ui.colored_label(secondary, page_label(app));
 
         if app.is_current_page_isolated() {
@@ -120,6 +125,21 @@ pub(crate) fn draw_toolbar_item(ui: &mut Ui, app: &mut ComicApp, item: ToolbarIt
         ToolbarItem::ReadingMode => {
             if ui.button(app.reading_mode.label()).clicked() {
                 app.toggle_reading_mode();
+            }
+        }
+        ToolbarItem::WebtoonWidth => {
+            if app.reading_mode == ReadingMode::Webtoon {
+                ui.label("Width");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut app.webtoon_page_width_pct, WEBTOON_WIDTH_PCT_MIN..=WEBTOON_WIDTH_PCT_MAX)
+                            .suffix("%"),
+                    )
+                    .on_hover_text("Page width in Webtoon mode, as a percentage of the window's width.")
+                    .changed()
+                {
+                    app.save_config();
+                }
             }
         }
         ToolbarItem::Bookmark => {
@@ -213,6 +233,21 @@ pub fn draw_update_indicator(ui: &mut Ui, app: &mut ComicApp) {
             }
         }
         UpdateStatus::Idle | UpdateStatus::Checking => {}
+    }
+}
+
+/// The current book's `ComicInfo.xml` series/issue, formatted for the
+/// header — `"Series #Number"`, just the series or just the number if only
+/// one is present, falling back to the tagged title if neither is. `None`
+/// when there's no `ComicInfo.xml` (or it had nothing this recognizes) —
+/// see `comic::comic_info::ComicInfo`.
+fn comic_info_label(app: &ComicApp) -> Option<String> {
+    let info = app.comic_info.as_ref()?;
+    match (&info.series, &info.number) {
+        (Some(series), Some(number)) => Some(format!("{series} #{number}")),
+        (Some(series), None) => Some(series.clone()),
+        (None, Some(number)) => Some(format!("#{number}")),
+        (None, None) => info.title.clone(),
     }
 }
 

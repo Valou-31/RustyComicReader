@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     pub reading_mode: ReadingMode,
+    pub webtoon_page_width_pct: f32,
     pub keybindings: KeyBindings,
     pub theme: ThemePreset,
     pub layout: LayoutConfig,
@@ -33,6 +34,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             reading_mode: ReadingMode::LTR,
+            webtoon_page_width_pct: 70.0,
             keybindings: KeyBindings::default(),
             theme: ThemePreset::default(),
             layout: LayoutConfig::default(),

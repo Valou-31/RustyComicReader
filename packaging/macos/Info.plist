@@ -36,6 +36,15 @@
                 <string>com.rustycomicreader.cbz</string>
                 <string>public.zip-archive</string>
             </array>
+            <!-- Legacy extension-based fallback alongside the UTI declaration
+                 above — matches by raw extension without needing to "own"
+                 any UTI, so it isn't affected by another app's exported UTI
+                 winning the extension's system-wide UTI-ownership
+                 arbitration (macOS only keeps one "active" exported UTI per
+                 extension at a time; a rival app's own custom UTI for .cbz
+                 can end up as that winner, silently demoting ours). -->
+            <key>CFBundleTypeExtensions</key>
+            <array><string>cbz</string></array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -49,6 +58,8 @@
                 <string>com.rustycomicreader.cb7</string>
                 <string>org.7-zip.7-zip-archive</string>
             </array>
+            <key>CFBundleTypeExtensions</key>
+            <array><string>cb7</string></array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -62,6 +73,8 @@
                 <string>com.rustycomicreader.cbr</string>
                 <string>com.rarlab.rar-archive</string>
             </array>
+            <key>CFBundleTypeExtensions</key>
+            <array><string>cbr</string></array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>

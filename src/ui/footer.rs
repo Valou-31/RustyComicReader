@@ -6,7 +6,9 @@ use egui::{Align2, Context};
 /// bottom edge of the window, independent of the header at the top, and
 /// floating above the reader rather than reserving space from it. Empty by
 /// default; only appears once at least one control is placed in
-/// `ToolbarArea::Footer`. Fades with the same idle timer as the header.
+/// `ToolbarArea::Footer`. Fades on the same `UI_HIDE_DELAY` as the header,
+/// but its own independent reveal zone (the bottom `UI_REVEAL_ZONE_FRACTION`
+/// of the window rather than the top) — see `ComicApp::update_ui_activity`.
 /// Only ever called outside `app.toolbar_edit_mode` — editing has its own
 /// full-screen replacement for the header/reader/footer entirely, see
 /// `ui::toolbar::draw_toolbar_editor`.
@@ -23,7 +25,7 @@ pub fn draw_footer(ctx: &Context, app: &mut ComicApp) {
         return;
     }
 
-    let visible = app.idle_time() < UI_HIDE_DELAY;
+    let visible = app.footer_idle_time() < UI_HIDE_DELAY;
     let alpha =
         ctx.animate_bool_with_time(egui::Id::new("footer_fade"), visible, app.layout.fade_duration().as_secs_f32());
     if alpha <= 0.01 {

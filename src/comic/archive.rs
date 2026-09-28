@@ -1,3 +1,4 @@
+use crate::comic::comic_info::ComicInfo;
 use crate::comic::fore_edge;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -26,6 +27,10 @@ pub struct ComicArchive {
     /// it (see `ForeEdgeTail::poll`) to fill in the rest of
     /// `fore_edge_columns`'s placeholders as they land.
     pub fore_edge_tail: Option<ForeEdgeTail>,
+    /// Parsed from the archive's `ComicInfo.xml` entry, if it has one —
+    /// `None` when there isn't one, regardless of whether that's because the
+    /// book just wasn't tagged or the archive format doesn't carry one.
+    pub comic_info: Option<ComicInfo>,
 }
 
 /// `sort_and_filter`'s result: pages in final order, their fore-edge
@@ -174,12 +179,13 @@ impl ComicArchive {
 
         let edge_pool = compute_fore_edge.then(EdgeSamplePool::spawn);
 
-        let pages = match extension.as_str() {
+        let (pages, comic_info_xml) = match extension.as_str() {
             "cbz" | "zip" => Self::load_zip(path, &mut on_progress, edge_pool.as_ref()).await?,
             "cb7" | "7z" => Self::load_7z(path, &mut on_progress, edge_pool.as_ref()).await?,
             "cbr" | "rar" => Self::load_rar(path, &mut on_progress, edge_pool.as_ref()).await?,
             _ => anyhow::bail!("Format non supporté: {}", extension),
         };
+        let comic_info = comic_info_xml.map(|bytes| ComicInfo::parse(&bytes)).filter(|info| !info.is_empty());
 
         let (edge_samples, edge_rx) = match edge_pool {
             Some(pool) => {
@@ -191,14 +197,19 @@ impl ComicArchive {
         let (pages, fore_edge_columns, index_by_name) = Self::sort_and_filter(pages, edge_samples, edge_rx.is_some());
         let fore_edge_tail = edge_rx.map(|result_rx| ForeEdgeTail { result_rx, index_by_name });
 
-        Ok(ComicArchive { pages, fore_edge_columns, fore_edge_tail })
+        Ok(ComicArchive { pages, fore_edge_columns, fore_edge_tail, comic_info })
     }
 
-    async fn load_zip(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_zip(
+        path: &Path,
+        on_progress: &mut ProgressFn<'_>,
+        edge_pool: Option<&EdgeSamplePool>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>)> {
         let file = std::fs::File::open(path)?;
         let mut archive = zip::ZipArchive::new(file)?;
         let total = archive.file_names().filter(|n| Self::is_image_file(n)).count();
         let mut images = Vec::new();
+        let mut comic_info_xml = None;
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
@@ -215,13 +226,21 @@ impl ComicArchive {
                 }
                 images.push((name, data));
                 on_progress(images.len(), total, preview.as_ref());
+            } else if comic_info_xml.is_none() && Self::is_comic_info_file(file.name()) {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut data)?;
+                comic_info_xml = Some(data);
             }
         }
 
-        Ok(images)
+        Ok((images, comic_info_xml))
     }
 
-    async fn load_7z(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_7z(
+        path: &Path,
+        on_progress: &mut ProgressFn<'_>,
+        edge_pool: Option<&EdgeSamplePool>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>)> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mut archive = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
@@ -235,6 +254,7 @@ impl ComicArchive {
             .count();
 
         let mut images = Vec::new();
+        let mut comic_info_xml: Option<Vec<u8>> = None;
         archive
             .for_each_entries(|entry, reader| {
                 if !entry.is_directory() && Self::is_image_file(entry.name()) {
@@ -249,15 +269,23 @@ impl ComicArchive {
                         images.push((name, data));
                         on_progress(images.len(), total, preview.as_ref());
                     }
+                } else if !entry.is_directory() && comic_info_xml.is_none() && Self::is_comic_info_file(entry.name()) {
+                    let mut data = Vec::new();
+                    reader.read_to_end(&mut data)?;
+                    comic_info_xml = Some(data);
                 }
                 Ok(true)
             })
             .map_err(|e| anyhow::anyhow!("Erreur lecture 7z: {e}"))?;
 
-        Ok(images)
+        Ok((images, comic_info_xml))
     }
 
-    async fn load_rar(path: &Path, on_progress: &mut ProgressFn<'_>, edge_pool: Option<&EdgeSamplePool>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn load_rar(
+        path: &Path,
+        on_progress: &mut ProgressFn<'_>,
+        edge_pool: Option<&EdgeSamplePool>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>)> {
         let total = unrar::Archive::new(path)
             .open_for_listing()
             .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?
@@ -266,6 +294,7 @@ impl ComicArchive {
             .count();
 
         let mut images = Vec::new();
+        let mut comic_info_xml: Option<Vec<u8>> = None;
 
         let archive = unrar::Archive::new(path)
             .open_for_processing()
@@ -282,6 +311,7 @@ impl ComicArchive {
 
             let name = file.entry().filename.to_string_lossy().into_owned();
             let is_image = !file.entry().is_directory() && Self::is_image_file(&name);
+            let is_comic_info = !file.entry().is_directory() && comic_info_xml.is_none() && Self::is_comic_info_file(&name);
 
             if is_image {
                 let (data, next) = file
@@ -296,6 +326,12 @@ impl ComicArchive {
                     on_progress(images.len(), total, preview.as_ref());
                 }
                 cursor = Some(next);
+            } else if is_comic_info {
+                let (data, next) = file
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
+                comic_info_xml = Some(data);
+                cursor = Some(next);
             } else {
                 cursor = Some(
                     file.skip()
@@ -304,7 +340,7 @@ impl ComicArchive {
             }
         }
 
-        Ok(images)
+        Ok((images, comic_info_xml))
     }
 
     fn is_image_file(filename: &str) -> bool {
@@ -312,6 +348,16 @@ impl ComicArchive {
         lower.ends_with(".jpg") || lower.ends_with(".jpeg")
             || lower.ends_with(".png") || lower.ends_with(".webp")
             || lower.ends_with(".gif")
+    }
+
+    /// Matches `ComicInfo.xml` by its base filename alone (case-insensitive),
+    /// regardless of which directory inside the archive it sits in — taggers
+    /// disagree on whether it belongs at the root or alongside the pages.
+    fn is_comic_info_file(filename: &str) -> bool {
+        Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("ComicInfo.xml"))
     }
 
     /// Sniffs the magic bytes to confirm an entry is really an image, not
@@ -462,12 +508,16 @@ pub struct PageMeta {
     /// exceeds height, unlike a normal comic page). Shown alone, spanning
     /// the full reader width, instead of being paired with another page.
     pub is_spread: bool,
+    /// Width divided by height — used by `ui::reader::draw_webtoon` to lay
+    /// out each page's own slot in the continuous vertical strip before a
+    /// texture (which also carries its own size) is necessarily resident.
+    pub aspect: f32,
 }
 
 impl PageMeta {
     pub fn sample(image: &egui::ColorImage) -> Self {
         let [w, h] = image.size;
-        Self { edge: EdgeColors::sample(image), is_spread: w > h }
+        Self { edge: EdgeColors::sample(image), is_spread: w > h, aspect: w as f32 / h.max(1) as f32 }
     }
 }
 

@@ -19,14 +19,19 @@ pub enum ToolbarItem {
     Bookmarks,
     UpdateStatus,
     BlueLightFilter,
+    /// The webtoon page-width% slider — only actually drawn while
+    /// `ReadingMode::Webtoon` is active (see `ui::header::draw_toolbar_item`),
+    /// same as `ResetZoom` only showing while zoomed.
+    WebtoonWidth,
     Separator,
 }
 
 impl ToolbarItem {
-    pub const ALL: [ToolbarItem; 12] = [
+    pub const ALL: [ToolbarItem; 13] = [
         ToolbarItem::LoadFile,
         ToolbarItem::NextInQueue,
         ToolbarItem::ReadingMode,
+        ToolbarItem::WebtoonWidth,
         ToolbarItem::Bookmark,
         ToolbarItem::ResetZoom,
         ToolbarItem::LockZoom,
@@ -43,6 +48,7 @@ impl ToolbarItem {
             ToolbarItem::LoadFile => "Load File",
             ToolbarItem::NextInQueue => "Next in Queue",
             ToolbarItem::ReadingMode => "Reading Mode",
+            ToolbarItem::WebtoonWidth => "Webtoon Page Width",
             ToolbarItem::Bookmark => "Bookmark Toggle",
             ToolbarItem::ResetZoom => "Reset Zoom",
             ToolbarItem::LockZoom => "Lock Zoom",
@@ -250,6 +256,7 @@ impl LayoutConfig {
             (ToolbarItem::Separator, Header, 0, Left),
             (ToolbarItem::History, Header, 0, Left),
             (ToolbarItem::ReadingMode, Header, 0, Center),
+            (ToolbarItem::WebtoonWidth, Header, 0, Center),
             (ToolbarItem::BlueLightFilter, Header, 0, Right),
             (ToolbarItem::UpdateStatus, Header, 0, Right),
             (ToolbarItem::LockZoom, Footer, 0, Left),

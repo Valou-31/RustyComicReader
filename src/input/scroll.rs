@@ -39,6 +39,10 @@ pub fn handle_scroll(app: &mut ComicApp, ctx: &egui::Context) {
         || app.show_bookmarks
         || app.toolbar_edit_mode
         || app.remapping_action.is_some()
+        // Webtoon mode has no spreads to turn — it scrolls continuously
+        // instead (arrow keys, see `input::keyboard`), so there's nothing
+        // here for a trackpad swipe to do.
+        || app.reading_mode == ReadingMode::Webtoon
     {
         return;
     }
@@ -96,6 +100,6 @@ fn wants_forward(delta_x: f32, reading_mode: ReadingMode) -> bool {
     let left_to_right = delta_x > 0.0;
     match reading_mode {
         ReadingMode::RTL => left_to_right,
-        ReadingMode::LTR | ReadingMode::Single => !left_to_right,
+        ReadingMode::LTR | ReadingMode::Single | ReadingMode::Webtoon => !left_to_right,
     }
 }

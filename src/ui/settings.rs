@@ -52,7 +52,34 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                 {
                     app.set_reading_mode(ReadingMode::Single);
                 }
+                if ui
+                    .selectable_label(app.reading_mode == ReadingMode::Webtoon, "📜 Webtoon")
+                    .on_hover_text(
+                        "Every page stacked into one continuous vertical strip, scrolled with the \
+                         up/down arrow keys instead of turned.",
+                    )
+                    .clicked()
+                {
+                    app.set_reading_mode(ReadingMode::Webtoon);
+                }
             });
+            if app.reading_mode == ReadingMode::Webtoon {
+                ui.horizontal(|ui| {
+                    ui.label("Webtoon page width");
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut app.webtoon_page_width_pct,
+                                crate::app::WEBTOON_WIDTH_PCT_MIN..=crate::app::WEBTOON_WIDTH_PCT_MAX,
+                            )
+                            .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                });
+            }
 
             ui.separator();
             ui.heading("Key Remapping");

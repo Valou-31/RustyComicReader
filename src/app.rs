@@ -1,3 +1,4 @@
+use crate::comic::comic_info::ComicInfo;
 use crate::comic::prefetch::{DecodeQueue, DecodeRequest};
 use crate::input::keybindings::{Action, KeyBindings};
 use crate::storage::bookmarks::Bookmarks;
@@ -11,8 +12,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// How long the header stays visible after the last mouse movement.
-pub const UI_HIDE_DELAY: Duration = Duration::from_secs(3);
+/// How long the header/footer stay visible after the cursor last left
+/// their reveal zone — see `ComicApp::update_ui_activity`.
+pub const UI_HIDE_DELAY: Duration = Duration::from_secs(2);
+
+/// How close to the top (for the header) or bottom (for the footer) edge
+/// of the window, as a fraction of its height, the cursor has to be to
+/// reveal/keep visible that bar — see `ComicApp::update_ui_activity`.
+pub const UI_REVEAL_ZONE_FRACTION: f32 = 0.15;
 
 /// Minimum time between debounced history saves triggered by page
 /// navigation — an exit or a freshly-loaded book flushes immediately
@@ -31,6 +38,19 @@ pub const DOWNSCALE_MAX_DIMENSION: u32 = 2400;
 pub const ZOOM_MIN: f32 = 1.0;
 /// `PageZoom::scale`'s upper bound.
 pub const ZOOM_MAX: f32 = 5.0;
+
+/// `ComicApp::webtoon_page_width_pct`'s allowed range, as a percentage of
+/// the window's width — floored well above `0` so the strip never shrinks
+/// to something unreadable, capped at the full window width.
+pub const WEBTOON_WIDTH_PCT_MIN: f32 = 20.0;
+pub const WEBTOON_WIDTH_PCT_MAX: f32 = 100.0;
+
+/// How fast held-down arrow keys scroll the webtoon strip, in document
+/// units per second — see `ui::reader::WEBTOON_DOC_WIDTH` for what a
+/// document unit is. Tuned so a page roughly `1.4x` as tall as it is wide
+/// (a common webtoon panel proportion) scrolls past in a bit under two
+/// seconds, comfortably readable rather than a blur.
+pub const WEBTOON_SCROLL_SPEED_DOC: f32 = 750.0;
 
 /// Whether zooming magnifies the whole two-page spread together
 /// (`ComicApp::zoom_spread`), or each page independently
@@ -108,6 +128,11 @@ pub enum ReadingMode {
     /// second page alongside it, so every turn moves by exactly one page
     /// instead of two.
     Single,
+    /// A single continuous vertical strip — every page stacked top-to-
+    /// bottom, scrolled with the arrow keys instead of turned — see
+    /// `ui::reader::draw_webtoon`. Like `Single`, `pages_for_position` never
+    /// pairs a second page alongside the current one.
+    Webtoon,
 }
 
 impl ReadingMode {
@@ -116,6 +141,7 @@ impl ReadingMode {
             ReadingMode::LTR => "➡ LTR (Western)",
             ReadingMode::RTL => "⬅ RTL (Manga)",
             ReadingMode::Single => "📄 Single Page",
+            ReadingMode::Webtoon => "📜 Webtoon",
         }
     }
 }
@@ -147,9 +173,40 @@ pub struct ComicApp {
     pub current_page: usize,
     pub total_pages: usize,
     pub reading_mode: ReadingMode,
+    /// `ReadingMode::Webtoon`'s page width, as a percentage of the window's
+    /// width (`WEBTOON_WIDTH_PCT_MIN..=WEBTOON_WIDTH_PCT_MAX`) — narrower
+    /// than the full window by default so a wide monitor doesn't stretch
+    /// every page uncomfortably wide. Persisted; adjusted from the header's
+    /// width slider, which only appears while `Webtoon` is the active mode.
+    pub webtoon_page_width_pct: f32,
+    /// Current scroll position of the webtoon strip, in the same document
+    /// units as `ui::reader::WEBTOON_DOC_WIDTH` — top of the book is `0.0`,
+    /// increasing downward. Not persisted (each session starts wherever
+    /// `webtoon_scroll_target` below points it), and re-clamped to the
+    /// current content/viewport height every frame by `ui::reader::draw_webtoon`.
+    pub webtoon_scroll: f32,
+    /// Set whenever something *outside* of scrolling itself should move the
+    /// webtoon viewport to a specific page — opening/resuming a book,
+    /// switching into `Webtoon` mode, or a deliberate jump (progress bar,
+    /// bookmarks, "Go to Page"), all of which already funnel through
+    /// `jump_to_page`/`apply_reading_mode`. Consumed (and cleared) by the
+    /// next `draw_webtoon` call, which is the only place that knows enough
+    /// about the current layout to turn a page index into a scroll offset.
+    pub(crate) webtoon_scroll_target: Option<usize>,
     pub filename: String,
+    /// Parsed from the current book's `ComicInfo.xml`, if it had one — see
+    /// `comic::comic_info::ComicInfo`. Shown alongside the filename in the
+    /// header when present; `None` on the empty-state screen and for any
+    /// book that wasn't tagged (or tagged with nothing this recognizes).
+    pub comic_info: Option<ComicInfo>,
     pub show_settings: bool,
-    pub last_mouse_move: std::time::Instant,
+    /// When the cursor was last within `UI_REVEAL_ZONE_FRACTION` of the top
+    /// edge (or outside the window entirely) — see `update_ui_activity`.
+    /// Drives `ui::header::draw_header`/`draw_header_overlay`'s idle-hide
+    /// fade, independent of the footer's own.
+    pub header_active_since: std::time::Instant,
+    /// Same as `header_active_since`, but for the bottom edge/`ui::footer`.
+    pub footer_active_since: std::time::Instant,
     pub fullscreen: bool,
     pub fullscreen_dirty: bool,
     pub keybindings: KeyBindings,
@@ -275,6 +332,21 @@ pub struct ComicApp {
     /// `toggle_bookmark`.
     pub bookmarks: Bookmarks,
     pub show_bookmarks: bool,
+    /// Whether the "Go to Page" popup (`ui::goto_page`) is open — a
+    /// deliberately little-used feature (page-by-page/scroll navigation
+    /// covers normal reading), so it lives behind `Backtick` rather than
+    /// any of the main remappable/easily-reached keys.
+    pub show_goto_page: bool,
+    /// The popup's text field contents, as the user is typing it — parsed
+    /// on submit rather than kept in sync with a numeric field live, so an
+    /// in-progress edit (a blank field, a leading digit before the rest is
+    /// typed) is never forced into a "valid" page number.
+    pub goto_page_input: String,
+    /// Set by `open_goto_page`, consumed by `ui::goto_page` the next frame
+    /// it draws — `egui::Response::request_focus` only works once the
+    /// widget already exists, so the popup can't simply request focus at
+    /// the moment it's opened.
+    pub goto_page_focus_pending: bool,
     /// Live drag-and-drop toolbar customization, toggled from Settings.
     /// Not persisted — always starts off on launch. While true, the header
     /// and footer render their controls as draggable chips instead of their
@@ -352,9 +424,14 @@ impl Default for ComicApp {
             current_page: 0,
             total_pages: 0,
             reading_mode: ReadingMode::LTR,
+            webtoon_page_width_pct: 70.0,
+            webtoon_scroll: 0.0,
+            webtoon_scroll_target: None,
             filename: "Aucun fichier".to_string(),
+            comic_info: None,
             show_settings: false,
-            last_mouse_move: std::time::Instant::now(),
+            header_active_since: std::time::Instant::now(),
+            footer_active_since: std::time::Instant::now(),
             fullscreen: false,
             fullscreen_dirty: false,
             keybindings: KeyBindings::default(),
@@ -390,6 +467,9 @@ impl Default for ComicApp {
             history_last_saved: std::time::Instant::now(),
             bookmarks: Bookmarks::default(),
             show_bookmarks: false,
+            show_goto_page: false,
+            goto_page_input: String::new(),
+            goto_page_focus_pending: false,
             toolbar_edit_mode: false,
             toolbar_pending_edit: None,
             resume_last_session: true,
@@ -426,6 +506,7 @@ impl ComicApp {
     fn load_persisted(&mut self) {
         if let Ok(config) = Config::load() {
             self.reading_mode = config.reading_mode;
+            self.webtoon_page_width_pct = config.webtoon_page_width_pct;
             self.keybindings = config.keybindings;
             self.theme_preset = config.theme;
             self.layout = config.layout;
@@ -497,6 +578,7 @@ impl ComicApp {
     pub fn save_config(&self) {
         let config = Config {
             reading_mode: self.reading_mode,
+            webtoon_page_width_pct: self.webtoon_page_width_pct,
             keybindings: self.keybindings.clone(),
             theme: self.theme_preset,
             layout: self.layout.clone(),
@@ -538,7 +620,7 @@ impl ComicApp {
     /// regardless of call order) would otherwise draw right over, masking
     /// whatever of the panel it overlaps.
     pub fn any_modal_panel_open(&self) -> bool {
-        self.show_settings || self.show_history || self.show_bookmarks
+        self.show_settings || self.show_history || self.show_bookmarks || self.show_goto_page
     }
 
     /// Advances to the next spread — one page for a double-page spread, two
@@ -572,6 +654,34 @@ impl ComicApp {
         self.page_transition = None;
         self.reset_zoom_for_new_page();
         self.mark_history_dirty();
+        self.webtoon_scroll_target = Some(self.current_page);
+    }
+
+    /// Opens the "Go to Page" popup, pre-filled with the current 1-indexed
+    /// page number so the common case (nudging it by a couple of pages) is
+    /// a small edit rather than typing from scratch. No-op with no book
+    /// loaded — there's nothing to jump within.
+    pub fn open_goto_page(&mut self) {
+        if self.total_pages == 0 {
+            return;
+        }
+        self.goto_page_input = (self.current_page + 1).to_string();
+        self.show_goto_page = true;
+        self.goto_page_focus_pending = true;
+    }
+
+    /// Parses `goto_page_input` as a 1-indexed page number and jumps there
+    /// via `jump_to_page` (which clamps out-of-range values rather than
+    /// rejecting them). Blank or non-numeric input just closes the popup
+    /// without moving — there's no page to jump to, but no reason to make
+    /// the user dismiss an error either.
+    pub fn submit_goto_page(&mut self) {
+        if let Ok(page) = self.goto_page_input.trim().parse::<usize>()
+            && page >= 1
+        {
+            self.jump_to_page(page - 1);
+        }
+        self.show_goto_page = false;
     }
 
     /// Whether the currently displayed spread has a bookmark — drives the
@@ -669,7 +779,7 @@ impl ComicApp {
     /// opposite sign.
     fn forward_entry_sign(&self) -> f32 {
         match self.reading_mode {
-            ReadingMode::LTR | ReadingMode::Single => 1.0,
+            ReadingMode::LTR | ReadingMode::Single | ReadingMode::Webtoon => 1.0,
             ReadingMode::RTL => -1.0,
         }
     }
@@ -688,19 +798,19 @@ impl ComicApp {
     }
 
     /// `left_page()`/`right_page()` (in that order) for the spread starting
-    /// at `position`. In Single Page mode `position` is always shown alone.
-    /// Otherwise, a double-page spread (its own image spanning a whole
-    /// opening — see `PageMeta::is_spread`) occupies `position` alone, with
-    /// `None` on the other side; so does a page whose would-be partner is
-    /// one, or a page either side of the pair has been isolated (`E`, see
-    /// `toggle_isolate_current_page`), since none of those can be paired
-    /// into a normal two-page spread either. Otherwise pairs `position` with
-    /// `position + 1`, swapped for RTL.
+    /// at `position`. In Single Page and Webtoon modes `position` is always
+    /// shown alone. Otherwise, a double-page spread (its own image spanning
+    /// a whole opening — see `PageMeta::is_spread`) occupies `position`
+    /// alone, with `None` on the other side; so does a page whose would-be
+    /// partner is one, or a page either side of the pair has been isolated
+    /// (`E`, see `toggle_isolate_current_page`), since none of those can be
+    /// paired into a normal two-page spread either. Otherwise pairs
+    /// `position` with `position + 1`, swapped for RTL.
     fn pages_for_position(&self, position: usize) -> (Option<usize>, Option<usize>) {
         if position >= self.total_pages {
             return (None, None);
         }
-        if self.reading_mode == ReadingMode::Single {
+        if matches!(self.reading_mode, ReadingMode::Single | ReadingMode::Webtoon) {
             return (Some(position), None);
         }
         let partner = position + 1;
@@ -734,7 +844,7 @@ impl ComicApp {
     /// neither is a double-page spread or isolated.
     fn prev_spread_start(&self, position: usize) -> Option<usize> {
         let prev = position.checked_sub(1)?;
-        if self.reading_mode == ReadingMode::Single
+        if matches!(self.reading_mode, ReadingMode::Single | ReadingMode::Webtoon)
             || prev == 0
             || self.is_double_page(prev)
             || self.is_isolated(prev)
@@ -1059,13 +1169,59 @@ impl ComicApp {
         }
     }
 
-    /// How long since the mouse last moved — drives the header auto-hide fade.
-    pub fn idle_time(&self) -> Duration {
-        self.last_mouse_move.elapsed()
+    /// How long since the cursor was last within the header's reveal zone
+    /// (or outside the window) — drives the header's auto-hide fade.
+    pub fn header_idle_time(&self) -> Duration {
+        self.header_active_since.elapsed()
     }
 
-    /// Cycles LTR → RTL → Single Page → LTR — used by the single reading-
-    /// mode button in the header/empty-state screen, which shows the
+    /// Same as `header_idle_time`, but for the footer.
+    pub fn footer_idle_time(&self) -> Duration {
+        self.footer_active_since.elapsed()
+    }
+
+    /// Refreshes `header_active_since`/`footer_active_since` for this
+    /// frame's cursor position — call once per frame while a book is open,
+    /// before the header/footer render. Each bar counts as "active" (and so
+    /// stays fully visible, with no fade countdown) for every frame the
+    /// cursor sits within `UI_REVEAL_ZONE_FRACTION` of its own edge, same as
+    /// `touch_header_activity` already does for hovering the progress bar
+    /// directly — holding the cursor still up there shouldn't make the bar
+    /// fade out from underneath it. Once the cursor leaves a bar's zone (or
+    /// re-enters the window somewhere that isn't either zone), that bar's
+    /// timestamp stops refreshing and `UI_HIDE_DELAY` starts counting down
+    /// from whenever it was last true.
+    ///
+    /// The cursor leaving the window entirely reports no position at all,
+    /// with no way to tell which edge it went out through — rather than
+    /// guess (or hide both), that counts as active for *both* bars, so
+    /// reaching up past the top edge (or down past the bottom) toward it
+    /// doesn't cause a flicker the instant the cursor crosses the border.
+    pub fn update_ui_activity(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.input(|i| i.viewport_rect());
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let (in_header_zone, in_footer_zone) =
+            reveal_zones(pointer.map(|pos| pos.y), viewport.top(), viewport.bottom());
+        let now = std::time::Instant::now();
+        if in_header_zone {
+            self.header_active_since = now;
+        }
+        if in_footer_zone {
+            self.footer_active_since = now;
+        }
+    }
+
+    /// Marks the header as active right now, regardless of cursor position
+    /// — used by `ui::progress_bar` while the cursor holds still over the
+    /// progress bar itself (which sits inside the header), since that's
+    /// squarely "using the header" even on a tall window where the bar's
+    /// own row might sit below `UI_REVEAL_ZONE_FRACTION` of the top edge.
+    pub fn touch_header_activity(&mut self) {
+        self.header_active_since = std::time::Instant::now();
+    }
+
+    /// Cycles LTR → RTL → Single Page → Webtoon → LTR — used by the single
+    /// reading-mode button in the header/empty-state screen, which shows the
     /// current mode's own label and advances to the next one on each click.
     pub fn toggle_reading_mode(&mut self) {
         self.set_reading_mode(Self::next_reading_mode(self.reading_mode));
@@ -1075,11 +1231,12 @@ impl ComicApp {
         match mode {
             ReadingMode::LTR => ReadingMode::RTL,
             ReadingMode::RTL => ReadingMode::Single,
-            ReadingMode::Single => ReadingMode::LTR,
+            ReadingMode::Single => ReadingMode::Webtoon,
+            ReadingMode::Webtoon => ReadingMode::LTR,
         }
     }
 
-    /// Switches directly to `mode` — used by Settings' three explicit
+    /// Switches directly to `mode` — used by Settings' four explicit
     /// reading-direction buttons. No-op (skips the save) if already in
     /// `mode`, so clicking the already-selected option is harmless.
     pub fn set_reading_mode(&mut self, mode: ReadingMode) {
@@ -1096,6 +1253,12 @@ impl ComicApp {
             return false;
         }
         self.reading_mode = mode;
+        if mode == ReadingMode::Webtoon {
+            // Entering the strip fresh: start scrolled to whatever page was
+            // already showing, rather than snapping back to the top of the
+            // book.
+            self.webtoon_scroll_target = Some(self.current_page);
+        }
         true
     }
 
@@ -1125,6 +1288,24 @@ impl ComicApp {
     fn mark_history_dirty(&mut self) {
         if self.current_path.is_some() {
             self.history_dirty = true;
+        }
+    }
+
+    /// Updates `current_page` to whichever page `ui::reader::draw_webtoon`
+    /// currently considers "at the top of the viewport", every frame while
+    /// scrolling — unlike `jump_to_page`, this is passive bookkeeping (no
+    /// zoom reset, no cleared transition, no `webtoon_scroll_target`): the
+    /// scroll position itself is already exactly where it should be, this
+    /// just keeps `current_page` (and anything keyed off it — the header's
+    /// page count, the progress bar, history, bookmarking) in sync with it.
+    pub fn update_webtoon_position(&mut self, page_idx: usize) {
+        if self.total_pages == 0 {
+            return;
+        }
+        let page_idx = page_idx.min(self.total_pages - 1);
+        if self.current_page != page_idx {
+            self.current_page = page_idx;
+            self.mark_history_dirty();
         }
     }
 
@@ -1220,6 +1401,26 @@ impl ComicApp {
         }
     }
 
+    /// Call once per frame: opens whatever comic archive(s) were just
+    /// dropped onto the window. Anything dropped with an unsupported
+    /// extension is silently ignored rather than surfaced as a load error;
+    /// mirrors `poll_picking`/`poll_macos_open_files`'s queue-the-rest,
+    /// open-the-first pattern for when more than one file lands at once.
+    pub fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let mut paths = dropped
+            .into_iter()
+            .map(|file| file.path().to_path_buf())
+            .filter(|path: &PathBuf| crate::comic::loader::is_supported_path(path));
+        if let Some(first) = paths.next() {
+            self.file_queue.extend(paths);
+            self.start_loading_path(first);
+        }
+    }
+
     /// Call once per frame: drains every background-load event queued since
     /// the last poll (progress ticks can arrive faster than frames).
     pub fn poll_loading(&mut self, ctx: &egui::Context) {
@@ -1249,6 +1450,7 @@ impl ComicApp {
                     self.total_pages = result.pages.len();
                     self.pages = result.pages;
                     self.filename = result.filename;
+                    self.comic_info = result.comic_info;
                     self.current_path = Some(result.path.clone());
                     // Whatever `ComicArchive::load` managed to sample
                     // concurrently with the archive read by the time it
@@ -1262,6 +1464,7 @@ impl ComicApp {
 
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
                     self.reset_zoom_for_new_page();
+                    self.webtoon_scroll_target = Some(self.current_page);
 
                     self.loading = false;
                     // Any decode still in flight for the previous archive is
@@ -1766,6 +1969,22 @@ fn build_fore_edge_texture(ctx: &egui::Context, columns: &[Vec<egui::Color32>]) 
     Some(ctx.load_texture("fore_edge", image, egui::TextureOptions::LINEAR))
 }
 
+/// Whether cursor position `pointer_y` (`None` if the cursor is outside the
+/// window entirely) counts as "in the header's reveal zone" / "in the
+/// footer's" — see `ComicApp::update_ui_activity`. Split out from that
+/// method (which also needs a live `egui::Context` to read the cursor and
+/// viewport from) purely so this actual boundary math is unit-testable on
+/// its own.
+fn reveal_zones(pointer_y: Option<f32>, viewport_top: f32, viewport_bottom: f32) -> (bool, bool) {
+    let Some(y) = pointer_y else {
+        // Outside the window, with no way to tell which edge it left
+        // through — counts as active for both rather than guessing.
+        return (true, true);
+    };
+    let zone_height = (viewport_bottom - viewport_top) * UI_REVEAL_ZONE_FRACTION;
+    (y <= viewport_top + zone_height, y >= viewport_bottom - zone_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1780,9 +1999,35 @@ mod tests {
         app.total_pages = total_pages;
         let placeholder = EdgeColors { left: egui::Color32::WHITE, right: egui::Color32::WHITE };
         for &i in doubles {
-            app.page_meta.insert(i, PageMeta { edge: placeholder, is_spread: true });
+            app.page_meta.insert(i, PageMeta { edge: placeholder, is_spread: true, aspect: 2.0 });
         }
         app
+    }
+
+    #[test]
+    fn reveal_zones_the_top_strip_only_activates_the_header() {
+        // A 1000-tall window: top 15% is y in [0, 150], bottom 15% is
+        // y in [850, 1000].
+        assert_eq!(reveal_zones(Some(0.0), 0.0, 1000.0), (true, false));
+        assert_eq!(reveal_zones(Some(150.0), 0.0, 1000.0), (true, false));
+        assert_eq!(reveal_zones(Some(150.1), 0.0, 1000.0), (false, false));
+    }
+
+    #[test]
+    fn reveal_zones_the_bottom_strip_only_activates_the_footer() {
+        assert_eq!(reveal_zones(Some(1000.0), 0.0, 1000.0), (false, true));
+        assert_eq!(reveal_zones(Some(850.0), 0.0, 1000.0), (false, true));
+        assert_eq!(reveal_zones(Some(849.9), 0.0, 1000.0), (false, false));
+    }
+
+    #[test]
+    fn reveal_zones_the_middle_activates_neither() {
+        assert_eq!(reveal_zones(Some(500.0), 0.0, 1000.0), (false, false));
+    }
+
+    #[test]
+    fn reveal_zones_outside_the_window_activates_both() {
+        assert_eq!(reveal_zones(None, 0.0, 1000.0), (true, true));
     }
 
     #[test]
@@ -1872,13 +2117,14 @@ mod tests {
     }
 
     #[test]
-    fn reading_mode_cycles_ltr_rtl_single_ltr() {
+    fn reading_mode_cycles_ltr_rtl_single_webtoon_ltr() {
         // Exercises the pure cycling logic directly rather than through
         // `toggle_reading_mode`, which also calls `save_config` (writes the
         // user's real config file) — not something a unit test should do.
         assert_eq!(ComicApp::next_reading_mode(ReadingMode::LTR), ReadingMode::RTL);
         assert_eq!(ComicApp::next_reading_mode(ReadingMode::RTL), ReadingMode::Single);
-        assert_eq!(ComicApp::next_reading_mode(ReadingMode::Single), ReadingMode::LTR);
+        assert_eq!(ComicApp::next_reading_mode(ReadingMode::Single), ReadingMode::Webtoon);
+        assert_eq!(ComicApp::next_reading_mode(ReadingMode::Webtoon), ReadingMode::LTR);
     }
 
     #[test]
@@ -1904,6 +2150,50 @@ mod tests {
         assert!(app.apply_reading_mode(ReadingMode::Single));
         assert_eq!(app.current_page, 4);
         assert_eq!((app.left_page(), app.right_page()), (Some(4), None));
+    }
+
+    #[test]
+    fn webtoon_mode_never_pairs_pages_like_single_page_mode() {
+        let mut app = app_with(4, &[1]);
+        app.reading_mode = ReadingMode::Webtoon;
+
+        assert_eq!((app.left_page(), app.right_page()), (Some(0), None));
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(1), None));
+        app.next_spread();
+        assert_eq!((app.left_page(), app.right_page()), (Some(2), None));
+    }
+
+    #[test]
+    fn switching_into_webtoon_mode_points_the_scroll_at_the_current_page() {
+        let mut app = app_with(10, &[]);
+        app.current_page = 4;
+        app.webtoon_scroll_target = None;
+
+        assert!(app.apply_reading_mode(ReadingMode::Webtoon));
+        assert_eq!(app.webtoon_scroll_target, Some(4));
+    }
+
+    #[test]
+    fn jump_to_page_also_points_the_webtoon_scroll_at_the_new_page() {
+        let mut app = app_with(10, &[]);
+        app.webtoon_scroll_target = None;
+
+        app.jump_to_page(6);
+        assert_eq!(app.webtoon_scroll_target, Some(6));
+    }
+
+    #[test]
+    fn update_webtoon_position_tracks_current_page_without_a_scroll_jump() {
+        let mut app = app_with(10, &[]);
+        app.webtoon_scroll_target = Some(9);
+
+        app.update_webtoon_position(3);
+        assert_eq!(app.current_page, 3);
+        // Passive scroll-driven tracking, unlike `jump_to_page`, must not
+        // disturb a pending (or absent) scroll target — the scroll position
+        // is already exactly where it should be.
+        assert_eq!(app.webtoon_scroll_target, Some(9));
     }
 
     #[test]
@@ -2233,6 +2523,52 @@ mod tests {
         app.jump_to_page(4);
         assert!(app.page_transition.is_none());
         assert_eq!((app.left_page(), app.right_page()), (Some(4), Some(5)));
+    }
+
+    #[test]
+    fn open_goto_page_prefills_the_current_one_indexed_page() {
+        let mut app = app_with(10, &[]);
+        app.jump_to_page(4);
+        app.open_goto_page();
+        assert!(app.show_goto_page);
+        assert_eq!(app.goto_page_input, "5");
+    }
+
+    #[test]
+    fn open_goto_page_is_a_no_op_with_no_book_open() {
+        let mut app = ComicApp::default();
+        app.open_goto_page();
+        assert!(!app.show_goto_page);
+    }
+
+    #[test]
+    fn submit_goto_page_jumps_to_the_typed_one_indexed_page_and_closes() {
+        let mut app = app_with(10, &[]);
+        app.show_goto_page = true;
+        app.goto_page_input = "7".to_string();
+        app.submit_goto_page();
+        assert!(!app.show_goto_page);
+        assert_eq!(app.current_page, 6);
+    }
+
+    #[test]
+    fn submit_goto_page_clamps_past_the_end() {
+        let mut app = app_with(10, &[]);
+        app.show_goto_page = true;
+        app.goto_page_input = "999".to_string();
+        app.submit_goto_page();
+        assert_eq!(app.current_page, 9);
+    }
+
+    #[test]
+    fn submit_goto_page_with_invalid_input_closes_without_moving() {
+        let mut app = app_with(10, &[]);
+        app.jump_to_page(3);
+        app.show_goto_page = true;
+        app.goto_page_input = "not a number".to_string();
+        app.submit_goto_page();
+        assert!(!app.show_goto_page);
+        assert_eq!(app.current_page, 3);
     }
 
     #[test]

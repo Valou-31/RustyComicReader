@@ -10,3 +10,4 @@ pub mod controls;
 pub mod settings;
 pub mod history;
 pub mod bookmarks;
+pub mod goto_page;

@@ -71,7 +71,7 @@ pub fn draw_progress_bar(ui: &mut Ui, app: &mut ComicApp) {
     // while looking for a specific one) doesn't move the pointer, so it
     // wouldn't otherwise count as activity — without this, the header (and
     // the bar along with it) would fade out from under the cursor mid-use.
-    app.last_mouse_move = std::time::Instant::now();
+    app.touch_header_activity();
 
     ui.painter().line_segment(
         [Pos2::new(marker_x, rect.top()), Pos2::new(marker_x, rect.bottom())],

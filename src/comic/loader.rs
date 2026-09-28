@@ -1,5 +1,6 @@
 use crate::comic::archive::{ComicArchive, ForeEdgeTail};
-use std::path::PathBuf;
+use crate::comic::comic_info::ComicInfo;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 pub struct LoadResult {
@@ -8,6 +9,9 @@ pub struct LoadResult {
     /// Each page's original compressed bytes, in reading order — decoded
     /// lazily by the UI as pages come into view.
     pub pages: Vec<Vec<u8>>,
+    /// Parsed from the archive's `ComicInfo.xml` entry, if it had one worth
+    /// showing — see `comic::comic_info::ComicInfo`.
+    pub comic_info: Option<ComicInfo>,
     /// Every page's fore-edge strip that had already finished sampling by
     /// the time the archive finished loading — see
     /// `comic::archive::ComicArchive::fore_edge_columns`. Empty when
@@ -39,6 +43,16 @@ pub enum PickEvent {
 }
 
 pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbr", "zip", "7z", "rar"];
+
+/// Whether `path`'s extension is one `ComicArchive::load` can actually open —
+/// shared by every non-file-picker way a path reaches the app (CLI args,
+/// macOS Open-With/Dock-drop events, a window drag-and-drop) so they all
+/// agree on what counts as "a comic archive" without duplicating the check.
+pub(crate) fn is_supported_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
 
 /// Opens a native file picker (multi-select) on a background thread, so the
 /// (possibly slow) dialog doesn't block the UI. Sends `Cancelled` if the user
@@ -88,6 +102,7 @@ pub fn spawn_file_load(path: PathBuf, compute_fore_edge: bool) -> Receiver<LoadE
                 path,
                 filename,
                 pages: archive.pages,
+                comic_info: archive.comic_info,
                 fore_edge_columns: archive.fore_edge_columns,
                 fore_edge_tail: archive.fore_edge_tail,
             }),
@@ -97,4 +112,27 @@ pub fn spawn_file_load(path: PathBuf, compute_fore_edge: bool) -> Receiver<LoadE
     });
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_every_supported_extension_case_insensitively() {
+        for ext in SUPPORTED_EXTENSIONS {
+            assert!(is_supported_path(Path::new(&format!("book.{ext}"))));
+            assert!(is_supported_path(Path::new(&format!("book.{}", ext.to_uppercase()))));
+        }
+    }
+
+    #[test]
+    fn rejects_an_unsupported_extension() {
+        assert!(!is_supported_path(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn rejects_a_path_with_no_extension() {
+        assert!(!is_supported_path(Path::new("book")));
+    }
 }
