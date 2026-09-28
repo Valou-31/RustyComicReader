@@ -45,6 +45,13 @@ type SortedPagesWithForeEdge = (Vec<Vec<u8>>, Vec<Vec<egui::Color32>>, HashMap<S
 /// `None` for every entry after that.
 type ProgressFn<'a> = dyn FnMut(usize, usize, Option<&egui::ColorImage>) + 'a;
 
+/// Cap on the loading-screen preview's longest side (`main.rs` displays it
+/// at up to 220x300 anyway) — decoding it at the source resolution risked
+/// `egui::Context::load_texture` panicking outright on a very tall page
+/// (e.g. a webtoon-format strip several thousand pixels tall), since GPUs
+/// commonly cap a texture's side at 8192px.
+const PREVIEW_MAX_DIMENSION: u32 = 400;
+
 /// One page's fore-edge sample, decoded once but keeping *both* possible
 /// sides (see `EdgeSamplePool`) since which one is wanted — the rule is by
 /// final, sorted page number (`comic::fore_edge::edge_on_right`) — isn't
@@ -219,7 +226,7 @@ impl ComicArchive {
                 if !Self::looks_like_image(&data) {
                     continue;
                 }
-                let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
+                let preview = if images.is_empty() { Self::decode_image(&data, Some(PREVIEW_MAX_DIMENSION)).ok() } else { None };
                 let name = file.name().to_string();
                 if let Some(pool) = edge_pool {
                     pool.submit(&name, &data);
@@ -261,7 +268,7 @@ impl ComicArchive {
                     let mut data = Vec::new();
                     reader.read_to_end(&mut data)?;
                     if Self::looks_like_image(&data) {
-                        let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
+                        let preview = if images.is_empty() { Self::decode_image(&data, Some(PREVIEW_MAX_DIMENSION)).ok() } else { None };
                         let name = entry.name().to_string();
                         if let Some(pool) = edge_pool {
                             pool.submit(&name, &data);
@@ -318,7 +325,7 @@ impl ComicArchive {
                     .read()
                     .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
                 if Self::looks_like_image(&data) {
-                    let preview = if images.is_empty() { Self::decode_image(&data, None).ok() } else { None };
+                    let preview = if images.is_empty() { Self::decode_image(&data, Some(PREVIEW_MAX_DIMENSION)).ok() } else { None };
                     if let Some(pool) = edge_pool {
                         pool.submit(&name, &data);
                     }
