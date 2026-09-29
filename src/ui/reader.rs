@@ -124,17 +124,16 @@ const WEBTOON_PRELOAD_MARGIN: f32 = 2000.0;
 /// Raw (physical-points, unscaled by zoom/`webtoon_wheel_sensitivity`) drag
 /// distance past the edge of the strip that maps to a full `0.0..=1.0`
 /// `WebtoonEdgeDrag::progress` — the vertical counterpart of
-/// `input::scroll::DRAG_FULL_DISTANCE` (`220.0`). Somewhat larger than that
-/// horizontal page-turn distance — this changes which *book* is open, not
-/// just the page, so it should still take a clearly deliberate push, not a
-/// hair-trigger flick — but nowhere near the `1200.0`-plus-decay the
-/// previous accumulator design needed, since that design had to size the
-/// threshold to also outrun trackpad momentum on its own (no `TouchPhase`
-/// gating); `webtoon_edge_drag_step` now does that gating structurally
-/// instead (see `WebtoonEdgeDrag`'s docs), so this constant is free to be
-/// just "how far is a deliberate push," the same job `DRAG_FULL_DISTANCE`
-/// does for a page turn.
-const WEBTOON_EDGE_DRAG_FULL_DISTANCE: f32 = 400.0;
+/// `input::scroll::DRAG_FULL_DISTANCE` (`220.0`), and now close to it: this
+/// still changes which *book* is open, not just the page, but with
+/// `TouchPhase` already gating *when* a drag can even start (see
+/// `WebtoonEdgeDrag`'s docs — a momentum tail past the edge can never start
+/// one), there's no longer a reason for the distance itself to also carry
+/// that "make sure this was deliberate" job. (An earlier `1200.0`-plus-decay
+/// needed the size specifically to outrun momentum on its own; a follow-up
+/// `400.0`, once `TouchPhase` gating existed, still read as needing more
+/// force than a normal page turn for no real reason.)
+const WEBTOON_EDGE_DRAG_FULL_DISTANCE: f32 = 260.0;
 
 /// `WebtoonEdgeDrag::progress` fraction that commits at release if the
 /// gesture wasn't fast enough to count as a fling (see
