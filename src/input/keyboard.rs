@@ -97,6 +97,7 @@ pub fn handle_keyboard(app: &mut ComicApp, ctx: &egui::Context) {
                         // Handled above via `action_held` (a held-key
                         // scroll, not a per-press step).
                         Action::WebtoonScrollUp | Action::WebtoonScrollDown => {}
+                        Action::NextVolume => app.open_sibling_volume(1),
                     }
                 }
             }

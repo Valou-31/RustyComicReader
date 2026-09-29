@@ -11,15 +11,22 @@ pub enum Action {
     /// rather than reacting to a single press.
     WebtoonScrollUp,
     WebtoonScrollDown,
+    /// Opens the next sibling archive in the current file's own folder —
+    /// see `ComicApp::open_sibling_volume`. The keyboard counterpart of
+    /// Webtoon's swipe-past-the-bottom gesture (`ui::reader::WebtoonEdgeDrag`),
+    /// but not itself Webtoon-specific: a no-op if there's no book open or
+    /// no next file in the folder, same as the swipe.
+    NextVolume,
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [
+    pub const ALL: [Action; 6] = [
         Action::NextSpread,
         Action::PrevSpread,
         Action::IsolatePage,
         Action::WebtoonScrollUp,
         Action::WebtoonScrollDown,
+        Action::NextVolume,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -29,6 +36,7 @@ impl Action {
             Action::IsolatePage => "Isolate Page (single view)",
             Action::WebtoonScrollUp => "Webtoon: Scroll Up",
             Action::WebtoonScrollDown => "Webtoon: Scroll Down",
+            Action::NextVolume => "Next Volume",
         }
     }
 }
@@ -62,6 +70,7 @@ impl Preset {
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
                 bindings.insert(Action::WebtoonScrollUp, vec!["ArrowUp".to_string()]);
                 bindings.insert(Action::WebtoonScrollDown, vec!["ArrowDown".to_string()]);
+                bindings.insert(Action::NextVolume, vec!["N".to_string()]);
             }
             Preset::LeftHand => {
                 bindings.insert(Action::NextSpread, vec!["D".to_string()]);
@@ -70,6 +79,7 @@ impl Preset {
                 // Keeps the hand on WASD rather than reaching for the arrows.
                 bindings.insert(Action::WebtoonScrollUp, vec!["W".to_string()]);
                 bindings.insert(Action::WebtoonScrollDown, vec!["S".to_string()]);
+                bindings.insert(Action::NextVolume, vec!["N".to_string()]);
             }
             Preset::RightHand => {
                 bindings.insert(Action::NextSpread, vec!["ArrowRight".to_string()]);
@@ -77,6 +87,7 @@ impl Preset {
                 bindings.insert(Action::IsolatePage, vec!["E".to_string()]);
                 bindings.insert(Action::WebtoonScrollUp, vec!["ArrowUp".to_string()]);
                 bindings.insert(Action::WebtoonScrollDown, vec!["ArrowDown".to_string()]);
+                bindings.insert(Action::NextVolume, vec!["N".to_string()]);
             }
             Preset::Numpad => {
                 bindings.insert(Action::NextSpread, vec!["Num6".to_string()]);
@@ -86,6 +97,7 @@ impl Preset {
                 // left/right.
                 bindings.insert(Action::WebtoonScrollUp, vec!["Num8".to_string()]);
                 bindings.insert(Action::WebtoonScrollDown, vec!["Num2".to_string()]);
+                bindings.insert(Action::NextVolume, vec!["N".to_string()]);
             }
         }
         KeyBindings { bindings }
