@@ -1,6 +1,6 @@
 [package]
 name = "rusty_comic_reader"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 
 [dependencies]
