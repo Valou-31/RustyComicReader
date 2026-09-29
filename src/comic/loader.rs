@@ -44,6 +44,32 @@ pub enum PickEvent {
 
 pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbr", "zip", "7z", "rar"];
 
+/// Cap on `spawn_sibling_preview`'s decode — big enough to look sharp
+/// filling the Webtoon strip's width during the overscroll-to-next-chapter
+/// transition (see `ui::reader::draw_webtoon`), far short of a full
+/// `decode_page_slices`-quality decode, since it's discarded the moment the
+/// real book finishes loading.
+pub(crate) const SIBLING_PREVIEW_MAX_DIMENSION: u32 = 1200;
+
+/// Spawns a one-shot background decode of `path`'s very first page (see
+/// `ComicArchive::peek_first_page`) — used to preview the next/previous
+/// sibling volume during `ui::reader::draw_webtoon`'s overscroll gesture,
+/// without running the whole `spawn_file_load` pipeline on a book the user
+/// might not even end up opening. Sends `None` on any failure (missing/
+/// corrupt file, no image entries) rather than surfacing an error — a
+/// missing preview just means the transition animation has nothing to show
+/// yet, not that anything is actually broken.
+pub fn spawn_sibling_preview(path: PathBuf) -> Receiver<Option<egui::ColorImage>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let image = ComicArchive::peek_first_page(&path)
+            .ok()
+            .and_then(|data| ComicArchive::decode_image(&data, Some(SIBLING_PREVIEW_MAX_DIMENSION)).ok());
+        let _ = tx.send(image);
+    });
+    rx
+}
+
 /// Whether `path`'s extension is one `ComicArchive::load` can actually open —
 /// shared by every non-file-picker way a path reaches the app (CLI args,
 /// macOS Open-With/Dock-drop events, a window drag-and-drop) so they all
@@ -52,6 +78,29 @@ pub(crate) fn is_supported_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
+
+/// `path`'s next (`direction > 0`) or previous (`direction < 0`) sibling
+/// comic archive, sorted by filename within the same folder — how
+/// `ui::reader::draw_webtoon`'s overscroll-past-the-edge gesture finds the
+/// next/previous volume of a series without needing them pre-queued via the
+/// file picker (`ComicApp::file_queue`), since in practice a series is just
+/// a folder of `chapter-NNN.cbz`-style files opened one at a time, not a
+/// multi-select batch. `None` if `path` has no parent, the folder can't be
+/// listed, `path` itself isn't in its own listing (already moved/deleted),
+/// or there's nothing in that direction (start/end of the folder).
+pub(crate) fn sibling_archive(path: &Path, direction: i32) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let mut siblings: Vec<PathBuf> = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| is_supported_path(p))
+        .collect();
+    siblings.sort();
+    let current_index = siblings.iter().position(|p| p == path)?;
+    let neighbor_index = if direction > 0 { current_index.checked_add(1) } else { current_index.checked_sub(1) };
+    neighbor_index.and_then(|i| siblings.get(i).cloned())
 }
 
 /// Opens a native file picker (multi-select) on a background thread, so the
@@ -134,5 +183,63 @@ mod tests {
     #[test]
     fn rejects_a_path_with_no_extension() {
         assert!(!is_supported_path(Path::new("book")));
+    }
+
+    /// A fresh, uniquely-named temp folder containing the given filenames
+    /// (empty files — `sibling_archive` only looks at names/extensions),
+    /// removed again once the returned guard drops.
+    struct TempFolder {
+        dir: PathBuf,
+    }
+
+    impl TempFolder {
+        fn with_files(test_name: &str, names: &[&str]) -> Self {
+            let dir = std::env::temp_dir().join(format!("rusty_comic_reader_test_{test_name}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in names {
+                std::fs::write(dir.join(name), []).unwrap();
+            }
+            Self { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for TempFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn sibling_archive_finds_the_next_and_previous_file_by_name() {
+        let folder = TempFolder::with_files(
+            "next_and_previous",
+            &["chapter-001.cbz", "chapter-002.cbz", "chapter-003.cbz"],
+        );
+
+        assert_eq!(sibling_archive(&folder.path("chapter-002.cbz"), 1), Some(folder.path("chapter-003.cbz")));
+        assert_eq!(sibling_archive(&folder.path("chapter-002.cbz"), -1), Some(folder.path("chapter-001.cbz")));
+    }
+
+    #[test]
+    fn sibling_archive_is_none_past_either_end_of_the_folder() {
+        let folder = TempFolder::with_files("either_end", &["chapter-001.cbz", "chapter-002.cbz"]);
+
+        assert_eq!(sibling_archive(&folder.path("chapter-002.cbz"), 1), None);
+        assert_eq!(sibling_archive(&folder.path("chapter-001.cbz"), -1), None);
+    }
+
+    #[test]
+    fn sibling_archive_skips_files_with_unsupported_extensions() {
+        let folder = TempFolder::with_files(
+            "skips_unsupported",
+            &["chapter-001.cbz", "notes.txt", "chapter-002.cbz", "ComicInfo.xml"],
+        );
+
+        assert_eq!(sibling_archive(&folder.path("chapter-001.cbz"), 1), Some(folder.path("chapter-002.cbz")));
     }
 }

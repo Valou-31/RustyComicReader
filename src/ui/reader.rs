@@ -1,8 +1,9 @@
 use crate::app::{
-    ComicApp, PageZoom, ReadingMode, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, ZOOM_MAX, ZOOM_MIN, ZoomTarget,
+    ComicApp, PageZoom, ReadingMode, SiblingPreviewState, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, ZOOM_MAX, ZOOM_MIN,
+    ZoomTarget,
 };
 use crate::comic::archive::{ComicArchive, PageMeta};
-use egui::{Align, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
+use egui::{Align, Align2, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use std::collections::HashMap;
 
 /// How many pages beyond the currently displayed spread keep their decoded
@@ -120,12 +121,87 @@ const WEBTOON_DEFAULT_ASPECT: f32 = 0.7;
 /// started well before it scrolls into view.
 const WEBTOON_PRELOAD_MARGIN: f32 = 2000.0;
 
+/// Raw (physical-points, unscaled by zoom/`webtoon_wheel_sensitivity`)
+/// wheel scroll that has to accumulate — while already at the very edge of
+/// the strip and still being pushed further — before `draw_webtoon` opens
+/// the next/previous sibling volume (`ComicApp::open_sibling_volume`).
+/// Larger than the paginated view's own swipe-to-turn gesture
+/// (`input::scroll::DRAG_FULL_DISTANCE`, `220.0`) — this changes which
+/// *book* is open, not just the page, so it should take a clearly
+/// deliberate push, not a single quick swipe — but not so large that a
+/// normal deliberate push (see `WEBTOON_OVERSCROLL_DECAY_PER_SECOND`) has
+/// to fight it for what feels like forever. Tuned by feel, not measurement
+/// (an earlier `900.0`, with no decay at all, triggered from trackpad
+/// momentum and casual over-scrolling too easily; `2200.0` paired with
+/// `3000.0` decay swung the other way and became hard to trigger even
+/// pushing deliberately) — adjust either constant first if this still
+/// isn't right rather than assuming the mechanism itself is wrong.
+const WEBTOON_OVERSCROLL_THRESHOLD: f32 = 1200.0;
+
+/// How fast (in points/second) `webtoon_overscroll_step`'s accumulators
+/// drain back toward `0.0` on every frame that isn't actively adding to
+/// them at least as fast. Unlike the paginated swipe (bounded by a single
+/// gesture's `TouchPhase::Start`..`End`), continuous wheel/trackpad
+/// scrolling has no natural "this gesture is over" signal — so without
+/// this, a hard flick's momentum/inertia tail (which keeps delivering
+/// scroll events well after the fingers actually lift) could rack up
+/// `WEBTOON_OVERSCROLL_THRESHOLD` on its own, just like casually
+/// continuing to scroll a bit past the edge out of habit could over enough
+/// (slow, ordinary) scrolling. Real trackpad momentum decelerates quickly,
+/// so even a decay well under the threshold's own size drains a momentum
+/// tail's contribution before it adds up to much, while a genuinely
+/// sustained, deliberate push — actively held, not just coasting — keeps
+/// feeding the accumulator faster than this drains it. See
+/// `WEBTOON_OVERSCROLL_THRESHOLD`'s docs for this value's own tuning
+/// history — the two are tuned together, not independently.
+const WEBTOON_OVERSCROLL_DECAY_PER_SECOND: f32 = 900.0;
+
+/// Fraction of `WEBTOON_OVERSCROLL_THRESHOLD` that produces *no* visible
+/// transition at all — the strip's content stays exactly where it is,
+/// nothing slides, nothing peeks in. Below this, the overscroll gesture
+/// (`webtoon_overscroll_step`) is still silently accumulating, but the
+/// reader gives no visual sign of it yet — otherwise even a small,
+/// incidental push (routinely reached just finishing the last panel of a
+/// volume and scrolling a little further, nowhere near an actual attempt
+/// to switch) would already start sliding that content away, "eating"
+/// visible content the reader still wants to see well before the gesture
+/// is anywhere near committing. Only once a push is clearly past
+/// incidental does the transition start — see `webtoon_reveal_fraction`,
+/// which remaps the *remaining* `1.0 - WEBTOON_OVERSCROLL_DEADZONE` of the
+/// range back out to the transition's full `0.0..=1.0`, so it still plays
+/// out completely (nothing to the incoming page filling the screen) rather
+/// than feeling rushed or clipped once it does start.
+const WEBTOON_OVERSCROLL_DEADZONE: f32 = 0.35;
+
+/// `overscroll`'s progress (an unsigned magnitude, e.g.
+/// `ComicApp::webtoon_overscroll_down`) toward `threshold`, remapped
+/// through `WEBTOON_OVERSCROLL_DEADZONE` into the sibling-preview
+/// transition's own `0.0..=1.0` reveal range — see that constant's docs.
+/// Pulled out as its own pure function so the remap is testable without
+/// needing a whole frame's worth of `draw_webtoon` state.
+fn webtoon_reveal_fraction(overscroll: f32, threshold: f32) -> f32 {
+    let raw = (overscroll / threshold).min(1.0);
+    ((raw - WEBTOON_OVERSCROLL_DEADZONE) / (1.0 - WEBTOON_OVERSCROLL_DEADZONE)).clamp(0.0, 1.0)
+}
+
 /// One page's height in document units, from its known aspect ratio (once
 /// decoded, via `ComicApp::webtoon_aspect`) or `WEBTOON_DEFAULT_ASPECT`
 /// until then.
+///
+/// The floor here (`0.001`, just guarding the division against a
+/// degenerate/corrupt `0.0` aspect) must match `webtoon_slice_display_heights`'s
+/// own floor exactly — this function decides how much doc-space (and so
+/// screen space, via `draw_webtoon`'s column) a page reserves, while that
+/// one decides how tall its texture actually renders; a *higher* floor
+/// here (this used `0.05` until real webtoon-chapter content exposed the
+/// bug) silently reserves less space than a page taller than 20x its own
+/// width actually needs once decoded — and some merged-chapter webtoon
+/// strips genuinely are (down to ~0.03 aspect, measured) — so its real
+/// content overflows past the space `draw_webtoon` allocated it, drawing
+/// over whatever comes next instead of being contained.
 fn webtoon_page_height(idx: usize, aspect_map: &HashMap<usize, f32>) -> f32 {
     let aspect = aspect_map.get(&idx).copied().unwrap_or(WEBTOON_DEFAULT_ASPECT);
-    WEBTOON_DOC_WIDTH / aspect.max(0.05)
+    WEBTOON_DOC_WIDTH / aspect.max(0.001)
 }
 
 /// Every page's own top offset (cumulative height of everything before it,
@@ -180,6 +256,51 @@ fn webtoon_visible_range(
     (keep_range, current_page)
 }
 
+/// One frame's worth of `draw_webtoon`'s wheel-scroll handling, pulled out
+/// into a pure function so it's testable without an `egui::Context`:
+/// reconciles the current scroll position and both overscroll accumulators
+/// against a new wheel delta, and returns the updated
+/// `(scroll, overscroll_down, overscroll_up)`.
+///
+/// `raw_delta` and `doc_delta` carry the same delta in two different units
+/// — `raw_delta` in physical points (what the overscroll accumulators are
+/// measured in, so the trigger threshold means the same physical gesture
+/// regardless of zoom/window size) and `doc_delta` in the document units
+/// `scroll` itself is kept in (see `WEBTOON_DOC_WIDTH`) — with the same
+/// sign. `scroll` is returned *not yet* clamped to `[0, max_scroll]`; the
+/// caller still does that.
+///
+/// Only one accumulator is ever left nonzero: whichever edge isn't
+/// currently being pushed against resets immediately, same as a normal
+/// in-bounds scroll resets both — so this only ever tracks one continuous
+/// push past an edge, not scattered scrolling back and forth over time.
+///
+/// Each accumulator also decays by `WEBTOON_OVERSCROLL_DECAY_PER_SECOND * dt`
+/// every frame it's active, *before* adding this frame's delta — see that
+/// constant's docs for why (distinguishing a sustained, deliberate push
+/// from trackpad momentum or casual continued scrolling, neither of which
+/// have a distinct "gesture ended" signal to reset on).
+fn webtoon_overscroll_step(
+    scroll: f32,
+    max_scroll: f32,
+    raw_delta: f32,
+    doc_delta: f32,
+    dt: f32,
+    overscroll_down: f32,
+    overscroll_up: f32,
+) -> (f32, f32, f32) {
+    let decay = WEBTOON_OVERSCROLL_DECAY_PER_SECOND * dt;
+    let at_bottom = scroll >= max_scroll;
+    let at_top = scroll <= 0.0;
+    if at_bottom && raw_delta > 0.0 {
+        (scroll, (overscroll_down - decay).max(0.0) + raw_delta, 0.0)
+    } else if at_top && raw_delta < 0.0 {
+        (scroll, 0.0, (overscroll_up - decay).max(0.0) - raw_delta)
+    } else {
+        (scroll + doc_delta, 0.0, 0.0)
+    }
+}
+
 /// Draws every page of the book as one continuous vertical strip —
 /// `ReadingMode::Webtoon`. Each page is scaled to `app.webtoon_page_width_pct`
 /// of the available width (preserving its own aspect ratio) and stacked
@@ -226,6 +347,8 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
         app.webtoon_scroll = offsets.get(target).copied().unwrap_or(0.0);
     }
 
+    let max_scroll = (total_doc_height - viewport_doc_height).max(0.0);
+
     // Two-finger trackpad (or mouse wheel) vertical scroll — natural 1:1
     // tracking with the content by default, same convention
     // `egui::ScrollArea` itself uses (`offset -= scroll_delta`), so it feels
@@ -240,18 +363,76 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     // meant for Settings/History/Bookmarks underneath doesn't leak through —
     // same guard `handle_zoom_and_pan` uses for the paginated view's own
     // pan/zoom.
+    //
+    // Once already at either edge, a scroll that keeps pushing past it
+    // doesn't move `webtoon_scroll` at all — it piles onto
+    // `webtoon_overscroll_down`/`_up` instead (see `webtoon_overscroll_step`),
+    // which triggers `ComicApp::open_sibling_volume` past
+    // `WEBTOON_OVERSCROLL_THRESHOLD`, checked below.
     if !(app.show_settings || app.show_history || app.show_bookmarks) {
         let wheel_delta_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
         if wheel_delta_y != 0.0 {
-            let signed_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
-            app.webtoon_scroll += signed_delta * app.webtoon_wheel_sensitivity / scale;
+            let raw_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
+            let doc_delta = raw_delta * app.webtoon_wheel_sensitivity / scale;
+            let dt = ui.ctx().input(|i| i.stable_dt);
+            let (new_scroll, new_down, new_up) = webtoon_overscroll_step(
+                app.webtoon_scroll,
+                max_scroll,
+                raw_delta,
+                doc_delta,
+                dt,
+                app.webtoon_overscroll_down,
+                app.webtoon_overscroll_up,
+            );
+            app.webtoon_scroll = new_scroll;
+            app.webtoon_overscroll_down = new_down;
+            app.webtoon_overscroll_up = new_up;
             ui.ctx().request_repaint();
         }
     }
 
-    let max_scroll = (total_doc_height - viewport_doc_height).max(0.0);
     app.webtoon_scroll = app.webtoon_scroll.clamp(0.0, max_scroll);
     let scroll = app.webtoon_scroll;
+
+    // How much of the viewport the incoming sibling volume's preview
+    // should cover this frame — `0.0..=1.0`, signed by direction (positive
+    // pushing up from the bottom, i.e. "next"; negative pushing down from
+    // the top, i.e. "previous"). Captured *before* a just-crossed threshold
+    // resets its accumulator to `0.0`, so the transition reaches a full,
+    // clean "the new page now fills the screen" moment on the very frame it
+    // triggers, instead of snapping back to nothing a frame early.
+    let reveal_fraction = if app.webtoon_overscroll_down > 0.0 {
+        webtoon_reveal_fraction(app.webtoon_overscroll_down, WEBTOON_OVERSCROLL_THRESHOLD)
+    } else if app.webtoon_overscroll_up > 0.0 {
+        -webtoon_reveal_fraction(app.webtoon_overscroll_up, WEBTOON_OVERSCROLL_THRESHOLD)
+    } else {
+        0.0
+    };
+
+    app.sync_webtoon_sibling_preview(ui.ctx());
+
+    if app.webtoon_overscroll_down > WEBTOON_OVERSCROLL_THRESHOLD {
+        app.webtoon_overscroll_down = 0.0;
+        app.webtoon_sibling_preview = None;
+        app.open_sibling_volume(1);
+    } else if app.webtoon_overscroll_up > WEBTOON_OVERSCROLL_THRESHOLD {
+        app.webtoon_overscroll_up = 0.0;
+        app.webtoon_sibling_preview = None;
+        app.open_sibling_volume(-1);
+    }
+
+    // Existing content slides away from whichever edge is being pushed
+    // against — up off the top as the strip overscrolls down past the
+    // bottom (revealing the next volume sliding up to take its place),
+    // or down off the bottom pulling up past the top — exactly the
+    // paginated view's own page-turn slide (`draw_double_page`'s `sliding`
+    // branch), just rotated 90°. `content_shift` is that same motion
+    // applied uniformly to every page's `y_top` below, in screen points.
+    let content_shift = reveal_fraction * base_rect.height();
+    let x_min = base_rect.center().x - displayed_width / 2.0;
+    if reveal_fraction != 0.0 {
+        draw_sibling_preview_slide(ui, base_rect, x_min, displayed_width, reveal_fraction, app.webtoon_sibling_preview.as_ref());
+    }
 
     // Which pages to keep decoded/resident and which to prefetch — anything
     // whose own slot falls within `WEBTOON_PRELOAD_MARGIN` doc units of the
@@ -269,14 +450,20 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
 
     let Some((low, high)) = keep_range else { return };
     app.webtoon_textures.retain(|&idx, _| (low..=high).contains(&idx));
-    app.webtoon_aspect.retain(|&idx, _| (low..=high).contains(&idx));
+    // `webtoon_aspect` is deliberately *not* evicted the same way — unlike
+    // `webtoon_textures` (real pixel data, genuinely worth bounding), an
+    // aspect ratio is a few bytes per page. `ComicApp::page_dimensions`
+    // already populates this for the *whole* book up front specifically so
+    // `webtoon_offsets`'s `total_doc_height` (and so `max_scroll`) stays
+    // accurate for pages outside the current window too — evicting it here
+    // would silently undo that the moment a page scrolls out of range,
+    // right back to `WEBTOON_DEFAULT_ASPECT`'s guess for it.
     app.request_webtoon_prefetch(low, high);
 
     let max_dimension = app.decode_max_dimension();
     let mut ctx =
         WebtoonSliceCtx { pages: &app.pages, textures: &mut app.webtoon_textures, aspect: &mut app.webtoon_aspect, max_dimension };
 
-    let x_min = base_rect.center().x - displayed_width / 2.0;
     for idx in low..=high {
         let page_top = offsets[idx];
         let height_doc = webtoon_page_height(idx, ctx.aspect);
@@ -286,10 +473,66 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
         if page_bottom < scroll || page_top > scroll + viewport_doc_height {
             continue;
         }
-        let y_top = base_rect.top() + (page_top - scroll) * scale;
+        let y_top = base_rect.top() + (page_top - scroll) * scale - content_shift;
         let column = Rect::from_min_size(Pos2::new(x_min, y_top), Vec2::new(displayed_width, height_doc * scale));
         draw_webtoon_page_slot(ui, column, idx, &mut ctx);
     }
+}
+
+/// Draws the incoming sibling volume's opening page sliding into the
+/// screen — the "new page arriving" half of `draw_webtoon`'s
+/// overscroll-past-the-edge transition; `content_shift` (computed
+/// alongside this call) is the other half, the same motion applied to the
+/// *existing* page content, together reading as one continuous slide, the
+/// vertical counterpart of the paginated view's own page-turn
+/// (`draw_double_page`'s `sliding` branch).
+///
+/// `reveal_fraction` is signed: positive reveals from the bottom (pushing
+/// down past the end — the next volume), negative from the top (pulling up
+/// past the start — the previous one); its magnitude (`0.0..=1.0`) is how
+/// much of the viewport height is revealed so far.
+///
+/// Before the preview image has actually finished decoding (see
+/// `ComicApp::sync_webtoon_sibling_preview`) — normally brief, but not
+/// instant — falls back to a small fading label in the same revealed
+/// region, so the gesture gives *some* feedback immediately rather than
+/// looking like scrolling just stopped working until the preview happens
+/// to land.
+fn draw_sibling_preview_slide(
+    ui: &Ui,
+    base_rect: Rect,
+    x_min: f32,
+    displayed_width: f32,
+    reveal_fraction: f32,
+    preview: Option<&SiblingPreviewState>,
+) {
+    let at_top = reveal_fraction < 0.0;
+    let reveal = reveal_fraction.abs() * base_rect.height();
+
+    let texture = match preview {
+        Some(SiblingPreviewState::Ready { texture, .. }) => Some(texture),
+        _ => None,
+    };
+
+    let Some(texture) = texture else {
+        let label = if at_top { "▲ Previous chapter" } else { "▼ Next chapter" };
+        let alpha = (reveal_fraction.abs() * 255.0) as u8;
+        let y = if at_top { base_rect.top() + reveal.min(24.0) } else { base_rect.bottom() - reveal.min(24.0) };
+        ui.painter().text(
+            Pos2::new(base_rect.center().x, y),
+            Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            Color32::from_white_alpha(alpha),
+        );
+        return;
+    };
+
+    let size = texture.size_vec2();
+    let natural_height = displayed_width * (size.y / size.x.max(1.0));
+    let top = if at_top { base_rect.top() + reveal - natural_height } else { base_rect.bottom() - reveal };
+    let rect = Rect::from_min_size(Pos2::new(x_min, top), Vec2::new(displayed_width, natural_height));
+    egui::Image::new(texture).paint_at(ui, rect);
 }
 
 /// Where a Webtoon page's compressed bytes come from, and the shared caches
@@ -336,13 +579,36 @@ fn draw_webtoon_page_slot(ui: &mut Ui, column: Rect, page_idx: usize, ctx: &mut 
     let Some(textures) = ctx.textures.get(&page_idx) else { return };
     let total_height_px: f32 = textures.iter().map(|t| t.size_vec2().y).sum::<f32>().max(1.0);
 
+    let aspect = ctx.aspect.get(&page_idx).copied().unwrap_or(WEBTOON_DEFAULT_ASPECT);
+    let slice_pixel_heights: Vec<f32> = textures.iter().map(|t| t.size_vec2().y).collect();
+    let slice_heights = webtoon_slice_display_heights(column.width(), aspect, &slice_pixel_heights, total_height_px);
+
     let mut y = column.top();
-    for texture in textures {
-        let slice_height = column.height() * (texture.size_vec2().y / total_height_px);
+    for (texture, slice_height) in textures.iter().zip(slice_heights) {
         let rect = Rect::from_min_size(Pos2::new(column.left(), y), Vec2::new(column.width(), slice_height));
         egui::Image::new(texture).paint_at(ui, rect);
         y += slice_height;
     }
+}
+
+/// Each slice's on-screen height, given the *page's* own aspect ratio and
+/// `column_width` — not `column.height()` directly. The caller
+/// (`draw_webtoon`) already fixed `column`'s height before a page's texture
+/// (and so its real aspect) was necessarily known, from whatever
+/// `ComicApp::webtoon_aspect` held at the top of the frame — still
+/// `WEBTOON_DEFAULT_ASPECT`'s guess for a page decoded for the first time
+/// just now. Stretching each slice to fill `column.height()` in that case
+/// would visibly distort it — e.g. a normal page's worth of height forced
+/// onto a webtoon chapter's 20+:1 strip. Deriving height from `aspect` and
+/// `column_width` instead means a page always renders undistorted; if that
+/// doesn't match `column.height()` because of a stale guess, it briefly
+/// over/undershoots its reserved slot by a few pixels instead of
+/// stretching — self-corrects the very next frame once `draw_webtoon`
+/// recomputes offsets from `webtoon_aspect`, which now has this page's real
+/// value.
+fn webtoon_slice_display_heights(column_width: f32, aspect: f32, slice_pixel_heights: &[f32], total_pixel_height: f32) -> Vec<f32> {
+    let natural_height = column_width / aspect.max(0.001);
+    slice_pixel_heights.iter().map(|&h| natural_height * (h / total_pixel_height.max(1.0))).collect()
 }
 
 fn draw_double_page(ui: &mut Ui, app: &mut ComicApp) {
@@ -856,6 +1122,44 @@ mod tests {
     }
 
     #[test]
+    fn webtoon_slice_display_heights_uses_the_pages_own_aspect_not_column_height() {
+        // Reproduces the stretch bug: a page freshly decoded to an extreme
+        // aspect ratio (a tall webtoon strip, 0.05) must render at its own
+        // proportions from `column_width` alone — the height this returns
+        // should have no relationship to whatever `column.height()`
+        // happened to be (here, a stand-in for a stale
+        // `WEBTOON_DEFAULT_ASPECT`-guessed column, deliberately very
+        // different from what aspect 0.05 implies).
+        let column_width = 400.0;
+        let aspect = 0.05; // width/height — a narrow, very tall strip
+        let heights = webtoon_slice_display_heights(column_width, aspect, &[8000.0], 8000.0);
+
+        assert_eq!(heights.len(), 1);
+        // Undistorted: height = width / aspect, regardless of any
+        // `column.height()` a caller might have passed in from a stale
+        // guess.
+        assert!((heights[0] - column_width / aspect).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_slice_display_heights_splits_proportionally_to_each_slices_own_pixels() {
+        let column_width = 300.0;
+        let aspect = 0.5;
+        // Three slices: 5000, 3000, 2000 native px tall (10000 total) — the
+        // on-screen heights should split the page's total natural height in
+        // those same proportions (50%, 30%, 20%).
+        let heights = webtoon_slice_display_heights(column_width, aspect, &[5000.0, 3000.0, 2000.0], 10000.0);
+
+        let natural_total = column_width / aspect;
+        assert_eq!(heights.len(), 3);
+        assert!((heights[0] - natural_total * 0.5).abs() < EPSILON);
+        assert!((heights[1] - natural_total * 0.3).abs() < EPSILON);
+        assert!((heights[2] - natural_total * 0.2).abs() < EPSILON);
+        let sum: f32 = heights.iter().sum();
+        assert!((sum - natural_total).abs() < EPSILON);
+    }
+
+    #[test]
     fn zoom_toward_point_keeps_the_cursor_offset_fixed_from_rest() {
         // Zooming in 2x centered on a point 40 points right of screen
         // center, starting unpanned, should pull the pan left so that same
@@ -903,6 +1207,36 @@ mod tests {
         let aspect_map = HashMap::new();
         let expected = WEBTOON_DOC_WIDTH / WEBTOON_DEFAULT_ASPECT;
         assert!((webtoon_page_height(0, &aspect_map) - expected).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_page_height_agrees_with_slice_display_height_for_an_extreme_real_world_aspect() {
+        // Regression test for a real bug: a merged-chapter webtoon page can
+        // legitimately have an aspect ratio well under the `0.05` this
+        // function used to floor at (e.g. a real 1654x37045 page measures
+        // ~0.04465) — `draw_webtoon` reserved column space from *this*
+        // function's (clamped, too-short) height while `draw_webtoon_page_slot`
+        // rendered the page at its real (unclamped, taller) height, so the
+        // page's own later content overflowed past its reserved slot and
+        // drew over whatever came after it — visible as missing/misplaced
+        // content. The two must agree, in document units converted to the
+        // same units `webtoon_slice_display_heights` returns (multiply by
+        // `column_width / WEBTOON_DOC_WIDTH` to convert one to the other).
+        let real_aspect = 1654.0 / 37045.0;
+        let mut aspect_map = HashMap::new();
+        aspect_map.insert(0, real_aspect);
+
+        let column_width = 304.0; // an arbitrary, real displayed_width
+        let layout_height_px = webtoon_page_height(0, &aspect_map) * (column_width / WEBTOON_DOC_WIDTH);
+
+        // A single "slice" spanning the whole page — same math
+        // `draw_webtoon_page_slot` uses for a page's actual rendered height.
+        let rendered_height_px = webtoon_slice_display_heights(column_width, real_aspect, &[37045.0], 37045.0)[0];
+
+        assert!(
+            (layout_height_px - rendered_height_px).abs() < 1.0,
+            "layout reserved {layout_height_px}px but rendering draws {rendered_height_px}px — a page's own content would overflow its slot"
+        );
     }
 
     #[test]
@@ -1014,5 +1348,121 @@ mod tests {
         let (range, current) = webtoon_visible_range(&[], &HashMap::new(), 0.0, 0.0, 0.0);
         assert_eq!(range, None);
         assert_eq!(current, 0);
+    }
+
+    #[test]
+    fn webtoon_reveal_fraction_is_zero_throughout_the_deadzone() {
+        assert_eq!(webtoon_reveal_fraction(0.0, 1000.0), 0.0);
+        // Right at the deadzone boundary — still exactly zero, not yet
+        // ramping up.
+        assert_eq!(webtoon_reveal_fraction(1000.0 * WEBTOON_OVERSCROLL_DEADZONE, 1000.0), 0.0);
+    }
+
+    #[test]
+    fn webtoon_reveal_fraction_reaches_1_exactly_at_the_threshold() {
+        assert!((webtoon_reveal_fraction(1000.0, 1000.0) - 1.0).abs() < EPSILON);
+        // Past the threshold (shouldn't happen in practice — the caller
+        // triggers the volume switch right at 1.0 — but must never exceed
+        // 1.0, which would overshoot the transition's own geometry).
+        assert!((webtoon_reveal_fraction(5000.0, 1000.0) - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_reveal_fraction_ramps_linearly_across_the_remaining_range() {
+        // Halfway between the deadzone's end and the threshold should
+        // reveal exactly half — the remap uses the *remaining* span after
+        // the deadzone, not the full `0..threshold` span.
+        let deadzone_end = 1000.0 * WEBTOON_OVERSCROLL_DEADZONE;
+        let midpoint = deadzone_end + (1000.0 - deadzone_end) / 2.0;
+        assert!((webtoon_reveal_fraction(midpoint, 1000.0) - 0.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_scrolls_normally_away_from_either_edge() {
+        // Mid-strip: a downward push just scrolls, no accumulation.
+        let (scroll, down, up) = webtoon_overscroll_step(500.0, 1000.0, 50.0, 5.0, 0.0, 0.0, 0.0);
+        assert!((scroll - 505.0).abs() < EPSILON);
+        assert_eq!((down, up), (0.0, 0.0));
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_accumulates_only_while_pushed_past_the_bottom() {
+        // Already at max_scroll, still pushing down: piles onto
+        // `overscroll_down` instead of moving `scroll` past the end.
+        // `dt: 0.0` isolates this from the decay covered separately below.
+        let (scroll, down, up) = webtoon_overscroll_step(1000.0, 1000.0, 50.0, 5.0, 0.0, 100.0, 0.0);
+        assert!((scroll - 1000.0).abs() < EPSILON);
+        assert!((down - 150.0).abs() < EPSILON);
+        assert_eq!(up, 0.0);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_accumulates_only_while_pulled_past_the_top() {
+        let (scroll, down, up) = webtoon_overscroll_step(0.0, 1000.0, -50.0, -5.0, 0.0, 0.0, 100.0);
+        assert!((scroll - 0.0).abs() < EPSILON);
+        assert_eq!(down, 0.0);
+        assert!((up - 150.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_resets_the_moment_the_push_stops_or_reverses() {
+        // At the bottom edge, but now scrolling back up: normal scroll
+        // resumes and any accumulated overscroll_down is dropped, not kept
+        // around for a later unrelated push to add onto.
+        let (scroll, down, up) = webtoon_overscroll_step(1000.0, 1000.0, -30.0, -3.0, 0.0, 400.0, 0.0);
+        assert!((scroll - 997.0).abs() < EPSILON);
+        assert_eq!(down, 0.0);
+        assert_eq!(up, 0.0);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_never_mixes_the_two_directions() {
+        // Pushing down while overscroll_up is (implausibly) already
+        // nonzero: down accumulates, up is still cleared.
+        let (_, down, up) = webtoon_overscroll_step(1000.0, 1000.0, 20.0, 2.0, 0.0, 0.0, 50.0);
+        assert!((down - 20.0).abs() < EPSILON);
+        assert_eq!(up, 0.0);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_decays_before_adding_the_new_delta() {
+        // Half a second at the (test-local) decay rate drains 50.0 before
+        // this frame's 5.0 push is added back on top.
+        let (_, down, _) = webtoon_overscroll_step(1000.0, 1000.0, 5.0, 0.5, 0.5, 100.0, 0.0);
+        let expected = (100.0 - WEBTOON_OVERSCROLL_DECAY_PER_SECOND * 0.5).max(0.0) + 5.0;
+        assert!((down - expected).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_decay_never_pushes_the_accumulator_negative() {
+        // A long idle-ish stretch (large dt) decaying a small accumulator
+        // clamps at 0.0 rather than going negative and needing an
+        // artificially large next push to recover from.
+        let (_, down, _) = webtoon_overscroll_step(1000.0, 1000.0, 1.0, 0.1, 10.0, 5.0, 0.0);
+        assert!((down - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_overscroll_step_decay_cuts_into_a_decelerating_tails_total() {
+        // A decaying trackpad-momentum-style tail: delivers 600.0 on the
+        // first frame, halving every subsequent ~16ms frame (a rough model
+        // of real inertial scrolling). Decay only ever subtracts, so this
+        // holds by construction for *any* decay rate above `0.0` — what it
+        // actually guards against is a future change accidentally making
+        // decay a no-op (e.g. applied in the wrong place, or only on frames
+        // that don't matter), which would silently defeat the whole point
+        // (see `WEBTOON_OVERSCROLL_DECAY_PER_SECOND`'s docs).
+        let mut down = 0.0f32;
+        let mut delta = 600.0f32;
+        let dt = 1.0 / 60.0;
+        let mut peak = 0.0f32;
+        for _ in 0..60 {
+            let (_, new_down, _) = webtoon_overscroll_step(1000.0, 1000.0, delta, delta * 0.1, dt, down, 0.0);
+            down = new_down;
+            peak = peak.max(down);
+            delta *= 0.5;
+        }
+        let undecayed_total = 600.0 / (1.0 - 0.5);
+        assert!(peak < undecayed_total, "decayed peak {peak} should stay under the undecayed total {undecayed_total}");
     }
 }

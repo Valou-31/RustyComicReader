@@ -177,6 +177,15 @@ pub enum UpdateStatus {
     Failed(String),
 }
 
+/// The next/previous sibling volume's opening-page preview shown by
+/// `ui::reader::draw_webtoon`'s overscroll-to-next-chapter gesture — see
+/// `ComicApp::sync_webtoon_sibling_preview`, which keeps this reconciled to
+/// whichever direction (if any) is currently being overscrolled.
+pub(crate) enum SiblingPreviewState {
+    Loading { path: PathBuf, rx: std::sync::mpsc::Receiver<Option<egui::ColorImage>> },
+    Ready { path: PathBuf, texture: egui::TextureHandle },
+}
+
 pub struct ComicApp {
     /// Each page's original compressed bytes (JPEG/PNG/etc.), not decoded
     /// pixels — decoding happens on demand in the reader UI, only for pages
@@ -243,6 +252,18 @@ pub struct ComicApp {
     /// the reader mid-scroll.
     pub(crate) webtoon_anchor_page: Option<usize>,
     pub(crate) webtoon_anchor_offset: f32,
+    /// Raw (unscaled, physical-points) wheel scroll accumulated while
+    /// already at the very bottom of the strip and still being pushed
+    /// further — see `ui::reader::WEBTOON_OVERSCROLL_THRESHOLD` and
+    /// `ComicApp::open_sibling_volume`. Reset to `0.0` the moment a scroll
+    /// isn't both at that edge *and* still pushing past it (including a
+    /// normal in-bounds scroll), so this only ever reflects one continuous
+    /// push, not scattered scrolling over time.
+    pub(crate) webtoon_overscroll_down: f32,
+    /// Same as `webtoon_overscroll_down`, for pulling past the very top.
+    pub(crate) webtoon_overscroll_up: f32,
+    /// See `SiblingPreviewState`.
+    pub(crate) webtoon_sibling_preview: Option<SiblingPreviewState>,
     pub filename: String,
     /// Parsed from the current book's `ComicInfo.xml`, if it had one — see
     /// `comic::comic_info::ComicInfo`. Shown alongside the filename in the
@@ -257,7 +278,13 @@ pub struct ComicApp {
     pub header_active_since: std::time::Instant,
     /// Same as `header_active_since`, but for the bottom edge/`ui::footer`.
     pub footer_active_since: std::time::Instant,
+    /// Toggled by the (non-remappable) `F` key — see `main.rs`'s
+    /// `fullscreen_dirty` handling for why this is a borderless maximized
+    /// window rather than the OS's actual fullscreen.
     pub fullscreen: bool,
+    /// Set whenever `fullscreen` changes, so `main.rs` sends the
+    /// `Decorations`/`Maximized` viewport commands exactly once rather than
+    /// every frame.
     pub fullscreen_dirty: bool,
     pub keybindings: KeyBindings,
     pub theme_preset: ThemePreset,
@@ -510,6 +537,9 @@ impl Default for ComicApp {
             webtoon_scroll_target: None,
             webtoon_anchor_page: None,
             webtoon_anchor_offset: 0.0,
+            webtoon_overscroll_down: 0.0,
+            webtoon_overscroll_up: 0.0,
+            webtoon_sibling_preview: None,
             filename: "Aucun fichier".to_string(),
             comic_info: None,
             show_settings: false,
@@ -1457,6 +1487,60 @@ impl ComicApp {
         }
     }
 
+    /// Opens the next (`direction > 0`) or previous (`direction < 0`)
+    /// sibling archive in the currently open file's own folder — see
+    /// `comic::loader::sibling_archive`. Triggered by `ui::reader::
+    /// draw_webtoon`'s overscroll-past-the-edge gesture, which is how a
+    /// folder of `chapter-NNN.cbz`-style volumes gets browsed without
+    /// pre-queuing them via the file picker. A no-op if no book is open or
+    /// there's nothing in that direction.
+    pub fn open_sibling_volume(&mut self, direction: i32) {
+        let Some(current) = &self.current_path else { return };
+        let Some(next) = crate::comic::loader::sibling_archive(current, direction) else { return };
+        self.start_loading_path(next);
+    }
+
+    /// Call once per frame from `ui::reader::draw_webtoon`: keeps
+    /// `webtoon_sibling_preview` matching whichever direction (if any) is
+    /// currently being overscrolled, so the next/previous volume's opening
+    /// page is ready to slide into view — normally well before the gesture
+    /// actually reaches `WEBTOON_OVERSCROLL_THRESHOLD`, the same "start the
+    /// decode before it's needed" idea `request_webtoon_prefetch` already
+    /// uses for ordinary page scrolling. Clears the preview entirely once
+    /// neither direction is being overscrolled (nothing to show), and
+    /// replaces it if the overscrolled direction's sibling path changes
+    /// (e.g. the user reversed which edge they're pushing against).
+    pub fn sync_webtoon_sibling_preview(&mut self, ctx: &egui::Context) {
+        let direction =
+            if self.webtoon_overscroll_down > 0.0 { Some(1) } else if self.webtoon_overscroll_up > 0.0 { Some(-1) } else { None };
+
+        let wanted_path = direction.and_then(|d| self.current_path.as_ref().and_then(|p| crate::comic::loader::sibling_archive(p, d)));
+
+        let Some(wanted_path) = wanted_path else {
+            self.webtoon_sibling_preview = None;
+            return;
+        };
+
+        let already_current = match &self.webtoon_sibling_preview {
+            Some(SiblingPreviewState::Loading { path, .. }) => *path == wanted_path,
+            Some(SiblingPreviewState::Ready { path, .. }) => *path == wanted_path,
+            None => false,
+        };
+        if !already_current {
+            let rx = crate::comic::loader::spawn_sibling_preview(wanted_path.clone());
+            self.webtoon_sibling_preview = Some(SiblingPreviewState::Loading { path: wanted_path, rx });
+        }
+
+        if let Some(SiblingPreviewState::Loading { path, rx }) = &self.webtoon_sibling_preview
+            && let Ok(result) = rx.try_recv()
+        {
+            self.webtoon_sibling_preview = result.map(|image| SiblingPreviewState::Ready {
+                path: path.clone(),
+                texture: ctx.load_texture("webtoon_sibling_preview", image, egui::TextureOptions::LINEAR),
+            });
+        }
+    }
+
     /// Call once per frame: loads any file macOS has handed us via a
     /// Finder double-click/"Open With"/Dock drop while already running —
     /// see `platform::macos`. A fresh launch instead goes through `main`'s
@@ -1546,6 +1630,21 @@ impl ComicApp {
                     self.thumbnail_queue.clear();
                     self.total_pages = result.pages.len();
                     self.pages = result.pages;
+                    // Real aspect ratios for the whole book, up front —
+                    // cheap (header-only, no pixel decode; see
+                    // `ComicArchive::page_dimensions`'s docs for why this
+                    // matters specifically for Webtoon mode's layout math,
+                    // not just avoiding a visible jump once a page's full
+                    // decode catches up later).
+                    self.webtoon_aspect = self
+                        .pages
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, data)| {
+                            let (w, h) = crate::comic::archive::ComicArchive::page_dimensions(data).ok()?;
+                            Some((idx, w as f32 / h.max(1) as f32))
+                        })
+                        .collect();
                     self.filename = result.filename;
                     self.comic_info = result.comic_info;
                     self.current_path = Some(result.path.clone());
@@ -1562,6 +1661,9 @@ impl ComicApp {
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
                     self.reset_zoom_for_new_page();
                     self.webtoon_scroll_target = Some(self.current_page);
+                    self.webtoon_overscroll_down = 0.0;
+                    self.webtoon_overscroll_up = 0.0;
+                    self.webtoon_sibling_preview = None;
 
                     self.loading = false;
                     // Any decode still in flight for the previous archive is
@@ -1679,6 +1781,7 @@ impl ComicApp {
     /// finished since the last poll into a GPU texture. Cheap no-op when
     /// nothing has arrived.
     pub fn poll_decoded_pages(&mut self, ctx: &egui::Context) {
+        let mut any = false;
         while let Ok(decoded) = self.decode_result_rx.try_recv() {
             if decoded.generation != self.load_generation {
                 continue; // stale — belonged to a since-replaced archive
@@ -1687,6 +1790,16 @@ impl ComicApp {
             self.textures.entry(decoded.page_idx).or_insert_with(|| {
                 ctx.load_texture(format!("page_{}", decoded.page_idx), decoded.image, egui::TextureOptions::LINEAR)
             });
+            any = true;
+        }
+        // Without this, a page that finishes decoding after the user has
+        // stopped actively scrolling/turning (so nothing else is asking for
+        // a repaint) just sits in the channel — the texture doesn't appear
+        // until *something* else happens to trigger another frame. Same
+        // reasoning as `poll_thumbnails`' own `request_repaint` — don't wait
+        // for the next mouse move.
+        if any {
+            ctx.request_repaint();
         }
     }
 
@@ -1712,6 +1825,7 @@ impl ComicApp {
     /// Same idea as `poll_decoded_pages`, for `webtoon_textures`: uploads
     /// every slice of a finished page as its own texture, in order.
     pub fn poll_webtoon_decoded_pages(&mut self, ctx: &egui::Context) {
+        let mut any = false;
         while let Ok(decoded) = self.webtoon_decode_result_rx.try_recv() {
             if decoded.generation != self.load_generation {
                 continue; // stale — belonged to a since-replaced archive
@@ -1731,6 +1845,16 @@ impl ComicApp {
                     })
                     .collect()
             });
+            any = true;
+        }
+        // See `poll_decoded_pages`'s matching comment — without this, a page
+        // whose decode finishes after the user has stopped scrolling just
+        // sits fully decoded but undisplayed until some unrelated input
+        // happens to trigger another frame. These pages can take a while
+        // (multiple full-resolution slices — see `decode_page_slices`), so
+        // this race is easy to lose in practice, not just theoretical.
+        if any {
+            ctx.request_repaint();
         }
     }
 
