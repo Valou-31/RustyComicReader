@@ -120,8 +120,34 @@ impl eframe::App for ComicApp {
             self.title_dirty = false;
         }
         if self.fullscreen_dirty {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            // A borderless maximized window, not `ViewportCommand::Fullscreen`
+            // — on macOS that maps to the OS's own fullscreen (a dedicated
+            // Space, entered/exited with the animated transition), whose
+            // Metal/vsync frame scheduling has long-standing, widely
+            // reported stutter independent of what's being drawn (e.g.
+            // https://github.com/bevyengine/bevy/issues/16087,
+            // https://developer.apple.com/forums/thread/733033). Hiding
+            // decorations and maximizing gets the same fill-the-screen look
+            // without leaving the normal windowed presentation path.
+            //
+            // On macOS specifically, that alone leaves the menu bar showing
+            // (a maximized window only fills `NSScreen.visibleFrame`, which
+            // excludes it) — `set_immersive_presentation` auto-hides the
+            // menu bar/Dock first, which is what grows `visibleFrame` out to
+            // the screen's full bounds for `Maximized` to then fill. Must
+            // run *before* `Maximized`/*after* un-maximizing — see its own
+            // doc comment for why the order matters.
+            #[cfg(target_os = "macos")]
+            if self.fullscreen {
+                platform::macos::set_immersive_presentation(true);
+            }
+            let ctx = ui.ctx();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.fullscreen));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.fullscreen));
+            #[cfg(target_os = "macos")]
+            if !self.fullscreen {
+                platform::macos::set_immersive_presentation(false);
+            }
             self.fullscreen_dirty = false;
         }
 

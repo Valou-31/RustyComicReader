@@ -45,13 +45,44 @@
 //! delegate is set* rather than *some point after* closes the race
 //! entirely, without needing to know winit's delegate class by name (this
 //! patches whatever class the very next `setDelegate:` call receives).
+use objc2::MainThreadMarker;
 use objc2::ffi::{class_addMethod, method_setImplementation, object_getClass};
 use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2::sel;
-use objc2_app_kit::NSApplication;
+use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions};
 use objc2_foundation::{NSArray, NSObject, NSURL};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+
+/// Hides (`immersive: true`) or restores (`false`) the system menu bar and
+/// Dock — used to make `ComicApp::fullscreen`'s borderless *maximized*
+/// window (see `main.rs`'s `fullscreen_dirty` handling for why it's not
+/// real `NSWindow` fullscreen) actually cover the whole screen edge to
+/// edge, the way real fullscreen would, instead of leaving a gap for the
+/// menu bar along the top.
+///
+/// Order matters at the call site: this needs to run *before* the window
+/// is asked to maximize, since hiding the menu bar/Dock is what grows
+/// `NSScreen.visibleFrame` (what `ViewportCommand::Maximized` sizes the
+/// window to) out to the screen's full bounds in the first place — call
+/// this after and the window would still be sized to the smaller,
+/// menu-bar-and-Dock-present frame from a moment earlier. Symmetrically,
+/// call this to un-hide *after* un-maximizing, so `visibleFrame` doesn't
+/// shrink out from under the still-maximized window.
+///
+/// A no-op if called from off the main thread (never happens in
+/// practice — `main.rs` only calls this from `eframe::App::ui`, which
+/// winit always dispatches on the main thread).
+pub fn set_immersive_presentation(immersive: bool) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let options = if immersive {
+        NSApplicationPresentationOptions::AutoHideMenuBar | NSApplicationPresentationOptions::AutoHideDock
+    } else {
+        NSApplicationPresentationOptions::Default
+    };
+    app.setPresentationOptions(options);
+}
 
 /// Files handed to us by `application_open_urls` since the last
 /// `take_opened_files` poll.
