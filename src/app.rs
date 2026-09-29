@@ -186,6 +186,43 @@ pub(crate) enum SiblingPreviewState {
     Ready { path: PathBuf, texture: egui::TextureHandle },
 }
 
+/// A live trackpad drag past the top/bottom edge of the Webtoon strip,
+/// toward opening the previous/next sibling volume — the vertical,
+/// edge-gated counterpart of `PageTransition`'s own drag
+/// (`ComicApp::start_page_drag`/`drag_page_by`/`end_page_drag`): `progress`
+/// is driven directly by the gesture (see `ui::reader::webtoon_edge_drag_step`)
+/// and holds steady while the gesture is merely held still, rather than
+/// draining on a timer the way the earlier accumulator-based design did —
+/// that's what let a brief pause mid-swipe undo progress a user had already
+/// made, forcing a single uninterrupted hard push to ever reach the
+/// threshold. It only resolves — commits to `direction`, or settles back to
+/// `0.0` — once the gesture actually ends (`TouchPhase::End`/`Cancel`),
+/// exactly like a manga page turn.
+///
+/// Deliberately only ever *started* by a fresh gesture (`TouchPhase::Start`)
+/// that begins while the strip is already sitting at that edge — not by the
+/// tail end of whatever gesture carried it there. Otherwise a fast flick
+/// that merely lands on the last page keeps feeding this from its own
+/// momentum tail (still the same gesture, no new `Start`) and can trigger a
+/// volume change the reader never actually asked for.
+pub(crate) struct WebtoonEdgeDrag {
+    /// `1` pushing past the bottom (opens the next volume), `-1` pulling
+    /// past the top (previous).
+    pub direction: i32,
+    /// `0.0..=1.0` toward committing. Held in place (no decay) while
+    /// `dragging`; once released without committing, decays back to `0.0`
+    /// instead of snapping, then the whole drag is dropped.
+    pub progress: f32,
+    /// Progress-units-per-second, exponentially smoothed — same role as
+    /// `PageTransition::velocity`, used for `webtoon_edge_drag_step`'s fling
+    /// detection at release.
+    pub velocity: f32,
+    /// `true` while the gesture that's driving this drag is still live;
+    /// `false` once it's released without committing and is instead
+    /// settling `progress` back to `0.0`.
+    pub dragging: bool,
+}
+
 pub struct ComicApp {
     /// Each page's original compressed bytes (JPEG/PNG/etc.), not decoded
     /// pixels — decoding happens on demand in the reader UI, only for pages
@@ -252,16 +289,11 @@ pub struct ComicApp {
     /// the reader mid-scroll.
     pub(crate) webtoon_anchor_page: Option<usize>,
     pub(crate) webtoon_anchor_offset: f32,
-    /// Raw (unscaled, physical-points) wheel scroll accumulated while
-    /// already at the very bottom of the strip and still being pushed
-    /// further — see `ui::reader::WEBTOON_OVERSCROLL_THRESHOLD` and
-    /// `ComicApp::open_sibling_volume`. Reset to `0.0` the moment a scroll
-    /// isn't both at that edge *and* still pushing past it (including a
-    /// normal in-bounds scroll), so this only ever reflects one continuous
-    /// push, not scattered scrolling over time.
-    pub(crate) webtoon_overscroll_down: f32,
-    /// Same as `webtoon_overscroll_down`, for pulling past the very top.
-    pub(crate) webtoon_overscroll_up: f32,
+    /// The live edge-past-the-strip drag toward opening the next/previous
+    /// sibling volume, if one is currently in progress (gesture still live)
+    /// or settling back to rest (released without committing) — see
+    /// `WebtoonEdgeDrag`. `None` the rest of the time.
+    pub(crate) webtoon_edge_drag: Option<WebtoonEdgeDrag>,
     /// See `SiblingPreviewState`.
     pub(crate) webtoon_sibling_preview: Option<SiblingPreviewState>,
     pub filename: String,
@@ -537,8 +569,7 @@ impl Default for ComicApp {
             webtoon_scroll_target: None,
             webtoon_anchor_page: None,
             webtoon_anchor_offset: 0.0,
-            webtoon_overscroll_down: 0.0,
-            webtoon_overscroll_up: 0.0,
+            webtoon_edge_drag: None,
             webtoon_sibling_preview: None,
             filename: "Aucun fichier".to_string(),
             comic_info: None,
@@ -1501,18 +1532,19 @@ impl ComicApp {
     }
 
     /// Call once per frame from `ui::reader::draw_webtoon`: keeps
-    /// `webtoon_sibling_preview` matching whichever direction (if any) is
-    /// currently being overscrolled, so the next/previous volume's opening
-    /// page is ready to slide into view — normally well before the gesture
-    /// actually reaches `WEBTOON_OVERSCROLL_THRESHOLD`, the same "start the
-    /// decode before it's needed" idea `request_webtoon_prefetch` already
-    /// uses for ordinary page scrolling. Clears the preview entirely once
-    /// neither direction is being overscrolled (nothing to show), and
-    /// replaces it if the overscrolled direction's sibling path changes
-    /// (e.g. the user reversed which edge they're pushing against).
+    /// `webtoon_sibling_preview` matching `webtoon_edge_drag`'s direction (if
+    /// any), so the next/previous volume's opening page is ready to slide
+    /// into view — normally well before the drag actually commits, the same
+    /// "start the decode before it's needed" idea `request_webtoon_prefetch`
+    /// already uses for ordinary page scrolling. Clears the preview entirely
+    /// once there's no edge drag at all (kept, still sliding back into
+    /// place, while one is merely settling to rest after a release not
+    /// committed — clearing it early would make the preview vanish before
+    /// its own slide-back animation finishes), and replaces it if the
+    /// drag's direction changes (e.g. the user reversed which edge they're
+    /// pushing against).
     pub fn sync_webtoon_sibling_preview(&mut self, ctx: &egui::Context) {
-        let direction =
-            if self.webtoon_overscroll_down > 0.0 { Some(1) } else if self.webtoon_overscroll_up > 0.0 { Some(-1) } else { None };
+        let direction = self.webtoon_edge_drag.as_ref().map(|d| d.direction);
 
         let wanted_path = direction.and_then(|d| self.current_path.as_ref().and_then(|p| crate::comic::loader::sibling_archive(p, d)));
 
@@ -1661,8 +1693,7 @@ impl ComicApp {
                     self.current_page = self.resume_to_page.take().unwrap_or(0);
                     self.reset_zoom_for_new_page();
                     self.webtoon_scroll_target = Some(self.current_page);
-                    self.webtoon_overscroll_down = 0.0;
-                    self.webtoon_overscroll_up = 0.0;
+                    self.webtoon_edge_drag = None;
                     self.webtoon_sibling_preview = None;
 
                     self.loading = false;

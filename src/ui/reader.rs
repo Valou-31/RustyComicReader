@@ -1,9 +1,9 @@
 use crate::app::{
-    ComicApp, PageZoom, ReadingMode, SiblingPreviewState, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, ZOOM_MAX, ZOOM_MIN,
-    ZoomTarget,
+    ComicApp, PageZoom, ReadingMode, SiblingPreviewState, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, WebtoonEdgeDrag,
+    ZOOM_MAX, ZOOM_MIN, ZoomTarget,
 };
 use crate::comic::archive::{ComicArchive, PageMeta};
-use egui::{Align, Align2, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
+use egui::{Align, Align2, Color32, Event, Pos2, Rect, Stroke, TextureHandle, TextureOptions, TouchPhase, Ui, Vec2};
 use std::collections::HashMap;
 
 /// How many pages beyond the currently displayed spread keep their decoded
@@ -121,68 +121,43 @@ const WEBTOON_DEFAULT_ASPECT: f32 = 0.7;
 /// started well before it scrolls into view.
 const WEBTOON_PRELOAD_MARGIN: f32 = 2000.0;
 
-/// Raw (physical-points, unscaled by zoom/`webtoon_wheel_sensitivity`)
-/// wheel scroll that has to accumulate — while already at the very edge of
-/// the strip and still being pushed further — before `draw_webtoon` opens
-/// the next/previous sibling volume (`ComicApp::open_sibling_volume`).
-/// Larger than the paginated view's own swipe-to-turn gesture
-/// (`input::scroll::DRAG_FULL_DISTANCE`, `220.0`) — this changes which
-/// *book* is open, not just the page, so it should take a clearly
-/// deliberate push, not a single quick swipe — but not so large that a
-/// normal deliberate push (see `WEBTOON_OVERSCROLL_DECAY_PER_SECOND`) has
-/// to fight it for what feels like forever. Tuned by feel, not measurement
-/// (an earlier `900.0`, with no decay at all, triggered from trackpad
-/// momentum and casual over-scrolling too easily; `2200.0` paired with
-/// `3000.0` decay swung the other way and became hard to trigger even
-/// pushing deliberately) — adjust either constant first if this still
-/// isn't right rather than assuming the mechanism itself is wrong.
-const WEBTOON_OVERSCROLL_THRESHOLD: f32 = 1200.0;
+/// Raw (physical-points, unscaled by zoom/`webtoon_wheel_sensitivity`) drag
+/// distance past the edge of the strip that maps to a full `0.0..=1.0`
+/// `WebtoonEdgeDrag::progress` — the vertical counterpart of
+/// `input::scroll::DRAG_FULL_DISTANCE` (`220.0`). Somewhat larger than that
+/// horizontal page-turn distance — this changes which *book* is open, not
+/// just the page, so it should still take a clearly deliberate push, not a
+/// hair-trigger flick — but nowhere near the `1200.0`-plus-decay the
+/// previous accumulator design needed, since that design had to size the
+/// threshold to also outrun trackpad momentum on its own (no `TouchPhase`
+/// gating); `webtoon_edge_drag_step` now does that gating structurally
+/// instead (see `WebtoonEdgeDrag`'s docs), so this constant is free to be
+/// just "how far is a deliberate push," the same job `DRAG_FULL_DISTANCE`
+/// does for a page turn.
+const WEBTOON_EDGE_DRAG_FULL_DISTANCE: f32 = 400.0;
 
-/// How fast (in points/second) `webtoon_overscroll_step`'s accumulators
-/// drain back toward `0.0` on every frame that isn't actively adding to
-/// them at least as fast. Unlike the paginated swipe (bounded by a single
-/// gesture's `TouchPhase::Start`..`End`), continuous wheel/trackpad
-/// scrolling has no natural "this gesture is over" signal — so without
-/// this, a hard flick's momentum/inertia tail (which keeps delivering
-/// scroll events well after the fingers actually lift) could rack up
-/// `WEBTOON_OVERSCROLL_THRESHOLD` on its own, just like casually
-/// continuing to scroll a bit past the edge out of habit could over enough
-/// (slow, ordinary) scrolling. Real trackpad momentum decelerates quickly,
-/// so even a decay well under the threshold's own size drains a momentum
-/// tail's contribution before it adds up to much, while a genuinely
-/// sustained, deliberate push — actively held, not just coasting — keeps
-/// feeding the accumulator faster than this drains it. See
-/// `WEBTOON_OVERSCROLL_THRESHOLD`'s docs for this value's own tuning
-/// history — the two are tuned together, not independently.
-const WEBTOON_OVERSCROLL_DECAY_PER_SECOND: f32 = 900.0;
+/// `WebtoonEdgeDrag::progress` fraction that commits at release if the
+/// gesture wasn't fast enough to count as a fling (see
+/// `WEBTOON_EDGE_DRAG_FLING_VELOCITY`) — same role and value as
+/// `ComicApp::end_page_drag`'s own `COMMIT_THRESHOLD`.
+const WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD: f32 = 0.5;
 
-/// Fraction of `WEBTOON_OVERSCROLL_THRESHOLD` that produces *no* visible
-/// transition at all — the strip's content stays exactly where it is,
-/// nothing slides, nothing peeks in. Below this, the overscroll gesture
-/// (`webtoon_overscroll_step`) is still silently accumulating, but the
-/// reader gives no visual sign of it yet — otherwise even a small,
-/// incidental push (routinely reached just finishing the last panel of a
-/// volume and scrolling a little further, nowhere near an actual attempt
-/// to switch) would already start sliding that content away, "eating"
-/// visible content the reader still wants to see well before the gesture
-/// is anywhere near committing. Only once a push is clearly past
-/// incidental does the transition start — see `webtoon_reveal_fraction`,
-/// which remaps the *remaining* `1.0 - WEBTOON_OVERSCROLL_DEADZONE` of the
-/// range back out to the transition's full `0.0..=1.0`, so it still plays
-/// out completely (nothing to the incoming page filling the screen) rather
-/// than feeling rushed or clipped once it does start.
-const WEBTOON_OVERSCROLL_DEADZONE: f32 = 0.35;
+/// `WebtoonEdgeDrag::velocity` (progress-units/second) fast enough at
+/// release to commit regardless of how little of `WEBTOON_EDGE_DRAG_FULL_DISTANCE`
+/// was actually covered — a quick, sharp push reads as just as deliberate
+/// as a slow, full one. Same value and reasoning as `ComicApp::end_page_drag`'s
+/// `FLING_VELOCITY`: comfortably above a slow full push (~1.0/s), below an
+/// actual quick flick (~5+/s).
+const WEBTOON_EDGE_DRAG_FLING_VELOCITY: f32 = 3.0;
 
-/// `overscroll`'s progress (an unsigned magnitude, e.g.
-/// `ComicApp::webtoon_overscroll_down`) toward `threshold`, remapped
-/// through `WEBTOON_OVERSCROLL_DEADZONE` into the sibling-preview
-/// transition's own `0.0..=1.0` reveal range — see that constant's docs.
-/// Pulled out as its own pure function so the remap is testable without
-/// needing a whole frame's worth of `draw_webtoon` state.
-fn webtoon_reveal_fraction(overscroll: f32, threshold: f32) -> f32 {
-    let raw = (overscroll / threshold).min(1.0);
-    ((raw - WEBTOON_OVERSCROLL_DEADZONE) / (1.0 - WEBTOON_OVERSCROLL_DEADZONE)).clamp(0.0, 1.0)
-}
+/// How fast (in progress-units/second) a released-but-not-committed
+/// `WebtoonEdgeDrag` settles its `progress` back to `0.0` — purely a
+/// visual "let go and it springs back" cue; unlike the old
+/// accumulator-based decay, this never runs while the gesture is still
+/// live (see `WebtoonEdgeDrag`'s docs), so it can never eat into progress
+/// the reader is actively building. Fast enough that letting go reads as an
+/// immediate cancel rather than a lingering, ambiguous fade.
+const WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND: f32 = 3.5;
 
 /// One page's height in document units, from its known aspect ratio (once
 /// decoded, via `ComicApp::webtoon_aspect`) or `WEBTOON_DEFAULT_ASPECT`
@@ -256,49 +231,110 @@ fn webtoon_visible_range(
     (keep_range, current_page)
 }
 
-/// One frame's worth of `draw_webtoon`'s wheel-scroll handling, pulled out
-/// into a pure function so it's testable without an `egui::Context`:
-/// reconciles the current scroll position and both overscroll accumulators
-/// against a new wheel delta, and returns the updated
-/// `(scroll, overscroll_down, overscroll_up)`.
+/// One frame's worth of `draw_webtoon`'s wheel-scroll handling against the
+/// Webtoon strip's own top/bottom edges, pulled out into a pure function so
+/// it's testable without an `egui::Context` — the vertical, edge-gated
+/// counterpart of `ComicApp::drag_page_by`/`end_page_drag`. Reconciles the
+/// current scroll position and any live `WebtoonEdgeDrag` against a new
+/// wheel delta and this frame's gesture-phase signals, and returns the
+/// updated `(scroll, edge_drag, commit)` — `commit` is `Some(direction)` on
+/// the exact frame a drag resolves to opening the sibling volume that way;
+/// the caller still has to actually do that (a pure function can't touch
+/// the filesystem).
 ///
 /// `raw_delta` and `doc_delta` carry the same delta in two different units
-/// — `raw_delta` in physical points (what the overscroll accumulators are
-/// measured in, so the trigger threshold means the same physical gesture
-/// regardless of zoom/window size) and `doc_delta` in the document units
-/// `scroll` itself is kept in (see `WEBTOON_DOC_WIDTH`) — with the same
-/// sign. `scroll` is returned *not yet* clamped to `[0, max_scroll]`; the
-/// caller still does that.
+/// — `raw_delta` in physical points (what `WebtoonEdgeDrag::progress` is
+/// measured against, so the drag means the same physical gesture regardless
+/// of zoom/window size, same reasoning `input::scroll::DRAG_FULL_DISTANCE`
+/// uses) and `doc_delta` in the document units `scroll` itself is kept in
+/// (see `WEBTOON_DOC_WIDTH`) — with the same sign. `scroll` is returned
+/// *not yet* clamped to `[0, max_scroll]`; the caller still does that.
 ///
-/// Only one accumulator is ever left nonzero: whichever edge isn't
-/// currently being pushed against resets immediately, same as a normal
-/// in-bounds scroll resets both — so this only ever tracks one continuous
-/// push past an edge, not scattered scrolling back and forth over time.
-///
-/// Each accumulator also decays by `WEBTOON_OVERSCROLL_DECAY_PER_SECOND * dt`
-/// every frame it's active, *before* adding this frame's delta — see that
-/// constant's docs for why (distinguishing a sustained, deliberate push
-/// from trackpad momentum or casual continued scrolling, neither of which
-/// have a distinct "gesture ended" signal to reset on).
-fn webtoon_overscroll_step(
+/// `gesture_started`/`gesture_ended` come from this frame's raw
+/// `Event::MouseWheel` phases (`TouchPhase::Start`/`End`/`Cancel`), same
+/// signal `input::scroll::handle_scroll` uses for the paginated swipe. A
+/// drag can only ever *start* on a frame where `gesture_started` is true
+/// and the strip is already sitting at that edge — never from the tail end
+/// of whatever gesture carried it there (still `Move`-phase events, no new
+/// `Start`) — see `WebtoonEdgeDrag`'s docs for why that matters. Once
+/// started, it holds `progress` in place while merely held still (no
+/// decay), and only resolves — commit or release-and-settle — on the frame
+/// `gesture_ended` fires.
+#[allow(clippy::too_many_arguments)] // each parameter is independently meaningful frame state; see the docs above
+fn webtoon_edge_drag_step(
     scroll: f32,
     max_scroll: f32,
     raw_delta: f32,
     doc_delta: f32,
     dt: f32,
-    overscroll_down: f32,
-    overscroll_up: f32,
-) -> (f32, f32, f32) {
-    let decay = WEBTOON_OVERSCROLL_DECAY_PER_SECOND * dt;
+    gesture_started: bool,
+    gesture_ended: bool,
+    edge_drag: Option<WebtoonEdgeDrag>,
+) -> (f32, Option<WebtoonEdgeDrag>, Option<i32>) {
+    const VELOCITY_SMOOTHING: f32 = 0.3;
+
+    if let Some(mut drag) = edge_drag {
+        if !drag.dragging {
+            // Released without committing: ignore any further input and
+            // just settle back to rest, same as a bounced-back page-turn
+            // drag settling toward `target: 0.0`.
+            drag.progress = (drag.progress - WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND * dt).max(0.0);
+            return if drag.progress <= 0.0 { (scroll + doc_delta, None, None) } else { (scroll, Some(drag), None) };
+        }
+
+        if gesture_ended {
+            // `drag.velocity` is already in progress-space (see `signed`
+            // below), where positive always means "still pushing further
+            // past this edge" regardless of which edge `direction` is —
+            // no second multiply by `direction` needed (or correct: doing
+            // so would flip the sign right back for the top edge's `-1`).
+            let commit = if drag.velocity.abs() >= WEBTOON_EDGE_DRAG_FLING_VELOCITY {
+                drag.velocity > 0.0
+            } else {
+                drag.progress >= WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD
+            };
+            if commit {
+                return (scroll, None, Some(drag.direction));
+            }
+            drag.dragging = false;
+            return (scroll, Some(drag), None);
+        }
+
+        // Still live: `signed` is this frame's push further past the edge
+        // (positive) or back toward it (negative), along the drag's own
+        // direction — symmetric with `ComicApp::drag_page_by`, which lets a
+        // partial page-turn drag reduce its own progress the same way.
+        let signed = raw_delta * drag.direction as f32;
+        let delta_progress = signed / WEBTOON_EDGE_DRAG_FULL_DISTANCE;
+        if dt > 0.0 {
+            let sample = delta_progress / dt;
+            drag.velocity += (sample - drag.velocity) * VELOCITY_SMOOTHING;
+        }
+        let new_progress = drag.progress + delta_progress;
+        if delta_progress < 0.0 && new_progress <= 0.0 {
+            // Pulled all the way back out of the edge before ever
+            // releasing — the gesture is still live, so just hand control
+            // back to normal scrolling instead of treating this like a
+            // release. Gated on `delta_progress < 0.0` (actually pulling
+            // back this frame), not just `new_progress <= 0.0` on its own —
+            // a drag that starts at `0.0` and is simply held still for a
+            // frame (zero delta) must not be mistaken for having already
+            // been pulled back out.
+            return (scroll + doc_delta, None, None);
+        }
+        drag.progress = new_progress.clamp(0.0, 1.0);
+        return (scroll, Some(drag), None);
+    }
+
     let at_bottom = scroll >= max_scroll;
     let at_top = scroll <= 0.0;
-    if at_bottom && raw_delta > 0.0 {
-        (scroll, (overscroll_down - decay).max(0.0) + raw_delta, 0.0)
-    } else if at_top && raw_delta < 0.0 {
-        (scroll, 0.0, (overscroll_up - decay).max(0.0) - raw_delta)
-    } else {
-        (scroll + doc_delta, 0.0, 0.0)
+    if gesture_started && at_bottom && raw_delta > 0.0 {
+        return (scroll, Some(WebtoonEdgeDrag { direction: 1, progress: 0.0, velocity: 0.0, dragging: true }), None);
     }
+    if gesture_started && at_top && raw_delta < 0.0 {
+        return (scroll, Some(WebtoonEdgeDrag { direction: -1, progress: 0.0, velocity: 0.0, dragging: true }), None);
+    }
+    (scroll + doc_delta, None, None)
 }
 
 /// Draws every page of the book as one continuous vertical strip —
@@ -365,28 +401,45 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     // pan/zoom.
     //
     // Once already at either edge, a scroll that keeps pushing past it
-    // doesn't move `webtoon_scroll` at all — it piles onto
-    // `webtoon_overscroll_down`/`_up` instead (see `webtoon_overscroll_step`),
-    // which triggers `ComicApp::open_sibling_volume` past
-    // `WEBTOON_OVERSCROLL_THRESHOLD`, checked below.
+    // doesn't move `webtoon_scroll` at all — it drives a live
+    // `WebtoonEdgeDrag` instead (see `webtoon_edge_drag_step`), which
+    // resolves to `ComicApp::open_sibling_volume` when the gesture ends
+    // past its commit threshold, exactly like a manga page turn.
     if !(app.show_settings || app.show_history || app.show_bookmarks) {
         let wheel_delta_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
-        if wheel_delta_y != 0.0 {
+        let (gesture_started, gesture_ended) = ui.ctx().input(|i| {
+            i.events.iter().fold((false, false), |(started, ended), event| match event {
+                // A scroll held with the zoom modifier is ctrl/Cmd-scroll-
+                // to-zoom, not a scroll gesture — same filter
+                // `input::scroll::handle_scroll` uses for the paginated
+                // view's own swipe.
+                Event::MouseWheel { modifiers, .. } if modifiers.command => (started, ended),
+                Event::MouseWheel { phase: TouchPhase::Start, .. } => (true, ended),
+                Event::MouseWheel { phase: TouchPhase::End | TouchPhase::Cancel, .. } => (started, true),
+                _ => (started, ended),
+            })
+        });
+
+        if wheel_delta_y != 0.0 || gesture_started || gesture_ended || app.webtoon_edge_drag.is_some() {
             let raw_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
             let doc_delta = raw_delta * app.webtoon_wheel_sensitivity / scale;
             let dt = ui.ctx().input(|i| i.stable_dt);
-            let (new_scroll, new_down, new_up) = webtoon_overscroll_step(
+            let (new_scroll, new_drag, commit) = webtoon_edge_drag_step(
                 app.webtoon_scroll,
                 max_scroll,
                 raw_delta,
                 doc_delta,
                 dt,
-                app.webtoon_overscroll_down,
-                app.webtoon_overscroll_up,
+                gesture_started,
+                gesture_ended,
+                app.webtoon_edge_drag.take(),
             );
             app.webtoon_scroll = new_scroll;
-            app.webtoon_overscroll_down = new_down;
-            app.webtoon_overscroll_up = new_up;
+            app.webtoon_edge_drag = new_drag;
+            if let Some(direction) = commit {
+                app.webtoon_sibling_preview = None;
+                app.open_sibling_volume(direction);
+            }
             ui.ctx().request_repaint();
         }
     }
@@ -397,29 +450,10 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     // How much of the viewport the incoming sibling volume's preview
     // should cover this frame — `0.0..=1.0`, signed by direction (positive
     // pushing up from the bottom, i.e. "next"; negative pushing down from
-    // the top, i.e. "previous"). Captured *before* a just-crossed threshold
-    // resets its accumulator to `0.0`, so the transition reaches a full,
-    // clean "the new page now fills the screen" moment on the very frame it
-    // triggers, instead of snapping back to nothing a frame early.
-    let reveal_fraction = if app.webtoon_overscroll_down > 0.0 {
-        webtoon_reveal_fraction(app.webtoon_overscroll_down, WEBTOON_OVERSCROLL_THRESHOLD)
-    } else if app.webtoon_overscroll_up > 0.0 {
-        -webtoon_reveal_fraction(app.webtoon_overscroll_up, WEBTOON_OVERSCROLL_THRESHOLD)
-    } else {
-        0.0
-    };
+    // the top, i.e. "previous").
+    let reveal_fraction = app.webtoon_edge_drag.as_ref().map(|d| d.progress * d.direction as f32).unwrap_or(0.0);
 
     app.sync_webtoon_sibling_preview(ui.ctx());
-
-    if app.webtoon_overscroll_down > WEBTOON_OVERSCROLL_THRESHOLD {
-        app.webtoon_overscroll_down = 0.0;
-        app.webtoon_sibling_preview = None;
-        app.open_sibling_volume(1);
-    } else if app.webtoon_overscroll_up > WEBTOON_OVERSCROLL_THRESHOLD {
-        app.webtoon_overscroll_up = 0.0;
-        app.webtoon_sibling_preview = None;
-        app.open_sibling_volume(-1);
-    }
 
     // Existing content slides away from whichever edge is being pushed
     // against — up off the top as the strip overscrolls down past the
@@ -1350,119 +1384,174 @@ mod tests {
         assert_eq!(current, 0);
     }
 
-    #[test]
-    fn webtoon_reveal_fraction_is_zero_throughout_the_deadzone() {
-        assert_eq!(webtoon_reveal_fraction(0.0, 1000.0), 0.0);
-        // Right at the deadzone boundary — still exactly zero, not yet
-        // ramping up.
-        assert_eq!(webtoon_reveal_fraction(1000.0 * WEBTOON_OVERSCROLL_DEADZONE, 1000.0), 0.0);
+    /// Shorthand for a live (`dragging: true`) drag at some `progress`, `0.0`
+    /// velocity unless a test overrides it after construction.
+    fn live_drag(direction: i32, progress: f32) -> WebtoonEdgeDrag {
+        WebtoonEdgeDrag { direction, progress, velocity: 0.0, dragging: true }
     }
 
     #[test]
-    fn webtoon_reveal_fraction_reaches_1_exactly_at_the_threshold() {
-        assert!((webtoon_reveal_fraction(1000.0, 1000.0) - 1.0).abs() < EPSILON);
-        // Past the threshold (shouldn't happen in practice — the caller
-        // triggers the volume switch right at 1.0 — but must never exceed
-        // 1.0, which would overshoot the transition's own geometry).
-        assert!((webtoon_reveal_fraction(5000.0, 1000.0) - 1.0).abs() < EPSILON);
-    }
-
-    #[test]
-    fn webtoon_reveal_fraction_ramps_linearly_across_the_remaining_range() {
-        // Halfway between the deadzone's end and the threshold should
-        // reveal exactly half — the remap uses the *remaining* span after
-        // the deadzone, not the full `0..threshold` span.
-        let deadzone_end = 1000.0 * WEBTOON_OVERSCROLL_DEADZONE;
-        let midpoint = deadzone_end + (1000.0 - deadzone_end) / 2.0;
-        assert!((webtoon_reveal_fraction(midpoint, 1000.0) - 0.5).abs() < EPSILON);
-    }
-
-    #[test]
-    fn webtoon_overscroll_step_scrolls_normally_away_from_either_edge() {
-        // Mid-strip: a downward push just scrolls, no accumulation.
-        let (scroll, down, up) = webtoon_overscroll_step(500.0, 1000.0, 50.0, 5.0, 0.0, 0.0, 0.0);
+    fn webtoon_edge_drag_step_scrolls_normally_away_from_either_edge() {
+        // Mid-strip: a downward push just scrolls, no drag starts, even on
+        // a fresh gesture.
+        let (scroll, drag, commit) = webtoon_edge_drag_step(500.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, true, false, None);
         assert!((scroll - 505.0).abs() < EPSILON);
-        assert_eq!((down, up), (0.0, 0.0));
+        assert!(drag.is_none());
+        assert_eq!(commit, None);
     }
 
     #[test]
-    fn webtoon_overscroll_step_accumulates_only_while_pushed_past_the_bottom() {
-        // Already at max_scroll, still pushing down: piles onto
-        // `overscroll_down` instead of moving `scroll` past the end.
-        // `dt: 0.0` isolates this from the decay covered separately below.
-        let (scroll, down, up) = webtoon_overscroll_step(1000.0, 1000.0, 50.0, 5.0, 0.0, 100.0, 0.0);
-        assert!((scroll - 1000.0).abs() < EPSILON);
-        assert!((down - 150.0).abs() < EPSILON);
-        assert_eq!(up, 0.0);
+    fn webtoon_edge_drag_step_never_starts_from_a_gestures_own_momentum_tail() {
+        // Already at max_scroll and still being pushed down — but
+        // `gesture_started` is false, so this is the tail end of whatever
+        // gesture arrived here, not a fresh push. No drag should start;
+        // `scroll` just stays clamped at the edge for the caller to clamp.
+        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, false, None);
+        assert!(drag.is_none());
+        assert_eq!(commit, None);
     }
 
     #[test]
-    fn webtoon_overscroll_step_accumulates_only_while_pulled_past_the_top() {
-        let (scroll, down, up) = webtoon_overscroll_step(0.0, 1000.0, -50.0, -5.0, 0.0, 0.0, 100.0);
+    fn webtoon_edge_drag_step_starts_only_on_a_fresh_gesture_already_at_the_bottom() {
+        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, true, false, None);
+        assert!((scroll - 1000.0).abs() < EPSILON); // doesn't move past the edge
+        let drag = drag.expect("a fresh push at the edge should start a drag");
+        assert_eq!(drag.direction, 1);
+        assert!(drag.dragging);
+        assert_eq!(commit, None);
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_starts_symmetrically_at_the_top() {
+        let (scroll, drag, _) = webtoon_edge_drag_step(0.0, 1000.0, -50.0, -5.0, 1.0 / 60.0, true, false, None);
         assert!((scroll - 0.0).abs() < EPSILON);
-        assert_eq!(down, 0.0);
-        assert!((up - 150.0).abs() < EPSILON);
+        assert_eq!(drag.expect("should start").direction, -1);
     }
 
     #[test]
-    fn webtoon_overscroll_step_resets_the_moment_the_push_stops_or_reverses() {
-        // At the bottom edge, but now scrolling back up: normal scroll
-        // resumes and any accumulated overscroll_down is dropped, not kept
-        // around for a later unrelated push to add onto.
-        let (scroll, down, up) = webtoon_overscroll_step(1000.0, 1000.0, -30.0, -3.0, 0.0, 400.0, 0.0);
-        assert!((scroll - 997.0).abs() < EPSILON);
-        assert_eq!(down, 0.0);
-        assert_eq!(up, 0.0);
+    fn webtoon_edge_drag_step_progress_matches_full_distance() {
+        let drag = live_drag(1, 0.0);
+        let push = WEBTOON_EDGE_DRAG_FULL_DISTANCE / 2.0;
+        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, false, Some(drag));
+        assert!((drag.unwrap().progress - 0.5).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_overscroll_step_never_mixes_the_two_directions() {
-        // Pushing down while overscroll_up is (implausibly) already
-        // nonzero: down accumulates, up is still cleared.
-        let (_, down, up) = webtoon_overscroll_step(1000.0, 1000.0, 20.0, 2.0, 0.0, 0.0, 50.0);
-        assert!((down - 20.0).abs() < EPSILON);
-        assert_eq!(up, 0.0);
+    fn webtoon_edge_drag_step_holds_progress_steady_while_held_still() {
+        // The whole point of the redesign: a live drag with zero delta this
+        // frame (fingers down but not moving) must not lose any progress —
+        // unlike the old accumulator, there's no per-frame decay while
+        // `dragging` is still true.
+        let drag = live_drag(1, 0.4);
+        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0, false, false, Some(drag));
+        assert!((drag.unwrap().progress - 0.4).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_overscroll_step_decays_before_adding_the_new_delta() {
-        // Half a second at the (test-local) decay rate drains 50.0 before
-        // this frame's 5.0 push is added back on top.
-        let (_, down, _) = webtoon_overscroll_step(1000.0, 1000.0, 5.0, 0.5, 0.5, 100.0, 0.0);
-        let expected = (100.0 - WEBTOON_OVERSCROLL_DECAY_PER_SECOND * 0.5).max(0.0) + 5.0;
-        assert!((down - expected).abs() < EPSILON);
+    fn webtoon_edge_drag_step_holding_still_right_after_starting_does_not_cancel_it() {
+        // A drag that just started sits at `progress: 0.0` — a zero-delta
+        // hold on the very next frame must still count as "holding", not
+        // "already pulled back past zero" (an easy off-by-one to get wrong
+        // since both look like `progress <= 0.0` from the outside).
+        let drag = live_drag(1, 0.0);
+        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, false, Some(drag));
+        assert_eq!(commit, None);
+        let drag = drag.expect("holding still at progress 0.0 must not drop the drag");
+        assert!(drag.dragging);
+        assert!((drag.progress - 0.0).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_overscroll_step_decay_never_pushes_the_accumulator_negative() {
-        // A long idle-ish stretch (large dt) decaying a small accumulator
-        // clamps at 0.0 rather than going negative and needing an
-        // artificially large next push to recover from.
-        let (_, down, _) = webtoon_overscroll_step(1000.0, 1000.0, 1.0, 0.1, 10.0, 5.0, 0.0);
-        assert!((down - 1.0).abs() < EPSILON);
+    fn webtoon_edge_drag_step_pulling_back_reduces_progress() {
+        let drag = live_drag(1, 0.5);
+        let pull = WEBTOON_EDGE_DRAG_FULL_DISTANCE * 0.2;
+        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, -pull, -pull * 0.1, 1.0 / 60.0, false, false, Some(drag));
+        assert!((drag.unwrap().progress - 0.3).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_overscroll_step_decay_cuts_into_a_decelerating_tails_total() {
-        // A decaying trackpad-momentum-style tail: delivers 600.0 on the
-        // first frame, halving every subsequent ~16ms frame (a rough model
-        // of real inertial scrolling). Decay only ever subtracts, so this
-        // holds by construction for *any* decay rate above `0.0` — what it
-        // actually guards against is a future change accidentally making
-        // decay a no-op (e.g. applied in the wrong place, or only on frames
-        // that don't matter), which would silently defeat the whole point
-        // (see `WEBTOON_OVERSCROLL_DECAY_PER_SECOND`'s docs).
-        let mut down = 0.0f32;
-        let mut delta = 600.0f32;
-        let dt = 1.0 / 60.0;
-        let mut peak = 0.0f32;
-        for _ in 0..60 {
-            let (_, new_down, _) = webtoon_overscroll_step(1000.0, 1000.0, delta, delta * 0.1, dt, down, 0.0);
-            down = new_down;
-            peak = peak.max(down);
-            delta *= 0.5;
+    fn webtoon_edge_drag_step_pulling_all_the_way_back_drops_the_drag_and_resumes_scrolling() {
+        let drag = live_drag(1, 0.1);
+        let pull = WEBTOON_EDGE_DRAG_FULL_DISTANCE * 0.2; // more than enough to zero out 0.1 progress
+        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, -pull, -3.0, 1.0 / 60.0, false, false, Some(drag));
+        assert!(drag.is_none());
+        assert_eq!(commit, None);
+        assert!((scroll - 997.0).abs() < EPSILON); // normal scroll applied instead
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_progress_never_exceeds_one() {
+        let drag = live_drag(1, 0.9);
+        let push = WEBTOON_EDGE_DRAG_FULL_DISTANCE; // would overshoot to 1.9 uncapped
+        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, false, Some(drag));
+        assert!((drag.unwrap().progress - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_commits_at_release_past_the_threshold() {
+        let drag = live_drag(1, WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD + 0.01);
+        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
+        assert!(drag.is_none());
+        assert_eq!(commit, Some(1));
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_releasing_below_threshold_settles_back_instead_of_committing() {
+        let drag = live_drag(1, WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD - 0.01);
+        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
+        assert_eq!(commit, None);
+        let drag = drag.expect("should still exist, settling back to rest");
+        assert!(!drag.dragging);
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_a_fast_flick_commits_even_with_little_progress() {
+        // Checked for both directions — `velocity` is already sign-
+        // normalized to progress-space ("positive = further past this
+        // edge") regardless of which edge, so a naive re-multiply by
+        // `direction` at the commit check would silently flip this for the
+        // top edge (`-1`) alone while `direction: 1` still passed.
+        for direction in [1, -1] {
+            let mut drag = live_drag(direction, 0.1);
+            drag.velocity = WEBTOON_EDGE_DRAG_FLING_VELOCITY + 1.0;
+            let (_, _, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
+            assert_eq!(commit, Some(direction));
         }
-        let undecayed_total = 600.0 / (1.0 - 0.5);
-        assert!(peak < undecayed_total, "decayed peak {peak} should stay under the undecayed total {undecayed_total}");
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_a_fast_flick_the_wrong_way_does_not_commit() {
+        // Fast velocity in itself isn't enough — it has to point the same
+        // way as the drag (a sharp pull back out counts as a cancel, not a
+        // flung commit). Checked for both directions, see the sibling test.
+        for direction in [1, -1] {
+            let mut drag = live_drag(direction, 0.1);
+            drag.velocity = -(WEBTOON_EDGE_DRAG_FLING_VELOCITY + 1.0);
+            let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
+            assert_eq!(commit, None);
+            assert!(!drag.unwrap().dragging);
+        }
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_settling_drag_decays_and_then_clears() {
+        let drag = WebtoonEdgeDrag { direction: 1, progress: 0.5, velocity: 0.0, dragging: false };
+        let dt = 0.5 / WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND; // exactly enough to drain 0.5
+        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, dt, false, false, Some(drag));
+        assert!(drag.is_none());
+        assert_eq!(commit, None);
+        assert!((scroll - 1000.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_drag_step_settling_drag_ignores_further_input() {
+        // Once released without committing, new wheel input (e.g. the same
+        // momentum tail continuing) shouldn't revive the drag or move
+        // `scroll` — it just keeps decaying toward `0.0`.
+        let drag = WebtoonEdgeDrag { direction: 1, progress: 0.5, velocity: 0.0, dragging: false };
+        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, false, Some(drag));
+        assert!((scroll - 1000.0).abs() < EPSILON);
+        assert!(drag.is_some());
+        assert_eq!(commit, None);
     }
 }
