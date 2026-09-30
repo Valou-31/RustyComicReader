@@ -4,6 +4,7 @@ use crate::ui::layout::LayoutConfig;
 use crate::ui::theme::ThemePreset;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +65,7 @@ impl Default for Config {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Config {
     pub fn config_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
@@ -86,6 +88,20 @@ impl Config {
         std::fs::create_dir_all(path.parent().unwrap())?;
         let content = serde_json::to_string_pretty(&self)?;
         std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+/// The web build has no `dirs::config_dir()`/real filesystem to persist
+/// to — settings simply reset to defaults every session (see the
+/// project-level decision to drop persistence for the first web version).
+#[cfg(target_arch = "wasm32")]
+impl Config {
+    pub fn load() -> Result<Self> {
+        Ok(Self::default())
+    }
+
+    pub fn save(&self) -> Result<()> {
         Ok(())
     }
 }

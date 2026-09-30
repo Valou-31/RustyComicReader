@@ -1,7 +1,10 @@
 use crate::comic::archive::ComicArchive;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, channel};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 
 /// A page waiting to be sliced for the Webtoon strip, off the UI thread —
 /// same shape as `comic::prefetch::DecodeRequest`, just routed to
@@ -21,6 +24,7 @@ pub struct WebtoonDecodedPage {
     pub aspect: f32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Shared {
     queue: Mutex<HashMap<usize, WebtoonDecodeRequest>>,
     work_available: Condvar,
@@ -31,11 +35,13 @@ struct Shared {
 /// DecodeQueue` is: `reconcile` keeps its contents matching exactly what's
 /// currently wanted, so a page scrolled past before the worker gets to it
 /// is dropped rather than left to pile up.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct WebtoonDecodeQueue {
     shared: Arc<Shared>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl WebtoonDecodeQueue {
     /// Makes the queue's contents exactly `wanted` — see
     /// `comic::prefetch::DecodeQueue::reconcile`, same behavior.
@@ -65,6 +71,7 @@ impl WebtoonDecodeQueue {
 /// `ComicApp::webtoon_textures` for why this needs its own worker rather
 /// than sharing `comic::prefetch`'s: a request here can produce more than
 /// one texture's worth of pixels.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_webtoon_decode_worker() -> (WebtoonDecodeQueue, Receiver<WebtoonDecodedPage>) {
     let shared = Arc::new(Shared { queue: Mutex::new(HashMap::new()), work_available: Condvar::new() });
     let worker_shared = Arc::clone(&shared);
@@ -90,4 +97,51 @@ pub fn spawn_webtoon_decode_worker() -> (WebtoonDecodeQueue, Receiver<WebtoonDec
     });
 
     (WebtoonDecodeQueue { shared }, result_rx)
+}
+
+/// The web build's counterpart to the native worker above — see
+/// `comic::prefetch`'s wasm32 twin for why (no OS threads on `wasm32`):
+/// `reconcile` decodes synchronously, inline, for whichever requested pages
+/// haven't been sent yet.
+#[cfg(target_arch = "wasm32")]
+struct Shared {
+    done: Mutex<std::collections::HashSet<usize>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct WebtoonDecodeQueue {
+    shared: Arc<Shared>,
+    result_tx: std::sync::mpsc::Sender<WebtoonDecodedPage>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebtoonDecodeQueue {
+    pub fn reconcile(
+        &self,
+        wanted: &std::collections::HashSet<usize>,
+        mut make_request: impl FnMut(usize) -> WebtoonDecodeRequest,
+    ) {
+        let mut done = self.shared.done.lock().unwrap();
+        for &page_idx in wanted {
+            if !done.insert(page_idx) {
+                continue;
+            }
+            let request = make_request(page_idx);
+            if let Ok((slices, aspect)) = ComicArchive::decode_page_slices(&request.data, request.max_dimension) {
+                let _ = self.result_tx.send(WebtoonDecodedPage { generation: request.generation, page_idx, slices, aspect });
+            }
+        }
+    }
+
+    pub fn clear(&self) {
+        self.shared.done.lock().unwrap().clear();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_webtoon_decode_worker() -> (WebtoonDecodeQueue, Receiver<WebtoonDecodedPage>) {
+    let shared = Arc::new(Shared { done: Mutex::new(std::collections::HashSet::new()) });
+    let (result_tx, result_rx) = channel::<WebtoonDecodedPage>();
+    (WebtoonDecodeQueue { shared, result_tx }, result_rx)
 }

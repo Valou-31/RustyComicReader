@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Most entries a `History` keeps — old books fall off the end rather than
 /// growing the file forever.
@@ -25,6 +25,7 @@ pub struct History {
     pub entries: Vec<HistoryEntry>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl History {
     pub fn history_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
@@ -49,7 +50,24 @@ impl History {
         std::fs::write(path, content)?;
         Ok(())
     }
+}
 
+/// The web build keeps `History` working in-memory for the current session
+/// (so the history panel still lists what's been opened since the page
+/// loaded) but never persists it — no real filesystem to write to, and
+/// persistence across reloads was dropped for the first web version.
+#[cfg(target_arch = "wasm32")]
+impl History {
+    pub fn load() -> Result<Self> {
+        Ok(Self::default())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl History {
     /// Moves `path` to the front of the list (inserting it if new) and
     /// records its current progress. Call whenever a book finishes loading
     /// or its reading position changes.

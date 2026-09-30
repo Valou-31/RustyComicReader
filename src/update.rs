@@ -1,8 +1,14 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::Receiver;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::channel;
 
+#[cfg(not(target_arch = "wasm32"))]
 const REPO_OWNER: &str = "Valou-31";
+#[cfg(not(target_arch = "wasm32"))]
 const REPO_NAME: &str = "RustyComicReader";
+#[cfg(not(target_arch = "wasm32"))]
 const USER_AGENT: &str = "RustyComicReader-updater";
 
 /// What a newer release looked like when `spawn_check` found one.
@@ -23,12 +29,14 @@ pub enum ApplyEvent {
     Failed(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Deserialize)]
 struct Release {
     tag_name: String,
     assets: Vec<Asset>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Deserialize)]
 struct Asset {
     name: String,
@@ -37,6 +45,7 @@ struct Asset {
 
 /// The release asset name for the platform this binary is running on — must
 /// match exactly what `.github/workflows/release.yml` uploads.
+#[cfg(not(target_arch = "wasm32"))]
 fn asset_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "comic-reader-macos-arm64.zip"
@@ -51,6 +60,7 @@ fn asset_name() -> &'static str {
 /// comparable `(major, minor, patch)` tuple. An unparseable segment becomes
 /// `0` — only reachable for a malformed release tag, since `CARGO_PKG_VERSION`
 /// is always well-formed.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_version(raw: &str) -> (u32, u32, u32) {
     let raw = raw.strip_prefix('v').unwrap_or(raw);
     let mut parts = raw.split('.').map(|p| p.parse().unwrap_or(0));
@@ -61,6 +71,7 @@ fn parse_version(raw: &str) -> (u32, u32, u32) {
 /// background thread — network access shouldn't block startup, and a
 /// failure (offline, rate-limited, no matching asset) is meant to be logged
 /// and ignored rather than bothering the user.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_check() -> Receiver<CheckEvent> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -69,6 +80,17 @@ pub fn spawn_check() -> Receiver<CheckEvent> {
     rx
 }
 
+/// No self-update on the web build — the browser always serves whatever's
+/// currently deployed, so "checking for an update" has no meaning. Returns
+/// an already-closed channel: `app.rs::poll_update_check`'s `try_recv()`
+/// loop just never sees an event, no different from a check that's still
+/// pending forever.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_check() -> Receiver<CheckEvent> {
+    std::sync::mpsc::channel().1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn check() -> CheckEvent {
     let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
     let mut response = match ureq::get(&url).header("User-Agent", USER_AGENT).call() {
@@ -102,6 +124,7 @@ fn check() -> CheckEvent {
 /// it as-is on Windows, where the asset already *is* the raw exe), and
 /// replaces the running executable with it via `self_replace` — takes
 /// effect the next time the app is launched.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_apply(info: UpdateInfo) -> Receiver<ApplyEvent> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -114,6 +137,14 @@ pub fn spawn_apply(info: UpdateInfo) -> Receiver<ApplyEvent> {
     rx
 }
 
+/// See `spawn_check`'s wasm32 stub — applying an update is equally
+/// meaningless on the web build.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_apply(_info: UpdateInfo) -> Receiver<ApplyEvent> {
+    std::sync::mpsc::channel().1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn apply(info: &UpdateInfo) -> Result<(), String> {
     let bytes = download(&info.asset_url)?;
     let binary = extract_binary(&bytes)?;
@@ -175,8 +206,10 @@ fn app_bundle_root(exe: &std::path::Path) -> Option<&std::path::Path> {
 }
 
 /// Release assets are well over ureq's default 10MB read limit.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_ASSET_SIZE: u64 = 200 * 1024 * 1024;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn download(url: &str) -> Result<Vec<u8>, String> {
     let mut response = ureq::get(url).header("User-Agent", USER_AGENT).call().map_err(|e| e.to_string())?;
     response.body_mut().with_config().limit(MAX_ASSET_SIZE).read_to_vec().map_err(|e| e.to_string())
@@ -185,6 +218,7 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
 /// Pulls the platform binary out of the downloaded release asset — a zip
 /// (macOS, containing the whole `.app` bundle) or tar.gz (Linux, containing
 /// a folder) archive.
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_binary(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if cfg!(target_os = "windows") {
         return Ok(bytes.to_vec());
@@ -195,6 +229,7 @@ fn extract_binary(bytes: &[u8]) -> Result<Vec<u8>, String> {
     extract_from_tar_gz(bytes, "/rusty_comic_reader")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_from_zip(bytes: &[u8], suffix: &str) -> Result<Vec<u8>, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     for i in 0..archive.len() {
@@ -208,6 +243,7 @@ fn extract_from_zip(bytes: &[u8], suffix: &str) -> Result<Vec<u8>, String> {
     Err(format!("No entry ending with {suffix} in the update archive"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_from_tar_gz(bytes: &[u8], suffix: &str) -> Result<Vec<u8>, String> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -224,7 +260,7 @@ fn extract_from_tar_gz(bytes: &[u8], suffix: &str) -> Result<Vec<u8>, String> {
     Err(format!("No entry ending with {suffix} in the update archive"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::io::Write;

@@ -10,7 +10,7 @@ use crate::update::{ApplyEvent, CheckEvent, UpdateInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// How long the header/footer stay visible after the cursor last left
 /// their reveal zone — see `ComicApp::update_ui_activity`.
@@ -343,9 +343,9 @@ pub struct ComicApp {
     /// edge (or outside the window entirely) — see `update_ui_activity`.
     /// Drives `ui::header::draw_header`/`draw_header_overlay`'s idle-hide
     /// fade, independent of the footer's own.
-    pub header_active_since: std::time::Instant,
+    pub header_active_since: Instant,
     /// Same as `header_active_since`, but for the bottom edge/`ui::footer`.
-    pub footer_active_since: std::time::Instant,
+    pub footer_active_since: Instant,
     /// Toggled by the (non-remappable) `F` key — see `main.rs`'s
     /// `fullscreen_dirty` handling for why this is a borderless maximized
     /// window rather than the OS's actual fullscreen.
@@ -487,11 +487,16 @@ pub struct ComicApp {
     /// Files picked (or passed on the command line) alongside the one
     /// currently loading/loaded, waiting their turn.
     pub file_queue: VecDeque<PathBuf>,
+    /// The web build's counterpart to `file_queue` — no real paths to queue,
+    /// so this holds the rest of a multi-file pick's own bytes instead. See
+    /// `queued_file_count`/`open_next_in_queue`.
+    #[cfg(target_arch = "wasm32")]
+    pub bytes_queue: VecDeque<(String, Vec<u8>)>,
     pub history: History,
     pub show_history: bool,
     /// Set true by navigation, cleared once `flush_history` runs.
     history_dirty: bool,
-    history_last_saved: std::time::Instant,
+    history_last_saved: Instant,
     /// Saved reading spots, independent of `history` (which only ever
     /// tracks the single most recent position per book) — see
     /// `toggle_bookmark`.
@@ -610,8 +615,8 @@ impl Default for ComicApp {
             filename: "Aucun fichier".to_string(),
             comic_info: None,
             show_settings: false,
-            header_active_since: std::time::Instant::now(),
-            footer_active_since: std::time::Instant::now(),
+            header_active_since: Instant::now(),
+            footer_active_since: Instant::now(),
             fullscreen: false,
             fullscreen_dirty: false,
             keybindings: KeyBindings::default(),
@@ -643,10 +648,12 @@ impl Default for ComicApp {
             load_error: None,
             current_path: None,
             file_queue: VecDeque::new(),
+            #[cfg(target_arch = "wasm32")]
+            bytes_queue: VecDeque::new(),
             history: History::default(),
             show_history: false,
             history_dirty: false,
-            history_last_saved: std::time::Instant::now(),
+            history_last_saved: Instant::now(),
             bookmarks: Bookmarks::default(),
             show_bookmarks: false,
             show_goto_page: false,
@@ -1394,7 +1401,7 @@ impl ComicApp {
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let (in_header_zone, in_footer_zone) =
             reveal_zones(pointer.map(|pos| pos.y), viewport.top(), viewport.bottom());
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if in_header_zone {
             self.header_active_since = now;
         }
@@ -1409,7 +1416,7 @@ impl ComicApp {
     /// squarely "using the header" even on a tall window where the bar's
     /// own row might sit below `UI_REVEAL_ZONE_FRACTION` of the top edge.
     pub fn touch_header_activity(&mut self) {
-        self.header_active_since = std::time::Instant::now();
+        self.header_active_since = Instant::now();
     }
 
     /// Cycles LTR → RTL → Single Page → Webtoon → LTR — used by the single
@@ -1536,6 +1543,21 @@ impl ComicApp {
         self.pending_load = Some(crate::comic::loader::spawn_file_load(path, self.show_fore_edge));
     }
 
+    /// The web build's counterpart to `start_loading_path` — there's no
+    /// filesystem path to hand `comic::loader::spawn_bytes_load`, just
+    /// whatever bytes the file picker or a drag-drop already read into
+    /// memory. Used by `poll_picking`'s `PickedBytes` arm.
+    #[cfg(target_arch = "wasm32")]
+    pub fn start_loading_bytes(&mut self, filename: String, data: Vec<u8>) {
+        self.resume_to_page = None;
+        self.loading = true;
+        self.load_error = None;
+        self.load_progress = (0, 0);
+        self.load_preview = None;
+        self.preview_texture = None;
+        self.pending_load = Some(crate::comic::loader::spawn_bytes_load(filename, data, self.show_fore_edge));
+    }
+
     /// Like `start_loading_path`, but jumps straight to `page` once loading
     /// finishes instead of the beginning — used by the bookmarks panel to
     /// open a book directly at a saved spot. Reuses the same mechanism
@@ -1548,10 +1570,35 @@ impl ComicApp {
     }
 
     /// Pops the next queued file (if any) and starts loading it.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_next_in_queue(&mut self) {
         if let Some(path) = self.file_queue.pop_front() {
             self.start_loading_path(path);
         }
+    }
+
+    /// The web build's counterpart to the native `open_next_in_queue` above
+    /// — pops from `bytes_queue` instead, since there's no path to hand
+    /// `start_loading_path`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_next_in_queue(&mut self) {
+        if let Some((filename, data)) = self.bytes_queue.pop_front() {
+            self.start_loading_bytes(filename, data);
+        }
+    }
+
+    /// How many more files are queued behind the one currently
+    /// loading/loaded — `ui::header`'s "▶ Next" button reads this instead of
+    /// `file_queue`/`bytes_queue` directly so it doesn't need its own
+    /// `#[cfg]` for which queue the current target actually uses.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn queued_file_count(&self) -> usize {
+        self.file_queue.len()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn queued_file_count(&self) -> usize {
+        self.bytes_queue.len()
     }
 
     /// Opens the next (`direction > 0`) or previous (`direction < 0`)
@@ -1599,6 +1646,15 @@ impl ComicApp {
                     self.start_loading_path(first);
                 }
             }
+            #[cfg(target_arch = "wasm32")]
+            Ok(PickEvent::PickedBytes(files)) => {
+                self.pending_pick = None;
+                let mut files = files.into_iter();
+                if let Some((filename, data)) = files.next() {
+                    self.bytes_queue.extend(files);
+                    self.start_loading_bytes(filename, data);
+                }
+            }
             Ok(PickEvent::Cancelled) | Err(TryRecvError::Disconnected) => {
                 self.pending_pick = None;
             }
@@ -1611,6 +1667,7 @@ impl ComicApp {
     /// extension is silently ignored rather than surfaced as a load error;
     /// mirrors `poll_picking`/`poll_macos_open_files`'s queue-the-rest,
     /// open-the-first pattern for when more than one file lands at once.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn poll_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped.is_empty() {
@@ -1624,6 +1681,33 @@ impl ComicApp {
             self.file_queue.extend(paths);
             self.start_loading_path(first);
         }
+    }
+
+    /// The web build's counterpart to the native `poll_dropped_files` above.
+    /// A dropped file's `path()` on the web is only ever a synthetic
+    /// relative path (browsers never expose a real one — see
+    /// `egui::DroppedFile`'s docs), good enough for the extension check but
+    /// not for actually reading the file, so this reads it via the trait's
+    /// async `bytes_async()` instead and feeds the result to
+    /// `start_loading_bytes` once it resolves. Only the first supported
+    /// drop is opened — unlike native's `file_queue`, a multi-file drop's
+    /// rest are simply not queued for v1.
+    #[cfg(target_arch = "wasm32")]
+    pub fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        let Some(first) = dropped.into_iter().find(|file| crate::comic::loader::is_supported_path(file.path())) else {
+            return;
+        };
+        if self.loading {
+            return;
+        }
+        let filename = first.path().to_string_lossy().into_owned();
+        self.loading = true;
+        self.load_error = None;
+        self.load_progress = (0, 0);
+        self.load_preview = None;
+        self.preview_texture = None;
+        self.pending_load = Some(crate::comic::loader::spawn_dropped_file_load(first, filename, self.show_fore_edge));
     }
 
     /// Call once per frame: drains every background-load event queued since
@@ -1709,7 +1793,7 @@ impl ComicApp {
                     let last_page = self.current_page;
                     self.history.touch(&result.path, &self.filename, last_page, self.total_pages);
                     self.history_dirty = false;
-                    self.history_last_saved = std::time::Instant::now();
+                    self.history_last_saved = Instant::now();
                     if let Err(err) = self.history.save() {
                         tracing::warn!("Failed to save history: {err}");
                     }
@@ -1760,7 +1844,7 @@ impl ComicApp {
             tracing::warn!("Failed to save history: {err}");
         }
         self.history_dirty = false;
-        self.history_last_saved = std::time::Instant::now();
+        self.history_last_saved = Instant::now();
     }
 
     /// The warm-tint overlay color to paint over the whole window for the

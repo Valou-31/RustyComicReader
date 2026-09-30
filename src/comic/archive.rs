@@ -2,8 +2,11 @@ use crate::comic::comic_info::ComicInfo;
 use crate::comic::fore_edge;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::{Read, Seek};
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 /// An opened comic archive. Pages are kept as their original *compressed*
 /// bytes (a few hundred KB each, typically) rather than decoded pixels —
@@ -88,11 +91,13 @@ impl EdgeSample {
 /// (measured on a real 259-page volume: roughly 1s to extract, but 2s more
 /// for every page's sample to finish decoding — `load` shouldn't make
 /// opening the book wait on the second number).
+#[cfg(not(target_arch = "wasm32"))]
 struct EdgeSamplePool {
     work_tx: mpsc::Sender<(String, Vec<u8>)>,
     result_rx: mpsc::Receiver<(String, EdgeSample)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl EdgeSamplePool {
     fn spawn() -> Self {
         let (work_tx, work_rx) = mpsc::channel::<(String, Vec<u8>)>();
@@ -144,6 +149,41 @@ impl EdgeSamplePool {
     }
 }
 
+/// `wasm32` has no OS threads to sample fore-edges concurrently with
+/// extraction (see module docs on `EdgeSamplePool`'s native impl above) —
+/// this decodes each sample synchronously the moment it's submitted instead.
+/// Same public shape (`spawn`/`submit`/`finish`) so `ComicArchive::load`
+/// doesn't need a different code path per target; just blocks the extraction
+/// loop a little longer per page instead of overlapping with it.
+#[cfg(target_arch = "wasm32")]
+struct EdgeSamplePool {
+    result_tx: mpsc::Sender<(String, EdgeSample)>,
+    result_rx: mpsc::Receiver<(String, EdgeSample)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl EdgeSamplePool {
+    fn spawn() -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
+        Self { result_tx, result_rx }
+    }
+
+    fn submit(&self, name: &str, data: &[u8]) {
+        if let Ok(image) = ComicArchive::decode_image(data, Some(fore_edge::FORE_EDGE_HEIGHT as u32)) {
+            let _ = self.result_tx.send((name.to_string(), EdgeSample::from_image(&image)));
+        }
+    }
+
+    fn finish(self) -> (HashMap<String, EdgeSample>, mpsc::Receiver<(String, EdgeSample)>) {
+        drop(self.result_tx);
+        let mut samples = HashMap::new();
+        while let Ok((name, sample)) = self.result_rx.try_recv() {
+            samples.insert(name, sample);
+        }
+        (samples, self.result_rx)
+    }
+}
+
 /// Fore-edge sampling still in flight when `ComicArchive::load` returned —
 /// see `EdgeSamplePool::finish`. The caller (`ComicApp::poll_fore_edge`)
 /// polls this once per frame until it reports it's done, applying each
@@ -185,6 +225,15 @@ impl ComicArchive {
     /// `compute_fore_edge` gates the `EdgeSamplePool` above entirely — when
     /// off (the user's "book thickness" setting is disabled), no extra
     /// decoding happens at all and `fore_edge_columns` comes back empty.
+    ///
+    /// Opens `path` itself (native only — the web build has no real
+    /// filesystem, see `load_from_bytes`) and dispatches by extension;
+    /// `cbz`/`zip`/`cb7`/`7z` go through `load_reader` (generic over any
+    /// `Read + Seek`, so the exact same extraction code runs for the web
+    /// build's in-memory bytes), `cbr`/`rar` needs a real path (`unrar` has
+    /// no wasm32 target) and isn't offered there at all — see
+    /// `comic::loader::SUPPORTED_EXTENSIONS`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn load(
         path: &Path,
         compute_fore_edge: bool,
@@ -192,14 +241,60 @@ impl ComicArchive {
     ) -> Result<Self> {
         let extension = path.extension().unwrap_or_default().to_str().unwrap_or("").to_lowercase();
 
+        if matches!(extension.as_str(), "cbr" | "rar") {
+            let edge_pool = compute_fore_edge.then(EdgeSamplePool::spawn);
+            let (pages, comic_info_xml) = Self::load_rar(path, &mut on_progress, edge_pool.as_ref())?;
+            return Ok(Self::finish_load(pages, comic_info_xml, edge_pool));
+        }
+
+        let file = std::fs::File::open(path)?;
+        Self::load_reader(&extension, file, compute_fore_edge, on_progress).await
+    }
+
+    /// The web build's entry point — no real filesystem, so the caller
+    /// (`comic::loader::spawn_bytes_load`) hands over whatever bytes the
+    /// browser's file picker/drag-drop already read into memory, plus the
+    /// original filename (used only to dispatch by extension).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn load_from_bytes(
+        filename: &str,
+        data: Vec<u8>,
+        compute_fore_edge: bool,
+        on_progress: impl FnMut(usize, usize, Option<&egui::ColorImage>),
+    ) -> Result<Self> {
+        let extension = Path::new(filename).extension().unwrap_or_default().to_str().unwrap_or("").to_lowercase();
+        Self::load_reader(&extension, std::io::Cursor::new(data), compute_fore_edge, on_progress).await
+    }
+
+    /// Shared by both `load` (native, `std::fs::File`) and `load_from_bytes`
+    /// (web, `std::io::Cursor<Vec<u8>>`) for every format except RAR (native
+    /// only, since `unrar` needs a real file path rather than any reader).
+    async fn load_reader<R: Read + Seek>(
+        extension: &str,
+        reader: R,
+        compute_fore_edge: bool,
+        mut on_progress: impl FnMut(usize, usize, Option<&egui::ColorImage>),
+    ) -> Result<Self> {
         let edge_pool = compute_fore_edge.then(EdgeSamplePool::spawn);
 
-        let (pages, comic_info_xml) = match extension.as_str() {
-            "cbz" | "zip" => Self::load_zip(path, &mut on_progress, edge_pool.as_ref()).await?,
-            "cb7" | "7z" => Self::load_7z(path, &mut on_progress, edge_pool.as_ref()).await?,
-            "cbr" | "rar" => Self::load_rar(path, &mut on_progress, edge_pool.as_ref()).await?,
-            _ => anyhow::bail!("Format non supporté: {}", extension),
+        let (pages, comic_info_xml) = match extension {
+            "cbz" | "zip" => Self::load_zip(reader, &mut on_progress, edge_pool.as_ref())?,
+            "cb7" | "7z" => Self::load_7z(reader, &mut on_progress, edge_pool.as_ref())?,
+            _ => anyhow::bail!("Format non supporté: {extension}"),
         };
+
+        Ok(Self::finish_load(pages, comic_info_xml, edge_pool))
+    }
+
+    /// Parses `ComicInfo.xml` (if any), collects whatever fore-edge samples
+    /// had already finished, and sorts pages into final reading order —
+    /// the tail end shared by every loading path regardless of format or
+    /// source.
+    fn finish_load(
+        pages: Vec<(String, Vec<u8>)>,
+        comic_info_xml: Option<Vec<u8>>,
+        edge_pool: Option<EdgeSamplePool>,
+    ) -> Self {
         let comic_info = comic_info_xml.map(|bytes| ComicInfo::parse(&bytes)).filter(|info| !info.is_empty());
 
         let (edge_samples, edge_rx) = match edge_pool {
@@ -212,16 +307,15 @@ impl ComicArchive {
         let (pages, fore_edge_columns, index_by_name) = Self::sort_and_filter(pages, edge_samples, edge_rx.is_some());
         let fore_edge_tail = edge_rx.map(|result_rx| ForeEdgeTail { result_rx, index_by_name });
 
-        Ok(ComicArchive { pages, fore_edge_columns, fore_edge_tail, comic_info })
+        ComicArchive { pages, fore_edge_columns, fore_edge_tail, comic_info }
     }
 
-    async fn load_zip(
-        path: &Path,
+    fn load_zip<R: Read + Seek>(
+        reader: R,
         on_progress: &mut ProgressFn<'_>,
         edge_pool: Option<&EdgeSamplePool>,
     ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>)> {
-        let file = std::fs::File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file)?;
+        let mut archive = zip::ZipArchive::new(reader)?;
         let total = archive.file_names().filter(|n| Self::is_image_file(n)).count();
         let mut images = Vec::new();
         let mut comic_info_xml = None;
@@ -251,14 +345,18 @@ impl ComicArchive {
         Ok((images, comic_info_xml))
     }
 
-    async fn load_7z(
-        path: &Path,
+    fn load_7z<R: Read + Seek>(
+        mut reader: R,
         on_progress: &mut ProgressFn<'_>,
         edge_pool: Option<&EdgeSamplePool>,
     ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>)> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
-        let mut archive = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
+        // `SevenZReader::new` wants the stream's length up front rather than
+        // asking the reader itself — works the same for a `File` (native) or
+        // an in-memory `Cursor<Vec<u8>>` (web), so long as it's rewound
+        // afterward (seeking to the end to measure it moves the cursor).
+        let len = reader.seek(std::io::SeekFrom::End(0))?;
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        let mut archive = sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty())
             .map_err(|e| anyhow::anyhow!("Erreur lecture 7z: {e}"))?;
 
         let total = archive
@@ -296,7 +394,8 @@ impl ComicArchive {
         Ok((images, comic_info_xml))
     }
 
-    async fn load_rar(
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_rar(
         path: &Path,
         on_progress: &mut ProgressFn<'_>,
         edge_pool: Option<&EdgeSamplePool>,

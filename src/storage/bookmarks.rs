@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bookmark {
@@ -21,6 +21,7 @@ pub struct Bookmarks {
     pub entries: Vec<Bookmark>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Bookmarks {
     pub fn bookmarks_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
@@ -45,7 +46,22 @@ impl Bookmarks {
         std::fs::write(path, content)?;
         Ok(())
     }
+}
 
+/// No real filesystem on the web build — bookmarks stay in memory for the
+/// current session only (see `storage::history`'s equivalent note).
+#[cfg(target_arch = "wasm32")]
+impl Bookmarks {
+    pub fn load() -> Result<Self> {
+        Ok(Self::default())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Bookmarks {
     /// Whether `path` has a bookmark at exactly `page`.
     pub fn contains(&self, path: &Path, page: usize) -> bool {
         self.entries.iter().any(|b| b.path == path && b.page == page)

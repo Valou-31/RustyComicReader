@@ -1,7 +1,10 @@
 use crate::comic::archive::ComicArchive;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, channel};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 
 /// Longest side, in pixels, of the cheap whole-book preview `ComicApp::
 /// warm_thumbnail_cache` decodes for every page up front — small enough
@@ -17,7 +20,7 @@ pub const HIGH_RES_MAX_DIMENSION: u32 = 400;
 
 /// Which of the two preview qualities a request/result is for — see the
 /// module docs on `LOW_RES_MAX_DIMENSION`/`HIGH_RES_MAX_DIMENSION`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThumbnailTier {
     Low,
     High,
@@ -43,6 +46,7 @@ pub struct DecodedThumbnail {
     pub image: egui::ColorImage,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Shared {
     queue: Mutex<VecDeque<ThumbnailRequest>>,
     work_available: Condvar,
@@ -57,11 +61,13 @@ struct Shared {
 /// fills in around the edges without ever delaying a page someone's
 /// actually looking at. A page can be queued at both tiers at once (they're
 /// different requests, matched on `(page_idx, tier)`, not just `page_idx`).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct ThumbnailQueue {
     shared: Arc<Shared>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ThumbnailQueue {
     /// Moves `request` to the front of the queue, dropping any existing
     /// queued entry for the same page *and tier* first so it isn't left
@@ -102,6 +108,7 @@ impl ThumbnailQueue {
 /// off the UI thread — so showing a preview never blocks a frame on
 /// decoding a full-resolution scanned page, which is what made the
 /// original synchronous-on-hover version feel sluggish.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_thumbnail_worker() -> (ThumbnailQueue, Receiver<DecodedThumbnail>) {
     let shared = Arc::new(Shared { queue: Mutex::new(VecDeque::new()), work_available: Condvar::new() });
     let worker_shared = Arc::clone(&shared);
@@ -131,4 +138,63 @@ pub fn spawn_thumbnail_worker() -> (ThumbnailQueue, Receiver<DecodedThumbnail>) 
     });
 
     (ThumbnailQueue { shared }, result_rx)
+}
+
+/// The web build's counterpart to the native worker above — see
+/// `comic::prefetch`'s wasm32 twin for why (no OS threads on `wasm32`) and
+/// its dedup approach (`done`, keyed here on `(page_idx, tier)` since a page
+/// can be queued at both quality tiers independently). Both `prioritize` and
+/// `extend_low_priority` decode synchronously, inline, rather than actually
+/// queueing — a whole-book `extend_low_priority` preload call will therefore
+/// block the tab for however long the whole book takes to decode at
+/// low-res, a known v1 trade-off (see `comic::prefetch`'s docs).
+#[cfg(target_arch = "wasm32")]
+struct Shared {
+    done: Mutex<std::collections::HashSet<(usize, ThumbnailTier)>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct ThumbnailQueue {
+    shared: Arc<Shared>,
+    result_tx: std::sync::mpsc::Sender<DecodedThumbnail>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ThumbnailQueue {
+    fn decode_and_send(&self, request: ThumbnailRequest, done: &mut std::collections::HashSet<(usize, ThumbnailTier)>) {
+        if !done.insert((request.page_idx, request.tier)) {
+            return;
+        }
+        if let Ok(image) = ComicArchive::decode_image(&request.data, Some(request.max_dimension)) {
+            let result = DecodedThumbnail { generation: request.generation, page_idx: request.page_idx, tier: request.tier, image };
+            let _ = self.result_tx.send(result);
+        }
+    }
+
+    pub fn prioritize(&self, request: ThumbnailRequest) {
+        let mut done = self.shared.done.lock().unwrap();
+        // A re-hover after already seeing this page/tier should still show
+        // it again immediately rather than silently no-op — forget it first.
+        done.remove(&(request.page_idx, request.tier));
+        self.decode_and_send(request, &mut done);
+    }
+
+    pub fn extend_low_priority(&self, requests: Vec<ThumbnailRequest>) {
+        let mut done = self.shared.done.lock().unwrap();
+        for request in requests {
+            self.decode_and_send(request, &mut done);
+        }
+    }
+
+    pub fn clear(&self) {
+        self.shared.done.lock().unwrap().clear();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_thumbnail_worker() -> (ThumbnailQueue, Receiver<DecodedThumbnail>) {
+    let shared = Arc::new(Shared { done: Mutex::new(std::collections::HashSet::new()) });
+    let (result_tx, result_rx) = channel::<DecodedThumbnail>();
+    (ThumbnailQueue { shared, result_tx }, result_rx)
 }

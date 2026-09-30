@@ -36,19 +36,30 @@ pub enum LoadEvent {
     Failed(String),
 }
 
-/// Sent once the native file dialog closes.
+/// Sent once the file dialog closes.
 pub enum PickEvent {
     Picked(Vec<PathBuf>),
+    /// The web build's counterpart to `Picked` — no real filesystem, so the
+    /// browser hands back each file's bytes directly instead of a path.
+    #[cfg(target_arch = "wasm32")]
+    PickedBytes(Vec<(String, Vec<u8>)>),
     Cancelled,
 }
 
+/// RAR/CBR is native-only — `unrar` wraps a real C library with no wasm32
+/// target (see `comic::archive::ComicArchive::load_rar`) — so the web build
+/// simply never offers it, in the picker's filter or anywhere else that
+/// checks `is_supported_path`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbr", "zip", "7z", "rar"];
+#[cfg(target_arch = "wasm32")]
+pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["cbz", "cb7", "zip", "7z"];
 
 /// Whether `path`'s extension is one `ComicArchive::load` can actually open —
 /// shared by every non-file-picker way a path reaches the app (CLI args,
 /// macOS Open-With/Dock-drop events, a window drag-and-drop) so they all
 /// agree on what counts as "a comic archive" without duplicating the check.
-pub(crate) fn is_supported_path(path: &Path) -> bool {
+pub fn is_supported_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
@@ -80,6 +91,7 @@ pub(crate) fn sibling_archive(path: &Path, direction: i32) -> Option<PathBuf> {
 /// Opens a native file picker (multi-select) on a background thread, so the
 /// (possibly slow) dialog doesn't block the UI. Sends `Cancelled` if the user
 /// closes it without picking anything.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_file_picker() -> Receiver<PickEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -98,6 +110,36 @@ pub fn spawn_file_picker() -> Receiver<PickEvent> {
     rx
 }
 
+/// The web build's counterpart to `spawn_file_picker` — no OS thread (wasm32
+/// has none), just a browser-native async file picker driven on the local
+/// task queue, reading each picked file's bytes directly since there's no
+/// path to hand back.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_file_picker() -> Receiver<PickEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let handles = rfd::AsyncFileDialog::new()
+            .add_filter("Comic archives", SUPPORTED_EXTENSIONS)
+            .pick_files()
+            .await;
+
+        let event = match handles {
+            Some(handles) if !handles.is_empty() => {
+                let mut files = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    files.push((handle.file_name(), handle.read().await));
+                }
+                PickEvent::PickedBytes(files)
+            }
+            _ => PickEvent::Cancelled,
+        };
+        let _ = tx.send(event);
+    });
+
+    rx
+}
+
 /// Decodes the archive at `path` on a background thread. Used both after the
 /// file picker returns a path and whenever a path is already known (reading
 /// history, the multi-file queue, resuming last session, CLI arguments).
@@ -106,6 +148,7 @@ pub fn spawn_file_picker() -> Receiver<PickEvent> {
 /// fore-edge sampling `ComicArchive::load` does concurrently with
 /// extraction — when `false`, no extra decoding happens and
 /// `LoadResult::fore_edge_columns` comes back empty.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_file_load(path: PathBuf, compute_fore_edge: bool) -> Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -123,6 +166,102 @@ pub fn spawn_file_load(path: PathBuf, compute_fore_edge: bool) -> Receiver<LoadE
         let event = match pollster::block_on(ComicArchive::load(&path, compute_fore_edge, on_progress)) {
             Ok(archive) => LoadEvent::Finished(LoadResult {
                 path,
+                filename,
+                pages: archive.pages,
+                comic_info: archive.comic_info,
+                fore_edge_columns: archive.fore_edge_columns,
+                fore_edge_tail: archive.fore_edge_tail,
+            }),
+            Err(err) => LoadEvent::Failed(err.to_string()),
+        };
+        let _ = tx.send(event);
+    });
+
+    rx
+}
+
+/// There's no real filesystem on the web build, so a bare `PathBuf` never
+/// refers to an actual file there — this only exists so `ComicApp::
+/// start_loading_path` (used by CLI-opened files, the native picker/drop,
+/// and reopening a history/bookmark entry, none of which are reachable on
+/// web in practice: history/bookmarks aren't persisted and the web build's
+/// own picker/drop paths go through `spawn_bytes_load`/`spawn_dropped_file_load`
+/// instead) still compiles for both targets without every one of those call
+/// sites needing its own `#[cfg]`. Reports a clear failure instead of
+/// silently hanging.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_file_load(_path: PathBuf, _compute_fore_edge: bool) -> Receiver<LoadEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(LoadEvent::Failed("Opening a file by path isn't supported in the browser version".to_string()));
+    rx
+}
+
+/// The web build's counterpart to `spawn_file_load` for a drag-and-drop
+/// (as opposed to the file picker, which already gets bytes synchronously
+/// via `rfd`'s `FileHandle::read`) — `egui::DroppedFile::path()` on the web
+/// is only a synthetic relative filename, never a real filesystem path, so
+/// the actual bytes have to come from the trait's async `bytes_async()`
+/// instead.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_dropped_file_load(
+    file: egui::DroppedFileHandle,
+    filename: String,
+    compute_fore_edge: bool,
+) -> Receiver<LoadEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let data = match file.bytes_async().await {
+            Ok(data) => data,
+            Err(err) => {
+                let _ = tx.send(LoadEvent::Failed(err));
+                return;
+            }
+        };
+
+        let progress_tx = tx.clone();
+        let on_progress = move |loaded: usize, total: usize, preview: Option<&egui::ColorImage>| {
+            let _ = progress_tx.send(LoadEvent::Progress { loaded, total, first_page: preview.cloned() });
+        };
+
+        let event = match ComicArchive::load_from_bytes(&filename, data, compute_fore_edge, on_progress).await {
+            Ok(archive) => LoadEvent::Finished(LoadResult {
+                path: PathBuf::from(&filename),
+                filename,
+                pages: archive.pages,
+                comic_info: archive.comic_info,
+                fore_edge_columns: archive.fore_edge_columns,
+                fore_edge_tail: archive.fore_edge_tail,
+            }),
+            Err(err) => LoadEvent::Failed(err.to_string()),
+        };
+        let _ = tx.send(event);
+    });
+
+    rx
+}
+
+/// The web build's counterpart to `spawn_file_load` — there's no filesystem
+/// path to decode from, so this takes bytes already read into memory (by the
+/// file picker above or a drag-and-drop) and decodes them on the browser's
+/// local task queue instead of an OS thread. `LoadResult::path` gets a
+/// synthetic path built from `filename` alone: every native consumer of it
+/// (history/bookmarks keying, `sibling_archive`'s directory listing) either
+/// no-ops on web already (see `storage::*`) or degrades gracefully for a
+/// bare filename with no real parent directory.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_bytes_load(filename: String, data: Vec<u8>, compute_fore_edge: bool) -> Receiver<LoadEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let progress_tx = tx.clone();
+        let on_progress = move |loaded: usize, total: usize, preview: Option<&egui::ColorImage>| {
+            let _ = progress_tx.send(LoadEvent::Progress { loaded, total, first_page: preview.cloned() });
+        };
+
+        let event = match ComicArchive::load_from_bytes(&filename, data, compute_fore_edge, on_progress).await {
+            Ok(archive) => LoadEvent::Finished(LoadResult {
+                path: PathBuf::from(&filename),
                 filename,
                 pages: archive.pages,
                 comic_info: archive.comic_info,

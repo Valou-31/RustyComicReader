@@ -355,7 +355,7 @@ pub fn draw_settings(ctx: &Context, app: &mut ComicApp) {
                 ui.label("Spine color");
                 if ui.color_edit_button_srgb(&mut app.layout.spine_color).changed() {
                     layout_changed = true;
-                    app.spine_color_pending_since = Some(std::time::Instant::now());
+                    app.spine_color_pending_since = Some(web_time::Instant::now());
                 }
                 if !app.layout.spine_color_history.is_empty() {
                     ui.label("Recent:");

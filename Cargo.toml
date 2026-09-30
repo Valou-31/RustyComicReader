@@ -3,32 +3,75 @@ name = "rusty_comic_reader"
 version = "0.1.19"
 edition = "2024"
 
+# Named differently from the package/bin target: both would otherwise
+# produce an identically-named `rusty_comic_reader.wasm` artifact for the
+# wasm32 build, which `trunk` can't tell apart (see `index.html`'s
+# `data-target-name`, which picks this one explicitly).
+[lib]
+name = "rusty_comic_reader_lib"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 alphanumeric-sort = "1.5.8"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 eframe = "0.36.1"
 egui = "0.36.1"
-egui-winit = "0.36.1"
 egui_extras = "0.36.1"
 flate2 = "1.1.10"
 image = "0.25.10"
 pollster = "1.0.1"
 quick-xml = "0.41.0"
 rfd = "0.17.2"
-self-replace = "1.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sevenz-rust = "0.6.1"
 tar = "0.4.46"
 thiserror = "2.0.20"
-tokio = "1.53.1"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+# `std::time::{Instant, SystemTime}::now()` panic outright on
+# `wasm32-unknown-unknown` (no clock source without going through JS) —
+# `web-time` is a complete drop-in replacement (same types, re-exports
+# `std::time` verbatim on every other target) backed by `Performance.now()`/
+# `Date.now()` there instead. Used everywhere in place of `std::time` so the
+# same code works on both targets without any `#[cfg]`.
+web-time = "1.1.0"
+
+# Native-only: `unrar`/`self-replace`/`ureq` have no wasm32 target (RAR
+# support and the GitHub-release self-updater are both desktop-only
+# features — see `comic::archive::load_rar` and `update.rs`). `tokio` and
+# `walkdir` aren't referenced anywhere in `src/` either; kept native-only
+# rather than risking their default features against wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+self-replace = "1.5.0"
+tokio = "1.53.1"
 unrar = "0.5.8"
 ureq = "3.4.2"
 walkdir = "2.5.0"
 zip = "8.6.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["Document", "Element", "HtmlCanvasElement", "Window"]
+
+# Same crate/version as native, but without the `zstd` feature: `zstd-sys`
+# compiles libzstd as C via `cc`, which links fine for a `cargo check` but
+# fails at actual link time on `wasm32-unknown-unknown` with undefined
+# `ZSTD_*` symbols — there's no wasm32 object for it to link against. A
+# zstd-compressed CBZ/ZIP is vanishingly rare (plain DEFLATE or stored is
+# what real-world comic archives use), so dropping it for the web build only
+# is a safe trade. Every other default feature (deflate, bzip2, lzma/xz,
+# ppmd, aes-crypto) is pure Rust or otherwise links fine and stays enabled.
+[target.'cfg(target_arch = "wasm32")'.dependencies.zip]
+version = "8.6.0"
+default-features = false
+features = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "ppmd", "time", "xz"]
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

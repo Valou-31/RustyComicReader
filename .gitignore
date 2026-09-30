@@ -1,2 +1,4 @@
 /target
 /missing.md
+/dist
+.DS_Store

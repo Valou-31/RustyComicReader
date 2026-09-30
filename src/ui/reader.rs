@@ -549,7 +549,7 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
                     direction,
                     from_overscroll: overscroll,
                     from_hold_progress: (held_for / WEBTOON_EDGE_HOLD_DURATION_SECONDS).clamp(0.0, 1.0),
-                    started: std::time::Instant::now(),
+                    started: web_time::Instant::now(),
                 });
             }
             if haptics.crossed_min_overscroll {

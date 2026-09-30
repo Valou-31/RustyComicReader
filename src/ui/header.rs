@@ -118,7 +118,8 @@ pub(crate) fn draw_toolbar_item(ui: &mut Ui, app: &mut ComicApp, item: ToolbarIt
             }
         }
         ToolbarItem::NextInQueue => {
-            if !app.file_queue.is_empty() && ui.button(format!("▶ Next ({})", app.file_queue.len())).clicked() {
+            let queued = app.queued_file_count();
+            if queued > 0 && ui.button(format!("▶ Next ({queued})")).clicked() {
                 app.open_next_in_queue();
             }
         }
