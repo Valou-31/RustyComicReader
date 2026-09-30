@@ -13,9 +13,9 @@ pub enum Action {
     WebtoonScrollDown,
     /// Opens the next sibling archive in the current file's own folder —
     /// see `ComicApp::open_sibling_volume`. The keyboard counterpart of
-    /// Webtoon's swipe-past-the-bottom gesture (`ui::reader::WebtoonEdgeDrag`),
+    /// Webtoon's hold-past-the-bottom gesture (`ui::reader::WebtoonEdgeHold`),
     /// but not itself Webtoon-specific: a no-op if there's no book open or
-    /// no next file in the folder, same as the swipe.
+    /// no next file in the folder, same as the hold.
     NextVolume,
 }
 

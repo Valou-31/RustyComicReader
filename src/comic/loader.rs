@@ -44,32 +44,6 @@ pub enum PickEvent {
 
 pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbr", "zip", "7z", "rar"];
 
-/// Cap on `spawn_sibling_preview`'s decode — big enough to look sharp
-/// filling the Webtoon strip's width during the overscroll-to-next-chapter
-/// transition (see `ui::reader::draw_webtoon`), far short of a full
-/// `decode_page_slices`-quality decode, since it's discarded the moment the
-/// real book finishes loading.
-pub(crate) const SIBLING_PREVIEW_MAX_DIMENSION: u32 = 1200;
-
-/// Spawns a one-shot background decode of `path`'s very first page (see
-/// `ComicArchive::peek_first_page`) — used to preview the next/previous
-/// sibling volume during `ui::reader::draw_webtoon`'s overscroll gesture,
-/// without running the whole `spawn_file_load` pipeline on a book the user
-/// might not even end up opening. Sends `None` on any failure (missing/
-/// corrupt file, no image entries) rather than surfacing an error — a
-/// missing preview just means the transition animation has nothing to show
-/// yet, not that anything is actually broken.
-pub fn spawn_sibling_preview(path: PathBuf) -> Receiver<Option<egui::ColorImage>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let image = ComicArchive::peek_first_page(&path)
-            .ok()
-            .and_then(|data| ComicArchive::decode_image(&data, Some(SIBLING_PREVIEW_MAX_DIMENSION)).ok());
-        let _ = tx.send(image);
-    });
-    rx
-}
-
 /// Whether `path`'s extension is one `ComicArchive::load` can actually open —
 /// shared by every non-file-picker way a path reaches the app (CLI args,
 /// macOS Open-With/Dock-drop events, a window drag-and-drop) so they all

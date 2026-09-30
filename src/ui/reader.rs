@@ -1,9 +1,10 @@
 use crate::app::{
-    ComicApp, PageZoom, ReadingMode, SiblingPreviewState, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, WebtoonEdgeDrag,
-    ZOOM_MAX, ZOOM_MIN, ZoomTarget,
+    ComicApp, PageZoom, ReadingMode, UI_HIDE_DELAY, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, WebtoonEdgeHold, ZOOM_MAX,
+    ZOOM_MIN, ZoomTarget,
 };
 use crate::comic::archive::{ComicArchive, PageMeta};
-use egui::{Align, Align2, Color32, Event, Pos2, Rect, Stroke, TextureHandle, TextureOptions, TouchPhase, Ui, Vec2};
+use crate::ui::theme::Theme;
+use egui::{Align, Color32, Event, Pos2, Rect, Stroke, TextureHandle, TextureOptions, TouchPhase, Ui, Vec2};
 use std::collections::HashMap;
 
 /// How many pages beyond the currently displayed spread keep their decoded
@@ -121,42 +122,41 @@ const WEBTOON_DEFAULT_ASPECT: f32 = 0.7;
 /// started well before it scrolls into view.
 const WEBTOON_PRELOAD_MARGIN: f32 = 2000.0;
 
-/// Raw (physical-points, unscaled by zoom/`webtoon_wheel_sensitivity`) drag
-/// distance past the edge of the strip that maps to a full `0.0..=1.0`
-/// `WebtoonEdgeDrag::progress` — the vertical counterpart of
-/// `input::scroll::DRAG_FULL_DISTANCE` (`220.0`), and now close to it: this
-/// still changes which *book* is open, not just the page, but with
-/// `TouchPhase` already gating *when* a drag can even start (see
-/// `WebtoonEdgeDrag`'s docs — a momentum tail past the edge can never start
-/// one), there's no longer a reason for the distance itself to also carry
-/// that "make sure this was deliberate" job. (An earlier `1200.0`-plus-decay
-/// needed the size specifically to outrun momentum on its own; a follow-up
-/// `400.0`, once `TouchPhase` gating existed, still read as needing more
-/// force than a normal page turn for no real reason.)
-const WEBTOON_EDGE_DRAG_FULL_DISTANCE: f32 = 260.0;
+/// Physical-points cap (unscaled by zoom/`webtoon_wheel_sensitivity`) on how
+/// far the Webtoon strip rubber-bands past its own top/bottom edge — see
+/// `WebtoonEdgeHold::overscroll`. Deliberately small: this is a "push and
+/// wait" gesture, not a "drag it all the way" one (see
+/// `WEBTOON_EDGE_HOLD_DURATION_SECONDS`), so how far the strip physically
+/// moves only needs to read as "yes, you're past the edge and something is
+/// listening", not to carry any of the "make sure this was deliberate" job
+/// itself.
+const WEBTOON_EDGE_HOLD_OVERSCROLL_MAX: f32 = 56.0;
 
-/// `WebtoonEdgeDrag::progress` fraction that commits at release if the
-/// gesture wasn't fast enough to count as a fling (see
-/// `WEBTOON_EDGE_DRAG_FLING_VELOCITY`) — same role and value as
-/// `ComicApp::end_page_drag`'s own `COMMIT_THRESHOLD`.
-const WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD: f32 = 0.5;
+/// Seconds a fresh push past the strip's edge has to keep pushing or sit
+/// still (see `WEBTOON_EDGE_HOLD_STILL_EPSILON`) before letting go commits
+/// to opening the sibling volume — see `WebtoonEdgeHold::held_for`. Short
+/// enough to feel immediate once the reader has committed to the gesture,
+/// long enough that grazing the edge in passing (and easing back off it
+/// again right away) never arms it by accident.
+const WEBTOON_EDGE_HOLD_DURATION_SECONDS: f32 = 1.0;
 
-/// `WebtoonEdgeDrag::velocity` (progress-units/second) fast enough at
-/// release to commit regardless of how little of `WEBTOON_EDGE_DRAG_FULL_DISTANCE`
-/// was actually covered — a quick, sharp push reads as just as deliberate
-/// as a slow, full one. Same value and reasoning as `ComicApp::end_page_drag`'s
-/// `FLING_VELOCITY`: comfortably above a slow full push (~1.0/s), below an
-/// actual quick flick (~5+/s).
-const WEBTOON_EDGE_DRAG_FLING_VELOCITY: f32 = 3.0;
+/// Raw per-frame drag magnitude (physical points, same units as
+/// `webtoon_edge_hold_step`'s `raw_delta`) a frame's movement, in either
+/// direction, has to exceed to count as real movement rather than ordinary
+/// trackpad jitter around otherwise-still fingers. Below this, a frame
+/// counts as "held still" toward `WEBTOON_EDGE_HOLD_DURATION_SECONDS`;
+/// above it (push or pull alike) resets that countdown to `0.0` — see
+/// `webtoon_edge_hold_step`'s docs for why even a continued push has to
+/// reset it, not just a pull-back.
+const WEBTOON_EDGE_HOLD_STILL_EPSILON: f32 = 1.0;
 
-/// How fast (in progress-units/second) a released-but-not-committed
-/// `WebtoonEdgeDrag` settles its `progress` back to `0.0` — purely a
-/// visual "let go and it springs back" cue; unlike the old
-/// accumulator-based decay, this never runs while the gesture is still
-/// live (see `WebtoonEdgeDrag`'s docs), so it can never eat into progress
-/// the reader is actively building. Fast enough that letting go reads as an
-/// immediate cancel rather than a lingering, ambiguous fade.
-const WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND: f32 = 3.5;
+/// `WebtoonEdgeHold::overscroll` fraction (`0.0..=1.0`, of
+/// `WEBTOON_EDGE_HOLD_OVERSCROLL_MAX`) a push has to reach before
+/// `WEBTOON_EDGE_HOLD_DURATION_SECONDS`'s countdown starts advancing at
+/// all — a minimum push distance separate from the countdown itself, so
+/// barely grazing the edge doesn't immediately start counting down a
+/// volume change.
+const WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT: f32 = 0.8;
 
 /// One page's height in document units, from its known aspect ratio (once
 /// decoded, via `ComicApp::webtoon_aspect`) or `WEBTOON_DEFAULT_ASPECT`
@@ -230,110 +230,152 @@ fn webtoon_visible_range(
     (keep_range, current_page)
 }
 
+/// Transient one-frame signals from `webtoon_edge_hold_step` for
+/// `draw_webtoon` to fire a haptic tap from (see `platform::haptics`) —
+/// `true` only on the exact frame each crossing happens, never on
+/// subsequent frames while the condition merely continues to hold. Same
+/// "pure function reports what happened; the caller does the actual
+/// side-effecting thing" split `commit` already uses for opening the
+/// sibling volume — a pure function can't reach out to the trackpad's
+/// Taptic Engine any more than it can touch the filesystem.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct WebtoonEdgeHoldHaptics {
+    /// `overscroll` just crossed `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT`
+    /// from below — the countdown just started actually counting.
+    crossed_min_overscroll: bool,
+    /// `held_for` just crossed `WEBTOON_EDGE_HOLD_DURATION_SECONDS` from
+    /// below — the hold just armed.
+    just_armed: bool,
+}
+
 /// One frame's worth of `draw_webtoon`'s wheel-scroll handling against the
 /// Webtoon strip's own top/bottom edges, pulled out into a pure function so
-/// it's testable without an `egui::Context` — the vertical, edge-gated
-/// counterpart of `ComicApp::drag_page_by`/`end_page_drag`. Reconciles the
-/// current scroll position and any live `WebtoonEdgeDrag` against a new
-/// wheel delta and this frame's gesture-phase signals, and returns the
-/// updated `(scroll, edge_drag, commit)` — `commit` is `Some(direction)` on
-/// the exact frame a drag resolves to opening the sibling volume that way;
-/// the caller still has to actually do that (a pure function can't touch
-/// the filesystem).
+/// it's testable without an `egui::Context`. Reconciles the current scroll
+/// position and any live `WebtoonEdgeHold` against a new wheel delta and
+/// this frame's gesture-phase signals, and returns the updated
+/// `(scroll, edge_hold, commit, haptics)` — `commit` is `Some(direction)` on
+/// the exact frame a hold resolves to opening the sibling volume that way,
+/// and `haptics` is `WebtoonEdgeHoldHaptics`; the caller still has to
+/// actually do either (a pure function can't touch the filesystem or the
+/// trackpad).
 ///
 /// `raw_delta` and `doc_delta` carry the same delta in two different units
-/// — `raw_delta` in physical points (what `WebtoonEdgeDrag::progress` is
-/// measured against, so the drag means the same physical gesture regardless
-/// of zoom/window size, same reasoning `input::scroll::DRAG_FULL_DISTANCE`
-/// uses) and `doc_delta` in the document units `scroll` itself is kept in
-/// (see `WEBTOON_DOC_WIDTH`) — with the same sign. `scroll` is returned
-/// *not yet* clamped to `[0, max_scroll]`; the caller still does that.
+/// — `raw_delta` in physical points (what `WebtoonEdgeHold::overscroll` and
+/// `WEBTOON_EDGE_HOLD_STILL_EPSILON` are measured against, so the gesture
+/// means the same physical push regardless of zoom/window size) and
+/// `doc_delta` in the document units `scroll` itself is kept in (see
+/// `WEBTOON_DOC_WIDTH`) — with the same sign. `scroll` is returned *not yet*
+/// clamped to `[0, max_scroll]`; the caller still does that.
 ///
-/// `gesture_started`/`gesture_ended` come from this frame's raw
-/// `Event::MouseWheel` phases (`TouchPhase::Start`/`End`/`Cancel`), same
-/// signal `input::scroll::handle_scroll` uses for the paginated swipe. A
-/// drag can only ever *start* on a frame where `gesture_started` is true
-/// and the strip is already sitting at that edge — never from the tail end
-/// of whatever gesture carried it there (still `Move`-phase events, no new
-/// `Start`) — see `WebtoonEdgeDrag`'s docs for why that matters. Once
-/// started, it holds `progress` in place while merely held still (no
-/// decay), and only resolves — commit or release-and-settle — on the frame
-/// `gesture_ended` fires.
-#[allow(clippy::too_many_arguments)] // each parameter is independently meaningful frame state; see the docs above
-fn webtoon_edge_drag_step(
+/// `gesture_ended` comes from this frame's raw `Event::MouseWheel` phases
+/// (`TouchPhase::End`/`Cancel`), same signal `input::scroll::handle_scroll`
+/// uses for the paginated swipe.
+///
+/// A hold starts the moment the strip is already sitting at an edge and
+/// still being pushed against — not gated on `TouchPhase::Start`. That gate
+/// existed once (to keep a fast flick's momentum from spawning a hold after
+/// the reader's fingers had already left the trackpad), got relaxed, came
+/// back when momentum turned out to still be a problem, and is gone again:
+/// logged, real-world event traces showed `Start`/`End` firing many times a
+/// second — sometimes both in the same frame — throughout one continuous,
+/// uninterrupted physical scroll, not just at actual touch-down/lift. On
+/// this event stream they're not "is this gesture fresh" at all, just
+/// "here's a new batch of deltas" — gating on them blocked the large
+/// majority of genuine, active pushes at the edge (only the ones that
+/// happened to land on a `Start`-flagged frame ever got through) without
+/// actually keeping momentum out.
+///
+/// What *does* keep momentum out: only a frame within
+/// `WEBTOON_EDGE_HOLD_STILL_EPSILON` of no movement at all — including a
+/// frame with no wheel event whatsoever, since the caller keeps invoking
+/// this every frame a hold exists regardless of whether there was a new
+/// event — counts toward `WEBTOON_EDGE_HOLD_DURATION_SECONDS`, and only
+/// once `overscroll` has already crossed
+/// `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT` too. Any real movement,
+/// *either* direction, resets the count back to `0.0` — a flick's momentum
+/// keeps generating real per-frame movement for essentially all of its
+/// decay, so it can only start building `held_for` in whatever sliver of
+/// stillness comes right before its own `gesture_ended` follows; pulling
+/// back far enough to zero out `overscroll` drops the hold entirely and
+/// hands control back to normal scrolling. It only resolves on the frame
+/// `gesture_ended` fires: armed (`held_for` already past the duration)
+/// commits; otherwise the hold is dropped outright, with no rebound or
+/// settle animation — that motion belongs to this gesture alone, and a
+/// reader who let go without arming it gets an immediate, plain cancel.
+fn webtoon_edge_hold_step(
     scroll: f32,
     max_scroll: f32,
     raw_delta: f32,
     doc_delta: f32,
     dt: f32,
-    gesture_started: bool,
     gesture_ended: bool,
-    edge_drag: Option<WebtoonEdgeDrag>,
-) -> (f32, Option<WebtoonEdgeDrag>, Option<i32>) {
-    const VELOCITY_SMOOTHING: f32 = 0.3;
+    edge_hold: Option<WebtoonEdgeHold>,
+) -> (f32, Option<WebtoonEdgeHold>, Option<i32>, WebtoonEdgeHoldHaptics) {
+    let no_haptics = WebtoonEdgeHoldHaptics::default();
 
-    if let Some(mut drag) = edge_drag {
-        if !drag.dragging {
-            // Released without committing: ignore any further input and
-            // just settle back to rest, same as a bounced-back page-turn
-            // drag settling toward `target: 0.0`.
-            drag.progress = (drag.progress - WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND * dt).max(0.0);
-            return if drag.progress <= 0.0 { (scroll + doc_delta, None, None) } else { (scroll, Some(drag), None) };
-        }
-
+    if let Some(mut hold) = edge_hold {
         if gesture_ended {
-            // `drag.velocity` is already in progress-space (see `signed`
-            // below), where positive always means "still pushing further
-            // past this edge" regardless of which edge `direction` is —
-            // no second multiply by `direction` needed (or correct: doing
-            // so would flip the sign right back for the top edge's `-1`).
-            let commit = if drag.velocity.abs() >= WEBTOON_EDGE_DRAG_FLING_VELOCITY {
-                drag.velocity > 0.0
+            let commit = hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS;
+            return if commit {
+                (scroll, None, Some(hold.direction), no_haptics)
             } else {
-                drag.progress >= WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD
+                (scroll, None, None, no_haptics)
             };
-            if commit {
-                return (scroll, None, Some(drag.direction));
-            }
-            drag.dragging = false;
-            return (scroll, Some(drag), None);
         }
 
         // Still live: `signed` is this frame's push further past the edge
-        // (positive) or back toward it (negative), along the drag's own
-        // direction — symmetric with `ComicApp::drag_page_by`, which lets a
-        // partial page-turn drag reduce its own progress the same way.
-        let signed = raw_delta * drag.direction as f32;
-        let delta_progress = signed / WEBTOON_EDGE_DRAG_FULL_DISTANCE;
-        if dt > 0.0 {
-            let sample = delta_progress / dt;
-            drag.velocity += (sample - drag.velocity) * VELOCITY_SMOOTHING;
+        // (positive) or back toward it (negative), along the hold's own
+        // direction.
+        let signed = raw_delta * hold.direction as f32;
+        if signed.abs() > WEBTOON_EDGE_HOLD_STILL_EPSILON {
+            // Real movement, either direction, resets the countdown — see
+            // the docs above for why momentum needs this, not just a
+            // pull-back, to be excluded. `overscroll` itself still tracks
+            // the push/pull normally.
+            hold.held_for = 0.0;
+            let was_counting = hold.overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT;
+            let delta_overscroll = signed / WEBTOON_EDGE_HOLD_OVERSCROLL_MAX;
+            let new_overscroll = hold.overscroll + delta_overscroll;
+            if signed < 0.0 && new_overscroll <= 0.0 {
+                // Pulled all the way back out of the edge before ever
+                // releasing — the gesture is still live, so just hand
+                // control back to normal scrolling instead of treating this
+                // like a release.
+                return (scroll + doc_delta, None, None, no_haptics);
+            }
+            hold.overscroll = new_overscroll.clamp(0.0, 1.0);
+            let now_counting = hold.overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT;
+            let haptics = WebtoonEdgeHoldHaptics { crossed_min_overscroll: now_counting && !was_counting, just_armed: false };
+            return (scroll, Some(hold), None, haptics);
         }
-        let new_progress = drag.progress + delta_progress;
-        if delta_progress < 0.0 && new_progress <= 0.0 {
-            // Pulled all the way back out of the edge before ever
-            // releasing — the gesture is still live, so just hand control
-            // back to normal scrolling instead of treating this like a
-            // release. Gated on `delta_progress < 0.0` (actually pulling
-            // back this frame), not just `new_progress <= 0.0` on its own —
-            // a drag that starts at `0.0` and is simply held still for a
-            // frame (zero delta) must not be mistaken for having already
-            // been pulled back out.
-            return (scroll + doc_delta, None, None);
+
+        // Essentially no movement this frame — keep counting toward arming
+        // (once already past the minimum push), but leave `overscroll`
+        // untouched.
+        let was_armed = hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS;
+        if hold.overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT {
+            hold.held_for += dt;
         }
-        drag.progress = new_progress.clamp(0.0, 1.0);
-        return (scroll, Some(drag), None);
+        let haptics =
+            WebtoonEdgeHoldHaptics { crossed_min_overscroll: false, just_armed: !was_armed && hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS };
+        return (scroll, Some(hold), None, haptics);
     }
 
     let at_bottom = scroll >= max_scroll;
     let at_top = scroll <= 0.0;
-    if gesture_started && at_bottom && raw_delta > 0.0 {
-        return (scroll, Some(WebtoonEdgeDrag { direction: 1, progress: 0.0, velocity: 0.0, dragging: true }), None);
+    if at_bottom && raw_delta > 0.0 {
+        let overscroll = (raw_delta / WEBTOON_EDGE_HOLD_OVERSCROLL_MAX).clamp(0.0, 1.0);
+        let haptics =
+            WebtoonEdgeHoldHaptics { crossed_min_overscroll: overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT, just_armed: false };
+        return (scroll, Some(WebtoonEdgeHold { direction: 1, overscroll, held_for: 0.0 }), None, haptics);
     }
-    if gesture_started && at_top && raw_delta < 0.0 {
-        return (scroll, Some(WebtoonEdgeDrag { direction: -1, progress: 0.0, velocity: 0.0, dragging: true }), None);
+    if at_top && raw_delta < 0.0 {
+        let overscroll = (raw_delta.abs() / WEBTOON_EDGE_HOLD_OVERSCROLL_MAX).clamp(0.0, 1.0);
+        let haptics =
+            WebtoonEdgeHoldHaptics { crossed_min_overscroll: overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT, just_armed: false };
+        return (scroll, Some(WebtoonEdgeHold { direction: -1, overscroll, held_for: 0.0 }), None, haptics);
     }
-    (scroll + doc_delta, None, None)
+    (scroll + doc_delta, None, None, no_haptics)
 }
 
 /// Draws every page of the book as one continuous vertical strip —
@@ -401,9 +443,10 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     //
     // Once already at either edge, a scroll that keeps pushing past it
     // doesn't move `webtoon_scroll` at all — it drives a live
-    // `WebtoonEdgeDrag` instead (see `webtoon_edge_drag_step`), which
-    // resolves to `ComicApp::open_sibling_volume` when the gesture ends
-    // past its commit threshold, exactly like a manga page turn.
+    // `WebtoonEdgeHold` instead (see `webtoon_edge_hold_step`): push past
+    // the edge, hold genuinely still for `WEBTOON_EDGE_HOLD_DURATION_SECONDS`,
+    // then let go to open the sibling volume, or move again (or scroll back)
+    // to cancel.
     if !(app.show_settings || app.show_history || app.show_bookmarks) {
         let wheel_delta_y = ui.ctx().input(|i| i.smooth_scroll_delta().y);
         let (gesture_started, gesture_ended) = ui.ctx().input(|i| {
@@ -419,26 +462,35 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
             })
         });
 
-        if wheel_delta_y != 0.0 || gesture_started || gesture_ended || app.webtoon_edge_drag.is_some() {
+        if wheel_delta_y != 0.0 || gesture_started || gesture_ended || app.webtoon_edge_hold.is_some() {
             let raw_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
             let doc_delta = raw_delta * app.webtoon_wheel_sensitivity / scale;
             let dt = ui.ctx().input(|i| i.stable_dt);
-            let (new_scroll, new_drag, commit) = webtoon_edge_drag_step(
+            let (new_scroll, new_hold, commit, haptics) = webtoon_edge_hold_step(
                 app.webtoon_scroll,
                 max_scroll,
                 raw_delta,
                 doc_delta,
                 dt,
-                gesture_started,
                 gesture_ended,
-                app.webtoon_edge_drag.take(),
+                app.webtoon_edge_hold.take(),
             );
             app.webtoon_scroll = new_scroll;
-            app.webtoon_edge_drag = new_drag;
+            app.webtoon_edge_hold = new_hold;
+            if haptics.crossed_min_overscroll {
+                crate::platform::haptics::perform(crate::platform::haptics::HapticTap::MinOverscrollCrossed);
+            }
+            if haptics.just_armed {
+                crate::platform::haptics::perform(crate::platform::haptics::HapticTap::Armed);
+            }
             if let Some(direction) = commit {
-                app.webtoon_sibling_preview = None;
                 app.open_sibling_volume(direction);
             }
+            // A hold in progress needs repainting every frame regardless of
+            // new wheel input, since `held_for` only advances by wall-clock
+            // time (see `webtoon_edge_hold_step`) — without this, holding
+            // perfectly still (the whole point of the gesture) would starve
+            // its own countdown of the repaints needed to ever finish it.
             ui.ctx().request_repaint();
         }
     }
@@ -446,26 +498,26 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     app.webtoon_scroll = app.webtoon_scroll.clamp(0.0, max_scroll);
     let scroll = app.webtoon_scroll;
 
-    // How much of the viewport the incoming sibling volume's preview
-    // should cover this frame — `0.0..=1.0`, signed by direction (positive
-    // pushing up from the bottom, i.e. "next"; negative pushing down from
-    // the top, i.e. "previous").
-    let reveal_fraction = app.webtoon_edge_drag.as_ref().map(|d| d.progress * d.direction as f32).unwrap_or(0.0);
+    // How far past the edge (screen points, signed by direction — positive
+    // pushing past the bottom, i.e. "next"; negative past the top, i.e.
+    // "previous") the strip is currently rubber-banded — see
+    // `WEBTOON_EDGE_HOLD_OVERSCROLL_MAX`.
+    let overscroll_px = app
+        .webtoon_edge_hold
+        .as_ref()
+        .map(|h| h.overscroll * WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * h.direction as f32)
+        .unwrap_or(0.0);
+    // `0.0..=1.0`: how much of `WEBTOON_EDGE_HOLD_DURATION_SECONDS` this
+    // hold has gone without easing back toward the edge.
+    let hold_progress = app
+        .webtoon_edge_hold
+        .as_ref()
+        .map(|h| (h.held_for / WEBTOON_EDGE_HOLD_DURATION_SECONDS).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    // Whether letting go *right now* would actually commit.
+    let armed = app.webtoon_edge_hold.as_ref().is_some_and(|h| h.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS);
 
-    app.sync_webtoon_sibling_preview(ui.ctx());
-
-    // Existing content slides away from whichever edge is being pushed
-    // against — up off the top as the strip overscrolls down past the
-    // bottom (revealing the next volume sliding up to take its place),
-    // or down off the bottom pulling up past the top — exactly the
-    // paginated view's own page-turn slide (`draw_double_page`'s `sliding`
-    // branch), just rotated 90°. `content_shift` is that same motion
-    // applied uniformly to every page's `y_top` below, in screen points.
-    let content_shift = reveal_fraction * base_rect.height();
     let x_min = base_rect.center().x - displayed_width / 2.0;
-    if reveal_fraction != 0.0 {
-        draw_sibling_preview_slide(ui, base_rect, x_min, displayed_width, reveal_fraction, app.webtoon_sibling_preview.as_ref());
-    }
 
     // Which pages to keep decoded/resident and which to prefetch — anything
     // whose own slot falls within `WEBTOON_PRELOAD_MARGIN` doc units of the
@@ -506,66 +558,186 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
         if page_bottom < scroll || page_top > scroll + viewport_doc_height {
             continue;
         }
-        let y_top = base_rect.top() + (page_top - scroll) * scale - content_shift;
+        let y_top = base_rect.top() + (page_top - scroll) * scale;
         let column = Rect::from_min_size(Pos2::new(x_min, y_top), Vec2::new(displayed_width, height_doc * scale));
         draw_webtoon_page_slot(ui, column, idx, &mut ctx);
     }
+
+    // Drawn last, on top of the (perfectly static — nothing above drags or
+    // shifts) page content: the hold gesture's own feedback badge — no
+    // picture, just the ring/arrow/label — pulls into the screen from off
+    // the edge as the reader pushes.
+    if overscroll_px != 0.0 {
+        let theme = app.theme_preset.theme();
+        let at_top = overscroll_px < 0.0;
+        // Nudges the badge further toward center while the header/footer
+        // menu bar sharing that edge is currently shown, so it doesn't end
+        // up sitting under/behind it — the footer always floats over the
+        // reader (see `ui::footer::draw_footer`), the header only does
+        // while `header_floats_over_reader` is on. Reuses the exact same
+        // `Id` and visibility condition `ui::header`/`ui::footer` drive
+        // their own fade with, so this just reads their already-animating
+        // value rather than starting a second, potentially out-of-sync one.
+        let menu_showing = if at_top {
+            app.layout.header_floats_over_reader && app.header_idle_time() < UI_HIDE_DELAY
+        } else {
+            app.footer_idle_time() < UI_HIDE_DELAY
+        };
+        let menu_fade_id = egui::Id::new(if at_top { "header_fade" } else { "footer_fade" });
+        let menu_fade = ui.ctx().animate_bool_with_time(menu_fade_id, menu_showing, app.layout.fade_duration().as_secs_f32());
+        draw_edge_hold_badge(ui, base_rect, at_top, overscroll_px.abs(), hold_progress, armed, menu_fade, &theme);
+    }
 }
 
-/// Draws the incoming sibling volume's opening page sliding into the
-/// screen — the "new page arriving" half of `draw_webtoon`'s
-/// overscroll-past-the-edge transition; `content_shift` (computed
-/// alongside this call) is the other half, the same motion applied to the
-/// *existing* page content, together reading as one continuous slide, the
-/// vertical counterpart of the paginated view's own page-turn
-/// (`draw_double_page`'s `sliding` branch).
-///
-/// `reveal_fraction` is signed: positive reveals from the bottom (pushing
-/// down past the end — the next volume), negative from the top (pulling up
-/// past the start — the previous one); its magnitude (`0.0..=1.0`) is how
-/// much of the viewport height is revealed so far.
-///
-/// Before the preview image has actually finished decoding (see
-/// `ComicApp::sync_webtoon_sibling_preview`) — normally brief, but not
-/// instant — falls back to a small fading label in the same revealed
-/// region, so the gesture gives *some* feedback immediately rather than
-/// looking like scrolling just stopped working until the preview happens
-/// to land.
-fn draw_sibling_preview_slide(
+/// Radius (screen points) of the countdown ring `draw_edge_hold_badge`
+/// draws at rest (`pulled_in == 1.0`, no pop in progress) — the primary
+/// visual cue for `WEBTOON_EDGE_HOLD_DURATION_SECONDS`'s hold-and-wait
+/// gesture, independent of `WEBTOON_EDGE_HOLD_OVERSCROLL_MAX`'s own much
+/// smaller rubber-band distance.
+const WEBTOON_EDGE_HOLD_RING_RADIUS: f32 = 24.0;
+
+/// Screen-points distance in from the edge the badge rests at once fully
+/// pulled into view — see `draw_edge_hold_badge`.
+const WEBTOON_EDGE_HOLD_BADGE_REST_MARGIN: f32 = 64.0;
+
+/// Extra screen-points distance in from the edge, on top of
+/// `WEBTOON_EDGE_HOLD_BADGE_REST_MARGIN`, while the header/footer menu bar
+/// sharing that edge is currently shown — see `draw_webtoon`'s `menu_fade`
+/// and `draw_edge_hold_badge`.
+const WEBTOON_EDGE_HOLD_BADGE_MENU_EXTRA_MARGIN: f32 = 48.0;
+
+/// Badge scale (a fraction of `WEBTOON_EDGE_HOLD_RING_RADIUS`/its glyph's
+/// font size) right as it first peeks into view, before `pulled_in` reaches
+/// `1.0` — see `draw_edge_hold_badge`'s `scale`. Growing in from here as it
+/// arrives, rather than popping straight to full size the instant any of it
+/// is visible, reinforces the same "arriving" read the position slide
+/// already gives it.
+const WEBTOON_EDGE_HOLD_BADGE_MIN_SCALE: f32 = 0.55;
+
+/// How long (seconds) the one-shot "pop" plays once the badge finishes
+/// pulling all the way in — see `draw_edge_hold_badge`.
+const WEBTOON_EDGE_HOLD_BADGE_POP_DURATION: f32 = 0.22;
+
+/// How far past `1.0` the pop's scale overshoots at its peak.
+const WEBTOON_EDGE_HOLD_BADGE_POP_OVERSHOOT: f32 = 0.22;
+
+/// Draws the hold gesture's own feedback: a small ring that pulls in from
+/// off the edge of the screen as `reveal` grows — starting fully behind
+/// `draw_webtoon`'s own clip rect (so genuinely off-screen, not just
+/// invisible-but-present) and sliding in to rest
+/// `WEBTOON_EDGE_HOLD_BADGE_REST_MARGIN` (plus
+/// `WEBTOON_EDGE_HOLD_BADGE_MENU_EXTRA_MARGIN * menu_fade`, see
+/// `draw_webtoon`) inside it, so the ring itself visibly arrives on screen
+/// as the reader pushes rather than fading in in place while something else
+/// slides away to reveal it. It also grows — from
+/// `WEBTOON_EDGE_HOLD_BADGE_MIN_SCALE` up to full size — in lockstep with
+/// that same slide. Fills clockwise over `WEBTOON_EDGE_HOLD_DURATION_SECONDS`
+/// as `hold_progress` advances, plus a label naming which sibling volume is
+/// about to open, and the instant `armed` actually becomes `true` — the
+/// countdown finishing, not merely the badge finishing its own slide-in —
+/// plays a one-shot overshoot "pop" (`WEBTOON_EDGE_HOLD_BADGE_POP_OVERSHOOT`)
+/// via `egui::Context::animate_bool_with_time`, which only restarts if the
+/// hold un-arms (eases back below the duration) and arms again — never
+/// replays just from sitting armed. Once `armed`, the ring becomes a solid
+/// accent disc (not just a completed arc — reading unambiguously as "done"
+/// rather than "almost done") with a checkmark in place of the plain
+/// directional arrow, and the label switches to telling the reader to let
+/// go. Mirrors `progress_bar::draw_progress_bar`'s use of `theme.accent` for
+/// "filled/active".
+#[allow(clippy::too_many_arguments)] // each parameter is independently meaningful frame state; see the docs above
+fn draw_edge_hold_badge(
     ui: &Ui,
     base_rect: Rect,
-    x_min: f32,
-    displayed_width: f32,
-    reveal_fraction: f32,
-    preview: Option<&SiblingPreviewState>,
+    at_top: bool,
+    reveal: f32,
+    hold_progress: f32,
+    armed: bool,
+    menu_fade: f32,
+    theme: &Theme,
 ) {
-    let at_top = reveal_fraction < 0.0;
-    let reveal = reveal_fraction.abs() * base_rect.height();
+    let full_radius = WEBTOON_EDGE_HOLD_RING_RADIUS;
 
-    let texture = match preview {
-        Some(SiblingPreviewState::Ready { texture, .. }) => Some(texture),
-        _ => None,
-    };
-
-    let Some(texture) = texture else {
-        let label = if at_top { "▲ Previous chapter" } else { "▼ Next chapter" };
-        let alpha = (reveal_fraction.abs() * 255.0) as u8;
-        let y = if at_top { base_rect.top() + reveal.min(24.0) } else { base_rect.bottom() - reveal.min(24.0) };
-        ui.painter().text(
-            Pos2::new(base_rect.center().x, y),
-            Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(14.0),
-            Color32::from_white_alpha(alpha),
-        );
+    // `0.0` right as the hold starts (badge sitting just past the edge,
+    // fully behind the clip rect) to `1.0` once `reveal` reaches the
+    // overscroll cap (badge at rest) — `reveal` itself only ever shrinks
+    // back down while the hold is easing toward canceling, at which point
+    // sliding back out reads correctly as "leaving" too.
+    let pulled_in = (reveal / WEBTOON_EDGE_HOLD_OVERSCROLL_MAX).clamp(0.0, 1.0);
+    let rest_margin = WEBTOON_EDGE_HOLD_BADGE_REST_MARGIN + WEBTOON_EDGE_HOLD_BADGE_MENU_EXTRA_MARGIN * menu_fade;
+    // Off-screen margin sized off `full_radius`, not the (possibly still
+    // growing) scaled radius below — guarantees the badge stays fully
+    // behind the clip rect at `pulled_in == 0.0` regardless of how small it
+    // currently draws.
+    let start_offset = -(full_radius + 4.0);
+    let offset = start_offset + (rest_margin - start_offset) * pulled_in;
+    if offset <= -full_radius {
+        // Still entirely behind the clip rect — nothing would be visible.
         return;
-    };
+    }
+    let center = Pos2::new(base_rect.center().x, if at_top { base_rect.top() + offset } else { base_rect.bottom() - offset });
 
-    let size = texture.size_vec2();
-    let natural_height = displayed_width * (size.y / size.x.max(1.0));
-    let top = if at_top { base_rect.top() + reveal - natural_height } else { base_rect.bottom() - reveal };
-    let rect = Rect::from_min_size(Pos2::new(x_min, top), Vec2::new(displayed_width, natural_height));
-    egui::Image::new(texture).paint_at(ui, rect);
+    let base_scale = WEBTOON_EDGE_HOLD_BADGE_MIN_SCALE + (1.0 - WEBTOON_EDGE_HOLD_BADGE_MIN_SCALE) * pulled_in;
+    let pop_id = egui::Id::new("webtoon_edge_hold_badge_pop").with(at_top);
+    let pop_t = ui.ctx().animate_bool_with_time(pop_id, armed, WEBTOON_EDGE_HOLD_BADGE_POP_DURATION);
+    let pop_bump = 4.0 * pop_t * (1.0 - pop_t); // 0 at t=0 and t=1, peaks at 1.0 at t=0.5
+    let scale = base_scale * (1.0 + WEBTOON_EDGE_HOLD_BADGE_POP_OVERSHOOT * pop_bump);
+    let radius = full_radius * scale;
+
+    let painter = ui.painter();
+
+    // The ring's own track, always drawn first so the progress arc (or the
+    // solid `armed` fill) has a visible base to stand out against.
+    painter.circle_filled(center, radius, theme.panel);
+    painter.circle_stroke(center, radius, Stroke::new(1.5, theme.text_secondary.gamma_multiply(0.5)));
+
+    if armed {
+        painter.circle_filled(center, radius, theme.accent);
+    } else if hold_progress > 0.0 {
+        // A stroked arc rather than a filled pie slice — simpler to get
+        // right for any sweep angle (a fan from the center works for a
+        // filled wedge too, but a stroke reads more like a familiar
+        // "loading ring" and avoids anti-aliasing artifacts right at the
+        // 100%-sweep seam).
+        const ARC_MAX_STEPS: usize = 48;
+        let steps = ((ARC_MAX_STEPS as f32 * hold_progress).ceil() as usize).max(1);
+        let arc_radius = radius - 3.0;
+        let points: Vec<Pos2> = (0..=steps)
+            .map(|i| {
+                let t = (i as f32 / ARC_MAX_STEPS as f32).min(hold_progress);
+                let angle = -std::f32::consts::FRAC_PI_2 + t * std::f32::consts::TAU;
+                center + Vec2::angled(angle) * arc_radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, Stroke::new(3.0, theme.accent)));
+    }
+
+    // `▲`/`▼`/`✓` aren't covered by egui's default proportional-font
+    // fallback chain (`Ubuntu-Light` → `NotoEmoji-Regular` →
+    // `emoji-icon-font`, per `epaint`'s `FontDefinitions::default`) and
+    // render as tofu boxes; `⬆`/`⬇`/`✔` are, and are what
+    // `ui::header`/`ui::settings` already use for their own arrow icons.
+    let glyph = if armed {
+        "✔"
+    } else if at_top {
+        "⬆"
+    } else {
+        "⬇"
+    };
+    let glyph_color = if armed { theme.bg } else { theme.text_primary };
+    let glyph_galley = painter.layout_no_wrap(glyph.to_string(), egui::FontId::proportional(14.0 * scale), glyph_color);
+    painter.galley(center - glyph_galley.size() / 2.0, glyph_galley, glyph_color);
+
+    let label = match (at_top, armed) {
+        (true, false) => "Hold to open previous chapter",
+        (true, true) => "Release for previous chapter",
+        (false, false) => "Hold to open next chapter",
+        (false, true) => "Release for next chapter",
+    };
+    let label_galley = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), theme.text_primary);
+    const LABEL_GAP: f32 = 8.0;
+    let label_top = if at_top { center.y + radius + LABEL_GAP } else { center.y - radius - LABEL_GAP - label_galley.size().y };
+    let label_pos = Pos2::new(base_rect.center().x - label_galley.size().x / 2.0, label_top);
+    painter.galley(label_pos, label_galley, theme.text_primary);
 }
 
 /// Where a Webtoon page's compressed bytes come from, and the shared caches
@@ -1383,174 +1555,226 @@ mod tests {
         assert_eq!(current, 0);
     }
 
-    /// Shorthand for a live (`dragging: true`) drag at some `progress`, `0.0`
-    /// velocity unless a test overrides it after construction.
-    fn live_drag(direction: i32, progress: f32) -> WebtoonEdgeDrag {
-        WebtoonEdgeDrag { direction, progress, velocity: 0.0, dragging: true }
+    /// Shorthand for a live hold at some `overscroll`, `held_for: 0.0`
+    /// unless a test advances it afterward.
+    fn live_hold(direction: i32, overscroll: f32) -> WebtoonEdgeHold {
+        WebtoonEdgeHold { direction, overscroll, held_for: 0.0 }
     }
 
     #[test]
-    fn webtoon_edge_drag_step_scrolls_normally_away_from_either_edge() {
-        // Mid-strip: a downward push just scrolls, no drag starts, even on
-        // a fresh gesture.
-        let (scroll, drag, commit) = webtoon_edge_drag_step(500.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, true, false, None);
+    fn webtoon_edge_hold_step_scrolls_normally_away_from_either_edge() {
+        // Mid-strip: a downward push just scrolls, no hold starts.
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(500.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, None);
         assert!((scroll - 505.0).abs() < EPSILON);
-        assert!(drag.is_none());
+        assert!(hold.is_none());
         assert_eq!(commit, None);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_never_starts_from_a_gestures_own_momentum_tail() {
-        // Already at max_scroll and still being pushed down — but
-        // `gesture_started` is false, so this is the tail end of whatever
-        // gesture arrived here, not a fresh push. No drag should start;
-        // `scroll` just stays clamped at the edge for the caller to clamp.
-        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, false, None);
-        assert!(drag.is_none());
-        assert_eq!(commit, None);
-    }
-
-    #[test]
-    fn webtoon_edge_drag_step_starts_only_on_a_fresh_gesture_already_at_the_bottom() {
-        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, true, false, None);
+    fn webtoon_edge_hold_step_starts_on_any_push_already_at_the_bottom() {
+        // Not gated on `TouchPhase::Start` — real event traces showed that
+        // phase firing many times a second even during one continuous,
+        // uninterrupted scroll on this platform, so gating on it blocked
+        // most genuine pushes without actually excluding momentum. See
+        // `webtoon_edge_hold_step`'s docs for what actually keeps momentum
+        // out (armed only by genuine stillness).
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.4;
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None);
         assert!((scroll - 1000.0).abs() < EPSILON); // doesn't move past the edge
-        let drag = drag.expect("a fresh push at the edge should start a drag");
-        assert_eq!(drag.direction, 1);
-        assert!(drag.dragging);
+        let hold = hold.expect("a push at the edge should start a hold");
+        assert_eq!(hold.direction, 1);
+        assert!((hold.overscroll - 0.4).abs() < EPSILON);
+        assert!((hold.held_for - 0.0).abs() < EPSILON);
         assert_eq!(commit, None);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_starts_symmetrically_at_the_top() {
-        let (scroll, drag, _) = webtoon_edge_drag_step(0.0, 1000.0, -50.0, -5.0, 1.0 / 60.0, true, false, None);
+    fn webtoon_edge_hold_step_starts_symmetrically_at_the_top() {
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.4;
+        let (scroll, hold, ..) = webtoon_edge_hold_step(0.0, 1000.0, -push, -push * 0.1, 1.0 / 60.0, false, None);
         assert!((scroll - 0.0).abs() < EPSILON);
-        assert_eq!(drag.expect("should start").direction, -1);
+        let hold = hold.expect("should start");
+        assert_eq!(hold.direction, -1);
+        assert!((hold.overscroll - 0.4).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_progress_matches_full_distance() {
-        let drag = live_drag(1, 0.0);
-        let push = WEBTOON_EDGE_DRAG_FULL_DISTANCE / 2.0;
-        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, false, Some(drag));
-        assert!((drag.unwrap().progress - 0.5).abs() < EPSILON);
-    }
-
-    #[test]
-    fn webtoon_edge_drag_step_holds_progress_steady_while_held_still() {
-        // The whole point of the redesign: a live drag with zero delta this
-        // frame (fingers down but not moving) must not lose any progress —
-        // unlike the old accumulator, there's no per-frame decay while
-        // `dragging` is still true.
-        let drag = live_drag(1, 0.4);
-        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0, false, false, Some(drag));
-        assert!((drag.unwrap().progress - 0.4).abs() < EPSILON);
-    }
-
-    #[test]
-    fn webtoon_edge_drag_step_holding_still_right_after_starting_does_not_cancel_it() {
-        // A drag that just started sits at `progress: 0.0` — a zero-delta
-        // hold on the very next frame must still count as "holding", not
-        // "already pulled back past zero" (an easy off-by-one to get wrong
-        // since both look like `progress <= 0.0` from the outside).
-        let drag = live_drag(1, 0.0);
-        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, false, Some(drag));
+    fn webtoon_edge_hold_step_a_fast_flicks_momentum_cannot_arm_it() {
+        // A flick's momentum can keep generating real per-frame movement
+        // for a while after the reader's fingers have already left the
+        // trackpad — modeled here as several frames of continued,
+        // above-epsilon push (which is also how it could have started this
+        // hold in the first place, now that starting isn't gated on
+        // `TouchPhase::Start`). Each frame resets `held_for` back to `0.0`,
+        // so ending the gesture right after — with no window of genuine
+        // stillness — must not commit.
+        let mut hold: Option<WebtoonEdgeHold> = None;
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.3;
+        for _ in 0..10 {
+            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, hold.take());
+            hold = next;
+        }
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, hold);
         assert_eq!(commit, None);
-        let drag = drag.expect("holding still at progress 0.0 must not drop the drag");
-        assert!(drag.dragging);
-        assert!((drag.progress - 0.0).abs() < EPSILON);
+        assert!(hold.is_none());
     }
 
     #[test]
-    fn webtoon_edge_drag_step_pulling_back_reduces_progress() {
-        let drag = live_drag(1, 0.5);
-        let pull = WEBTOON_EDGE_DRAG_FULL_DISTANCE * 0.2;
-        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, -pull, -pull * 0.1, 1.0 / 60.0, false, false, Some(drag));
-        assert!((drag.unwrap().progress - 0.3).abs() < EPSILON);
+    fn webtoon_edge_hold_step_holding_still_right_after_starting_does_not_cancel_it() {
+        let hold = live_hold(1, 0.0);
+        let dt = 1.0 / 60.0;
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, dt, false, Some(hold));
+        assert_eq!(commit, None);
+        let hold = hold.expect("holding still at overscroll 0.0 must not drop the hold");
+        assert!((hold.overscroll - 0.0).abs() < EPSILON);
+        // Below `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT` — see the
+        // dedicated test below — so it doesn't drop the hold, but doesn't
+        // start counting yet either.
+        assert!((hold.held_for - 0.0).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_pulling_all_the_way_back_drops_the_drag_and_resumes_scrolling() {
-        let drag = live_drag(1, 0.1);
-        let pull = WEBTOON_EDGE_DRAG_FULL_DISTANCE * 0.2; // more than enough to zero out 0.1 progress
-        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, -pull, -3.0, 1.0 / 60.0, false, false, Some(drag));
-        assert!(drag.is_none());
+    fn webtoon_edge_hold_step_wont_count_at_all_below_the_minimum_overscroll() {
+        // A push that never reaches `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT`
+        // shouldn't start counting down a volume change no matter how long
+        // it sits there.
+        let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT - 0.05);
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 5.0, false, Some(hold));
+        assert!((hold.unwrap().held_for - 0.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_starts_counting_the_moment_the_minimum_overscroll_is_crossed() {
+        let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT);
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(hold));
+        assert!((hold.unwrap().held_for - 0.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_holding_still_counts_toward_arming_without_touching_overscroll() {
+        let hold = live_hold(1, 0.9);
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(hold));
+        assert_eq!(commit, None);
+        let hold = hold.unwrap();
+        assert!((hold.overscroll - 0.9).abs() < EPSILON);
+        assert!((hold.held_for - 0.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_accumulates_held_for_across_several_still_frames() {
+        let mut hold = Some(live_hold(1, 0.9));
+        for _ in 0..4 {
+            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, hold.take());
+            hold = next;
+        }
+        assert!((hold.unwrap().held_for - 2.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_jitter_within_the_still_epsilon_still_counts_as_held() {
+        // Real trackpad "stillness" isn't perfectly zero — a frame with a
+        // tiny residual delta must still count toward the hold, not reset
+        // it back to zero.
+        let hold = live_hold(1, 0.9);
+        let jitter = WEBTOON_EDGE_HOLD_STILL_EPSILON * 0.5;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, jitter, jitter * 0.1, 0.3, false, Some(hold));
+        let hold = hold.unwrap();
+        assert!((hold.overscroll - 0.9).abs() < EPSILON);
+        assert!((hold.held_for - 0.3).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_pushing_further_resets_held_for_and_raises_overscroll() {
+        let mut hold = live_hold(1, 0.7);
+        hold.held_for = 0.4;
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        let hold = hold.unwrap();
+        assert!((hold.overscroll - 0.9).abs() < EPSILON);
+        assert!((hold.held_for - 0.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_pulling_back_partially_reduces_overscroll_and_resets_held_for() {
+        let mut hold = live_hold(1, 0.9);
+        hold.held_for = 1.0;
+        let pull = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -pull * 0.1, 1.0 / 60.0, false, Some(hold));
+        let hold = hold.unwrap();
+        assert!((hold.overscroll - 0.7).abs() < EPSILON);
+        assert!((hold.held_for - 0.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_pulling_all_the_way_back_drops_the_hold_and_resumes_scrolling() {
+        let hold = live_hold(1, 0.1);
+        let pull = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2; // more than enough to zero out 0.1 overscroll
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -3.0, 1.0 / 60.0, false, Some(hold));
+        assert!(hold.is_none());
         assert_eq!(commit, None);
         assert!((scroll - 997.0).abs() < EPSILON); // normal scroll applied instead
     }
 
     #[test]
-    fn webtoon_edge_drag_step_progress_never_exceeds_one() {
-        let drag = live_drag(1, 0.9);
-        let push = WEBTOON_EDGE_DRAG_FULL_DISTANCE; // would overshoot to 1.9 uncapped
-        let (_, drag, _) = webtoon_edge_drag_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, false, Some(drag));
-        assert!((drag.unwrap().progress - 1.0).abs() < EPSILON);
+    fn webtoon_edge_hold_step_overscroll_never_exceeds_one() {
+        let hold = live_hold(1, 0.9);
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX; // would overshoot to 1.9 uncapped
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        assert!((hold.unwrap().overscroll - 1.0).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_commits_at_release_past_the_threshold() {
-        let drag = live_drag(1, WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD + 0.01);
-        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
-        assert!(drag.is_none());
+    fn webtoon_edge_hold_step_commits_at_release_once_armed() {
+        let mut hold = live_hold(1, 0.9);
+        hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS;
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(hold));
+        assert!(hold.is_none());
         assert_eq!(commit, Some(1));
     }
 
     #[test]
-    fn webtoon_edge_drag_step_releasing_below_threshold_settles_back_instead_of_committing() {
-        let drag = live_drag(1, WEBTOON_EDGE_DRAG_COMMIT_THRESHOLD - 0.01);
-        let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
+    fn webtoon_edge_hold_step_releasing_before_armed_drops_the_hold_with_no_rebound() {
+        // No settle/rebound animation for this gesture — releasing without
+        // having armed just clears the hold outright, on this very frame.
+        let mut hold = live_hold(1, 0.9);
+        hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS - 0.01;
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(hold));
         assert_eq!(commit, None);
-        let drag = drag.expect("should still exist, settling back to rest");
-        assert!(!drag.dragging);
+        assert!(hold.is_none());
     }
 
     #[test]
-    fn webtoon_edge_drag_step_a_fast_flick_commits_even_with_little_progress() {
-        // Checked for both directions — `velocity` is already sign-
-        // normalized to progress-space ("positive = further past this
-        // edge") regardless of which edge, so a naive re-multiply by
-        // `direction` at the commit check would silently flip this for the
-        // top edge (`-1`) alone while `direction: 1` still passed.
-        for direction in [1, -1] {
-            let mut drag = live_drag(direction, 0.1);
-            drag.velocity = WEBTOON_EDGE_DRAG_FLING_VELOCITY + 1.0;
-            let (_, _, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
-            assert_eq!(commit, Some(direction));
-        }
+    fn webtoon_edge_hold_step_reports_crossed_min_overscroll_only_on_the_crossing_frame() {
+        let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT - 0.05);
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.1; // enough to cross the threshold
+        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        assert!(haptics.crossed_min_overscroll);
+        assert!(!haptics.just_armed);
+
+        // Already past the threshold now — pushing further must not report
+        // the crossing a second time.
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, hold);
+        assert!(!haptics.crossed_min_overscroll);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_a_fast_flick_the_wrong_way_does_not_commit() {
-        // Fast velocity in itself isn't enough — it has to point the same
-        // way as the drag (a sharp pull back out counts as a cancel, not a
-        // flung commit). Checked for both directions, see the sibling test.
-        for direction in [1, -1] {
-            let mut drag = live_drag(direction, 0.1);
-            drag.velocity = -(WEBTOON_EDGE_DRAG_FLING_VELOCITY + 1.0);
-            let (_, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, true, Some(drag));
-            assert_eq!(commit, None);
-            assert!(!drag.unwrap().dragging);
-        }
+    fn webtoon_edge_hold_step_starting_already_past_the_minimum_reports_the_crossing() {
+        // A single big enough push can jump straight past the minimum on
+        // the very frame the hold starts — that still counts as crossing it.
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.9;
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None);
+        assert!(haptics.crossed_min_overscroll);
     }
 
     #[test]
-    fn webtoon_edge_drag_step_settling_drag_decays_and_then_clears() {
-        let drag = WebtoonEdgeDrag { direction: 1, progress: 0.5, velocity: 0.0, dragging: false };
-        let dt = 0.5 / WEBTOON_EDGE_DRAG_RELEASE_DECAY_PER_SECOND; // exactly enough to drain 0.5
-        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 0.0, 0.0, dt, false, false, Some(drag));
-        assert!(drag.is_none());
-        assert_eq!(commit, None);
-        assert!((scroll - 1000.0).abs() < EPSILON);
-    }
+    fn webtoon_edge_hold_step_reports_just_armed_only_on_the_arming_frame() {
+        let mut hold = live_hold(1, 1.0);
+        hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS - 0.01;
+        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, Some(hold));
+        assert!(haptics.just_armed);
+        assert!(!haptics.crossed_min_overscroll); // already past it, not a fresh crossing
 
-    #[test]
-    fn webtoon_edge_drag_step_settling_drag_ignores_further_input() {
-        // Once released without committing, new wheel input (e.g. the same
-        // momentum tail continuing) shouldn't revive the drag or move
-        // `scroll` — it just keeps decaying toward `0.0`.
-        let drag = WebtoonEdgeDrag { direction: 1, progress: 0.5, velocity: 0.0, dragging: false };
-        let (scroll, drag, commit) = webtoon_edge_drag_step(1000.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, false, Some(drag));
-        assert!((scroll - 1000.0).abs() < EPSILON);
-        assert!(drag.is_some());
-        assert_eq!(commit, None);
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, hold);
+        assert!(!haptics.just_armed);
     }
 }

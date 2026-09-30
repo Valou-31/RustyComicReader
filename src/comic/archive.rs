@@ -358,102 +358,6 @@ impl ComicArchive {
         Ok((images, comic_info_xml))
     }
 
-    /// Reads just the first image entry's compressed bytes from the archive
-    /// at `path`, in archive order — without extracting anything else. Used
-    /// to preview the next/previous sibling volume's opening page during
-    /// `ui::reader::draw_webtoon`'s overscroll-to-next-chapter gesture,
-    /// where running the whole `load` pipeline on a neighboring archive just
-    /// to peek at one page would be wasteful for a gesture the user might
-    /// not even follow through on. Same "archive order, not final reading
-    /// order" caveat as `load`'s own first-page preview (see `ProgressFn`'s
-    /// docs) — good enough for a preview, not a substitute for actually
-    /// opening the book.
-    pub fn peek_first_page(path: &Path) -> Result<Vec<u8>> {
-        let extension = path.extension().unwrap_or_default().to_str().unwrap_or("").to_lowercase();
-        match extension.as_str() {
-            "cbz" | "zip" => Self::peek_first_page_zip(path),
-            "cb7" | "7z" => Self::peek_first_page_7z(path),
-            "cbr" | "rar" => Self::peek_first_page_rar(path),
-            _ => anyhow::bail!("Format non supporté: {}", extension),
-        }
-    }
-
-    fn peek_first_page_zip(path: &Path) -> Result<Vec<u8>> {
-        let file = std::fs::File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file)?;
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            if Self::is_image_file(&file.name()) {
-                let mut data = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut data)?;
-                if Self::looks_like_image(&data) {
-                    return Ok(data);
-                }
-            }
-        }
-        anyhow::bail!("Aucune image trouvée")
-    }
-
-    fn peek_first_page_7z(path: &Path) -> Result<Vec<u8>> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
-        let mut archive = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
-            .map_err(|e| anyhow::anyhow!("Erreur lecture 7z: {e}"))?;
-
-        let mut found = None;
-        archive
-            .for_each_entries(|entry, reader| {
-                if found.is_none() && !entry.is_directory() && Self::is_image_file(entry.name()) {
-                    let mut data = Vec::new();
-                    reader.read_to_end(&mut data)?;
-                    if Self::looks_like_image(&data) {
-                        found = Some(data);
-                    }
-                }
-                // Keep iterating even after finding it — `sevenz_rust`
-                // doesn't offer a way to stop early (`Ok(false)` here means
-                // "skip this entry's contents", not "stop entirely").
-                Ok(true)
-            })
-            .map_err(|e| anyhow::anyhow!("Erreur lecture 7z: {e}"))?;
-
-        found.ok_or_else(|| anyhow::anyhow!("Aucune image trouvée"))
-    }
-
-    fn peek_first_page_rar(path: &Path) -> Result<Vec<u8>> {
-        let archive = unrar::Archive::new(path)
-            .open_for_processing()
-            .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
-
-        let mut cursor = Some(archive);
-        while let Some(current) = cursor.take() {
-            let Some(file) = current
-                .read_header()
-                .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?
-            else {
-                break;
-            };
-
-            let name = file.entry().filename.to_string_lossy().into_owned();
-            if !file.entry().is_directory() && Self::is_image_file(&name) {
-                let (data, next) = file
-                    .read()
-                    .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?;
-                if Self::looks_like_image(&data) {
-                    return Ok(data);
-                }
-                cursor = Some(next);
-            } else {
-                cursor = Some(
-                    file.skip()
-                        .map_err(|e| anyhow::anyhow!("Erreur lecture RAR: {e}"))?,
-                );
-            }
-        }
-
-        anyhow::bail!("Aucune image trouvée")
-    }
-
     fn is_image_file(filename: &str) -> bool {
         let lower = filename.to_lowercase();
         lower.ends_with(".jpg") || lower.ends_with(".jpeg")
@@ -749,7 +653,6 @@ impl PageMeta {
 mod tests {
     use super::*;
     use crate::app::DOWNSCALE_MAX_DIMENSION;
-    use std::path::PathBuf;
 
     fn solid_image(width: usize, height: usize, color: egui::Color32) -> egui::ColorImage {
         egui::ColorImage::new([width, height], vec![color; width * height])
@@ -915,53 +818,6 @@ mod tests {
         }
         let total_height: usize = slices.iter().map(|s| s.size[1]).sum();
         assert_eq!(total_height, 10000); // no downscale needed, just sliced
-    }
-
-    /// A real `.cbz` (zip) fixture on disk — `peek_first_page` reads
-    /// straight from a file, so unlike `decode_page_slices`'s tests it
-    /// can't just hand it in-memory encoded bytes.
-    fn write_test_cbz(test_name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("rusty_comic_reader_test_{test_name}_{}.cbz", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
-        let mut writer = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, data) in entries {
-            writer.start_file(*name, options).unwrap();
-            std::io::Write::write_all(&mut writer, data).unwrap();
-        }
-        writer.finish().unwrap();
-        path
-    }
-
-    #[test]
-    fn peek_first_page_reads_the_first_image_entry_in_archive_order() {
-        let page_one = encode_solid_png(20, 20);
-        let page_two = encode_solid_png(30, 30);
-        let path = write_test_cbz("peek_first_page_order", &[("001.png", &page_one), ("002.png", &page_two)]);
-
-        let peeked = ComicArchive::peek_first_page(&path).unwrap();
-
-        assert_eq!(peeked, page_one);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn peek_first_page_skips_a_leading_non_image_entry() {
-        let page_one = encode_solid_png(20, 20);
-        let path = write_test_cbz("peek_first_page_skips", &[("ComicInfo.xml", b"<ComicInfo/>"), ("001.png", &page_one)]);
-
-        let peeked = ComicArchive::peek_first_page(&path).unwrap();
-
-        assert_eq!(peeked, page_one);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn peek_first_page_errors_on_an_archive_with_no_images() {
-        let path = write_test_cbz("peek_first_page_no_images", &[("ComicInfo.xml", b"<ComicInfo/>")]);
-
-        assert!(ComicArchive::peek_first_page(&path).is_err());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
