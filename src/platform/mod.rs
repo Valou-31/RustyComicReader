@@ -5,3 +5,4 @@ pub mod windows;
 pub mod macos;
 
 pub mod haptics;
+pub mod scroll_touch;

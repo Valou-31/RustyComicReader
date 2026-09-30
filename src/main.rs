@@ -83,6 +83,8 @@ fn main() -> Result<(), eframe::Error> {
         "Comic Reader",
         options,
         Box::new(move |_cc| {
+            #[cfg(target_os = "macos")]
+            platform::scroll_touch::install();
             let app = if files.is_empty() { ComicApp::new() } else { ComicApp::new_with_files(files) };
             Ok(Box::new(app))
         }),

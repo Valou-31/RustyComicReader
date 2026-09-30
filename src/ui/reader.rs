@@ -145,9 +145,10 @@ const WEBTOON_EDGE_HOLD_DURATION_SECONDS: f32 = 1.0;
 /// direction, has to exceed to count as real movement rather than ordinary
 /// trackpad jitter around otherwise-still fingers. Below this, a frame
 /// counts as "held still" toward `WEBTOON_EDGE_HOLD_DURATION_SECONDS`;
-/// above it (push or pull alike) resets that countdown to `0.0` — see
-/// `webtoon_edge_hold_step`'s docs for why even a continued push has to
-/// reset it, not just a pull-back.
+/// above it, a pull-back (or a push with no finger actually on the pad —
+/// see `webtoon_edge_hold_step`'s `finger_down`) resets that countdown to
+/// `0.0`, while a continued push with a finger still down keeps counting
+/// exactly like held-still would.
 const WEBTOON_EDGE_HOLD_STILL_EPSILON: f32 = 1.0;
 
 /// `WebtoonEdgeHold::overscroll` fraction (`0.0..=1.0`, of
@@ -289,19 +290,40 @@ struct WebtoonEdgeHoldHaptics {
 /// `WEBTOON_EDGE_HOLD_STILL_EPSILON` of no movement at all — including a
 /// frame with no wheel event whatsoever, since the caller keeps invoking
 /// this every frame a hold exists regardless of whether there was a new
-/// event — counts toward `WEBTOON_EDGE_HOLD_DURATION_SECONDS`, and only
+/// event — or a frame that's a continued push *with a finger still down*
+/// (`finger_down`, sourced from `platform::scroll_touch` on macOS — see its
+/// own docs for why `winit`'s touch-phase alone can't tell this apart from
+/// momentum) counts toward `WEBTOON_EDGE_HOLD_DURATION_SECONDS`, and only
 /// once `overscroll` has already crossed
-/// `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT` too. Any real movement,
-/// *either* direction, resets the count back to `0.0` — a flick's momentum
-/// keeps generating real per-frame movement for essentially all of its
-/// decay, so it can only start building `held_for` in whatever sliver of
-/// stillness comes right before its own `gesture_ended` follows; pulling
-/// back far enough to zero out `overscroll` drops the hold entirely and
-/// hands control back to normal scrolling. It only resolves on the frame
-/// `gesture_ended` fires: armed (`held_for` already past the duration)
-/// commits; otherwise the hold is dropped outright, with no rebound or
-/// settle animation — that motion belongs to this gesture alone, and a
-/// reader who let go without arming it gets an immediate, plain cancel.
+/// `WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT` too. Pulling back, or any
+/// movement once the OS is coasting on momentum instead of a live finger,
+/// resets the count back to `0.0`.
+///
+/// `finger_down` is `Option<bool>` rather than `bool` because it's only
+/// ever a real, trustworthy signal on macOS (`None` everywhere else,
+/// including if the monitor genuinely hasn't seen an event yet) — `Some(false)`
+/// is treated as definite proof fingers have lifted, `None` as "no opinion,"
+/// so a platform with no signal at all falls back to exactly the old
+/// behavior throughout (never blocks starting a hold, never resolves one
+/// early) instead of being unable to ever start or hold one at all. Where
+/// this matters most: `Some(false)` also keeps a fresh hold from ever
+/// *starting* on a momentum push in the first place (below), and resolves a
+/// live one immediately — same as an actual release — the instant it's
+/// seen, rather than waiting on `gesture_ended` (which, per the traces
+/// above, can lag well behind the actual moment fingers left the trackpad).
+/// That's what keeps the countdown badge from lingering through a flick's
+/// entire momentum tail: without this, a flick's momentum keeps generating
+/// real per-frame movement for essentially all of its decay, so absent this
+/// signal a hold born from (or still fed by) that momentum could only ever
+/// resolve once `gesture_ended` eventually caught up — visibly still on
+/// screen well after the reader's fingers actually left the pad. Pulling
+/// back far enough to zero out `overscroll` still drops the hold entirely
+/// and hands control back to normal scrolling, same as before. Once
+/// resolved (by `gesture_ended`, or by a confirmed finger-up): armed
+/// (`held_for` already past the duration) commits; otherwise the hold is
+/// dropped outright, with no rebound or settle animation — that motion
+/// belongs to this gesture alone, and a reader who let go without arming it
+/// gets an immediate, plain cancel.
 fn webtoon_edge_hold_step(
     scroll: f32,
     max_scroll: f32,
@@ -309,12 +331,16 @@ fn webtoon_edge_hold_step(
     doc_delta: f32,
     dt: f32,
     gesture_ended: bool,
+    finger_down: Option<bool>,
     edge_hold: Option<WebtoonEdgeHold>,
 ) -> (f32, Option<WebtoonEdgeHold>, Option<i32>, WebtoonEdgeHoldHaptics) {
     let no_haptics = WebtoonEdgeHoldHaptics::default();
+    // Definite proof fingers have lifted — see `finger_down`'s own docs for
+    // why this, not just `gesture_ended`, gets to resolve a hold.
+    let confirmed_lifted = finger_down == Some(false);
 
     if let Some(mut hold) = edge_hold {
-        if gesture_ended {
+        if gesture_ended || confirmed_lifted {
             let commit = hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS;
             return if commit {
                 (scroll, None, Some(hold.direction), no_haptics)
@@ -328,11 +354,20 @@ fn webtoon_edge_hold_step(
         // direction.
         let signed = raw_delta * hold.direction as f32;
         if signed.abs() > WEBTOON_EDGE_HOLD_STILL_EPSILON {
-            // Real movement, either direction, resets the countdown — see
-            // the docs above for why momentum needs this, not just a
-            // pull-back, to be excluded. `overscroll` itself still tracks
-            // the push/pull normally.
-            hold.held_for = 0.0;
+            // A continued push in the hold's own direction, with a finger
+            // actually still on the pad, is deliberate — it keeps counting
+            // toward arming exactly like holding still would. Only a
+            // pull-back, or this same continued push with no confirmed
+            // finger down (momentum, or no signal at all), resets the
+            // countdown — see this function's docs for why momentum can't
+            // be told apart from a deliberate continued push by delta
+            // alone. `overscroll` itself still tracks the push/pull
+            // normally either way.
+            let deliberate_continued_push = finger_down == Some(true) && signed > 0.0;
+            let was_armed = hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS;
+            if !deliberate_continued_push {
+                hold.held_for = 0.0;
+            }
             let was_counting = hold.overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT;
             let delta_overscroll = signed / WEBTOON_EDGE_HOLD_OVERSCROLL_MAX;
             let new_overscroll = hold.overscroll + delta_overscroll;
@@ -345,7 +380,13 @@ fn webtoon_edge_hold_step(
             }
             hold.overscroll = new_overscroll.clamp(0.0, 1.0);
             let now_counting = hold.overscroll >= WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT;
-            let haptics = WebtoonEdgeHoldHaptics { crossed_min_overscroll: now_counting && !was_counting, just_armed: false };
+            if deliberate_continued_push && now_counting {
+                hold.held_for += dt;
+            }
+            let haptics = WebtoonEdgeHoldHaptics {
+                crossed_min_overscroll: now_counting && !was_counting,
+                just_armed: !was_armed && hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS,
+            };
             return (scroll, Some(hold), None, haptics);
         }
 
@@ -359,6 +400,14 @@ fn webtoon_edge_hold_step(
         let haptics =
             WebtoonEdgeHoldHaptics { crossed_min_overscroll: false, just_armed: !was_armed && hold.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS };
         return (scroll, Some(hold), None, haptics);
+    }
+
+    // Never starts on a confirmed-momentum push — see `finger_down`'s docs —
+    // so the badge never even flashes on for a flick's momentum tail; a
+    // platform/monitor with no opinion (`None`) doesn't block starting one
+    // at all, same as before this signal existed.
+    if confirmed_lifted {
+        return (scroll + doc_delta, None, None, no_haptics);
     }
 
     let at_bottom = scroll >= max_scroll;
@@ -473,6 +522,7 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
                 doc_delta,
                 dt,
                 gesture_ended,
+                crate::platform::scroll_touch::finger_down(),
                 app.webtoon_edge_hold.take(),
             );
             app.webtoon_scroll = new_scroll;
@@ -1564,7 +1614,7 @@ mod tests {
     #[test]
     fn webtoon_edge_hold_step_scrolls_normally_away_from_either_edge() {
         // Mid-strip: a downward push just scrolls, no hold starts.
-        let (scroll, hold, commit, _) = webtoon_edge_hold_step(500.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, None);
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(500.0, 1000.0, 50.0, 5.0, 1.0 / 60.0, false, Some(true), None);
         assert!((scroll - 505.0).abs() < EPSILON);
         assert!(hold.is_none());
         assert_eq!(commit, None);
@@ -1577,9 +1627,10 @@ mod tests {
         // uninterrupted scroll on this platform, so gating on it blocked
         // most genuine pushes without actually excluding momentum. See
         // `webtoon_edge_hold_step`'s docs for what actually keeps momentum
-        // out (armed only by genuine stillness).
+        // out (armed only by genuine stillness or a deliberate finger-down
+        // push).
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.4;
-        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None);
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(true), None);
         assert!((scroll - 1000.0).abs() < EPSILON); // doesn't move past the edge
         let hold = hold.expect("a push at the edge should start a hold");
         assert_eq!(hold.direction, 1);
@@ -1591,7 +1642,7 @@ mod tests {
     #[test]
     fn webtoon_edge_hold_step_starts_symmetrically_at_the_top() {
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.4;
-        let (scroll, hold, ..) = webtoon_edge_hold_step(0.0, 1000.0, -push, -push * 0.1, 1.0 / 60.0, false, None);
+        let (scroll, hold, ..) = webtoon_edge_hold_step(0.0, 1000.0, -push, -push * 0.1, 1.0 / 60.0, false, Some(true), None);
         assert!((scroll - 0.0).abs() < EPSILON);
         let hold = hold.expect("should start");
         assert_eq!(hold.direction, -1);
@@ -1599,23 +1650,83 @@ mod tests {
     }
 
     #[test]
-    fn webtoon_edge_hold_step_a_fast_flicks_momentum_cannot_arm_it() {
+    fn webtoon_edge_hold_step_a_confirmed_lifted_finger_never_starts_a_hold() {
         // A flick's momentum can keep generating real per-frame movement
         // for a while after the reader's fingers have already left the
         // trackpad — modeled here as several frames of continued,
-        // above-epsilon push (which is also how it could have started this
-        // hold in the first place, now that starting isn't gated on
-        // `TouchPhase::Start`). Each frame resets `held_for` back to `0.0`,
-        // so ending the gesture right after — with no window of genuine
-        // stillness — must not commit.
+        // above-epsilon push with a confirmed-lifted finger signal
+        // (`Some(false)`, from `platform::scroll_touch` on macOS). Not one
+        // of these frames may start a hold at all — no badge ever flashes
+        // on for a momentum tail the reader never actually pushed with a
+        // finger down.
         let mut hold: Option<WebtoonEdgeHold> = None;
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.3;
         for _ in 0..10 {
-            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, hold.take());
+            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(false), hold.take());
+            hold = next;
+            assert!(hold.is_none());
+        }
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(false), hold);
+        assert_eq!(commit, None);
+        assert!(hold.is_none());
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_without_any_signal_still_starts_on_a_push_the_old_way() {
+        // `finger_down: None` (no monitor installed, or a non-macOS
+        // platform) must behave exactly like before this signal
+        // existed — starting a hold is never blocked just because nobody
+        // has an opinion on finger contact.
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.4;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None, None);
+        assert!(hold.is_some());
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_a_confirmed_lifted_finger_drops_a_live_unarmed_hold_immediately() {
+        // The whole fix for the badge lingering through a flick's momentum
+        // tail: once a finger-lift is confirmed, an unarmed hold must drop
+        // on that exact frame — it doesn't need `gesture_ended` to ever
+        // catch up, and it doesn't matter that this frame's delta still
+        // looks like a continued push (momentum).
+        let hold = live_hold(1, 0.9);
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.3;
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(false), Some(hold));
+        assert_eq!(commit, None);
+        assert!(hold.is_none());
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_a_confirmed_lifted_finger_commits_an_already_armed_hold_immediately() {
+        // Symmetric to the drop case above: an armed hold commits the
+        // instant a lifted finger is confirmed, without waiting on
+        // `gesture_ended`.
+        let mut hold = live_hold(1, 0.9);
+        hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS;
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, false, Some(false), Some(hold));
+        assert_eq!(commit, Some(1));
+        assert!(hold.is_none());
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_a_sustained_finger_down_push_can_arm_without_ever_going_still() {
+        // The whole point of `finger_down`: unlike the momentum case above,
+        // a deliberately sustained push — finger still on the pad the
+        // entire time — must be able to arm the hold on its own, without
+        // ever needing a still frame.
+        let mut hold: Option<WebtoonEdgeHold> = None;
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.9; // straight past the min-to-count threshold
+        let dt = 1.0 / 60.0;
+        let mut armed = false;
+        for _ in 0..90 {
+            // 1.5s of continued pushing, well past `WEBTOON_EDGE_HOLD_DURATION_SECONDS`.
+            let (_, next, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, dt, false, Some(true), hold.take());
+            armed |= haptics.just_armed;
             hold = next;
         }
-        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, hold);
-        assert_eq!(commit, None);
+        assert!(armed);
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, dt, true, Some(true), hold);
+        assert_eq!(commit, Some(1));
         assert!(hold.is_none());
     }
 
@@ -1623,7 +1734,7 @@ mod tests {
     fn webtoon_edge_hold_step_holding_still_right_after_starting_does_not_cancel_it() {
         let hold = live_hold(1, 0.0);
         let dt = 1.0 / 60.0;
-        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, dt, false, Some(hold));
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, dt, false, Some(true), Some(hold));
         assert_eq!(commit, None);
         let hold = hold.expect("holding still at overscroll 0.0 must not drop the hold");
         assert!((hold.overscroll - 0.0).abs() < EPSILON);
@@ -1639,21 +1750,21 @@ mod tests {
         // shouldn't start counting down a volume change no matter how long
         // it sits there.
         let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT - 0.05);
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 5.0, false, Some(hold));
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 5.0, false, Some(true), Some(hold));
         assert!((hold.unwrap().held_for - 0.0).abs() < EPSILON);
     }
 
     #[test]
     fn webtoon_edge_hold_step_starts_counting_the_moment_the_minimum_overscroll_is_crossed() {
         let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT);
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(hold));
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(true), Some(hold));
         assert!((hold.unwrap().held_for - 0.5).abs() < EPSILON);
     }
 
     #[test]
     fn webtoon_edge_hold_step_holding_still_counts_toward_arming_without_touching_overscroll() {
         let hold = live_hold(1, 0.9);
-        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(hold));
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(true), Some(hold));
         assert_eq!(commit, None);
         let hold = hold.unwrap();
         assert!((hold.overscroll - 0.9).abs() < EPSILON);
@@ -1664,7 +1775,7 @@ mod tests {
     fn webtoon_edge_hold_step_accumulates_held_for_across_several_still_frames() {
         let mut hold = Some(live_hold(1, 0.9));
         for _ in 0..4 {
-            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, hold.take());
+            let (_, next, ..) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.5, false, Some(true), hold.take());
             hold = next;
         }
         assert!((hold.unwrap().held_for - 2.0).abs() < EPSILON);
@@ -1677,18 +1788,40 @@ mod tests {
         // it back to zero.
         let hold = live_hold(1, 0.9);
         let jitter = WEBTOON_EDGE_HOLD_STILL_EPSILON * 0.5;
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, jitter, jitter * 0.1, 0.3, false, Some(hold));
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, jitter, jitter * 0.1, 0.3, false, Some(true), Some(hold));
         let hold = hold.unwrap();
         assert!((hold.overscroll - 0.9).abs() < EPSILON);
         assert!((hold.held_for - 0.3).abs() < EPSILON);
     }
 
     #[test]
-    fn webtoon_edge_hold_step_pushing_further_resets_held_for_and_raises_overscroll() {
+    fn webtoon_edge_hold_step_pushing_further_with_a_finger_down_keeps_counting_held_for() {
+        // A deliberate continued push — finger still on the pad — raises
+        // `overscroll` same as before, but no longer resets `held_for`;
+        // it keeps counting exactly like holding still would.
         let mut hold = live_hold(1, 0.7);
         hold.held_for = 0.4;
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2;
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        let dt = 1.0 / 60.0;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, dt, false, Some(true), Some(hold));
+        let hold = hold.unwrap();
+        assert!((hold.overscroll - 0.9).abs() < EPSILON);
+        assert!((hold.held_for - (0.4 + dt)).abs() < EPSILON);
+    }
+
+    #[test]
+    fn webtoon_edge_hold_step_pushing_further_with_no_signal_still_resets_held_for() {
+        // The same continued push, but with no opinion at all on finger
+        // contact (`None` — a platform `platform::scroll_touch` has
+        // nothing to report on) — must still reset the countdown, exactly
+        // like before this gesture could tell the difference at all. A
+        // *confirmed* lifted finger (`Some(false)`) is a stronger claim
+        // than this and drops the hold outright instead — see the
+        // dedicated test for that.
+        let mut hold = live_hold(1, 0.7);
+        hold.held_for = 0.4;
+        let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2;
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None, Some(hold));
         let hold = hold.unwrap();
         assert!((hold.overscroll - 0.9).abs() < EPSILON);
         assert!((hold.held_for - 0.0).abs() < EPSILON);
@@ -1696,10 +1829,13 @@ mod tests {
 
     #[test]
     fn webtoon_edge_hold_step_pulling_back_partially_reduces_overscroll_and_resets_held_for() {
+        // Even with a finger down, a pull-back (the wrong direction) still
+        // resets the countdown — `finger_down` only protects a *continued
+        // push*, never a retreat.
         let mut hold = live_hold(1, 0.9);
         hold.held_for = 1.0;
         let pull = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2;
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -pull * 0.1, 1.0 / 60.0, false, Some(hold));
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -pull * 0.1, 1.0 / 60.0, false, Some(true), Some(hold));
         let hold = hold.unwrap();
         assert!((hold.overscroll - 0.7).abs() < EPSILON);
         assert!((hold.held_for - 0.0).abs() < EPSILON);
@@ -1709,7 +1845,7 @@ mod tests {
     fn webtoon_edge_hold_step_pulling_all_the_way_back_drops_the_hold_and_resumes_scrolling() {
         let hold = live_hold(1, 0.1);
         let pull = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.2; // more than enough to zero out 0.1 overscroll
-        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -3.0, 1.0 / 60.0, false, Some(hold));
+        let (scroll, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, -pull, -3.0, 1.0 / 60.0, false, Some(true), Some(hold));
         assert!(hold.is_none());
         assert_eq!(commit, None);
         assert!((scroll - 997.0).abs() < EPSILON); // normal scroll applied instead
@@ -1719,7 +1855,7 @@ mod tests {
     fn webtoon_edge_hold_step_overscroll_never_exceeds_one() {
         let hold = live_hold(1, 0.9);
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX; // would overshoot to 1.9 uncapped
-        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        let (_, hold, ..) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(true), Some(hold));
         assert!((hold.unwrap().overscroll - 1.0).abs() < EPSILON);
     }
 
@@ -1727,7 +1863,7 @@ mod tests {
     fn webtoon_edge_hold_step_commits_at_release_once_armed() {
         let mut hold = live_hold(1, 0.9);
         hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS;
-        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(hold));
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(true), Some(hold));
         assert!(hold.is_none());
         assert_eq!(commit, Some(1));
     }
@@ -1738,7 +1874,7 @@ mod tests {
         // having armed just clears the hold outright, on this very frame.
         let mut hold = live_hold(1, 0.9);
         hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS - 0.01;
-        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(hold));
+        let (_, hold, commit, _) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 1.0 / 60.0, true, Some(true), Some(hold));
         assert_eq!(commit, None);
         assert!(hold.is_none());
     }
@@ -1747,13 +1883,13 @@ mod tests {
     fn webtoon_edge_hold_step_reports_crossed_min_overscroll_only_on_the_crossing_frame() {
         let hold = live_hold(1, WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT - 0.05);
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.1; // enough to cross the threshold
-        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(hold));
+        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(true), Some(hold));
         assert!(haptics.crossed_min_overscroll);
         assert!(!haptics.just_armed);
 
         // Already past the threshold now — pushing further must not report
         // the crossing a second time.
-        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, hold);
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(true), hold);
         assert!(!haptics.crossed_min_overscroll);
     }
 
@@ -1762,7 +1898,7 @@ mod tests {
         // A single big enough push can jump straight past the minimum on
         // the very frame the hold starts — that still counts as crossing it.
         let push = WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * 0.9;
-        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, None);
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, push, push * 0.1, 1.0 / 60.0, false, Some(true), None);
         assert!(haptics.crossed_min_overscroll);
     }
 
@@ -1770,11 +1906,11 @@ mod tests {
     fn webtoon_edge_hold_step_reports_just_armed_only_on_the_arming_frame() {
         let mut hold = live_hold(1, 1.0);
         hold.held_for = WEBTOON_EDGE_HOLD_DURATION_SECONDS - 0.01;
-        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, Some(hold));
+        let (_, hold, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, Some(true), Some(hold));
         assert!(haptics.just_armed);
         assert!(!haptics.crossed_min_overscroll); // already past it, not a fresh crossing
 
-        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, hold);
+        let (_, _, _, haptics) = webtoon_edge_hold_step(1000.0, 1000.0, 0.0, 0.0, 0.02, false, Some(true), hold);
         assert!(!haptics.just_armed);
     }
 }

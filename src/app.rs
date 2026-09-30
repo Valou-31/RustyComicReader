@@ -181,20 +181,29 @@ pub enum UpdateStatus {
 /// opening the previous/next sibling volume — committed by *holding* there,
 /// not by how far it's dragged (see `ui::reader::webtoon_edge_hold_step` and
 /// `ui::reader::WEBTOON_EDGE_HOLD_DURATION_SECONDS`): push past the edge a
-/// short distance, hold genuinely still for about a second, then let go to
-/// commit — or move at all (either direction) before then to reset the
-/// countdown, or ease back to the edge outright to cancel. Can start from
-/// any push at the edge, not gated on `TouchPhase::Start` — logged event
-/// traces showed that phase firing many times a second even mid-scroll on
-/// this platform, not just at actual touch-down, so gating on it blocked
-/// most genuine pushes without actually excluding momentum. What keeps a
-/// fast flick's momentum from spawning or feeding this with nobody actually
-/// touching the trackpad is armed only by genuine stillness (see
-/// `held_for` below), never by continued pushing — momentum keeps moving
-/// for essentially all of its decay, so it can't build real `held_for` on
-/// its own. Dropped the instant the underlying gesture ends without arming
-/// — no rebound/settle animation, since that motion belongs to this gesture
-/// alone and isn't something the reader asked for.
+/// short distance, then either hold genuinely still or keep deliberately
+/// pushing further (finger still on the pad — see
+/// `platform::scroll_touch::finger_down`) for about a second, then let go
+/// to commit — or pull back at all before then to reset the countdown, or
+/// ease back to the edge outright to cancel. Can start from any push at the
+/// edge, not gated on `TouchPhase::Start` — logged event traces showed that
+/// phase firing many times a second even mid-scroll on this platform, not
+/// just at actual touch-down, so gating on it blocked most genuine pushes
+/// without actually excluding momentum. What keeps a fast flick's momentum
+/// from spawning or feeding this with nobody actually touching the trackpad
+/// is armed only by genuine stillness or a deliberate, finger-down push
+/// (see `held_for` below), never by momentum's own continued movement —
+/// `platform::scroll_touch::finger_down` reports `Some(false)` once
+/// fingers have lifted and the OS is just coasting, so it can't build real
+/// `held_for` on its own, and can't even start a fresh hold in the first
+/// place (a momentum push arriving with no live hold yet is just ignored).
+/// A confirmed lift also resolves an already-live hold immediately —
+/// commits if armed, otherwise drops it outright — rather than waiting on
+/// `gesture_ended`, which real event traces showed can lag well behind the
+/// actual moment fingers left the trackpad; without that, the countdown
+/// badge would keep showing through a flick's entire momentum tail. Either
+/// way there's no rebound/settle animation on drop, since that motion
+/// belongs to this gesture alone and isn't something the reader asked for.
 pub(crate) struct WebtoonEdgeHold {
     /// `1` pushing past the bottom (opens the next volume), `-1` pulling
     /// past the top (previous).
@@ -206,9 +215,12 @@ pub(crate) struct WebtoonEdgeHold {
     /// way cancels the hold outright and hands control back to normal
     /// scrolling.
     pub overscroll: f32,
-    /// Seconds this hold has sat essentially still (see
-    /// `ui::reader::WEBTOON_EDGE_HOLD_STILL_EPSILON`) — reset to `0.0` by
-    /// any real movement, push or pull alike. Only starts advancing once
+    /// Seconds this hold has sat essentially still, or been deliberately
+    /// pushed further with a finger still down (see
+    /// `ui::reader::WEBTOON_EDGE_HOLD_STILL_EPSILON` and
+    /// `platform::scroll_touch::finger_down`) — reset to `0.0` by a
+    /// pull-back, or by that same continued push once there's no finger
+    /// down to vouch for it (momentum). Only starts advancing once
     /// `overscroll` has already crossed
     /// `ui::reader::WEBTOON_EDGE_HOLD_MIN_OVERSCROLL_TO_COUNT` — a minimum
     /// push before any of this starts counting at all, so barely grazing

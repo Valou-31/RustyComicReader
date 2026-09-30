@@ -41,12 +41,15 @@ winreg = "0.56.0"
 # objc2-foundation — see `platform::macos` for what these are for.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
+# For `platform::scroll_touch`'s `NSEvent` local monitor block.
+block2 = "0.6.2"
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
 version = "0.3.2"
 default-features = false
 # `NSHapticFeedback` is for `platform::haptics` (NSHapticFeedbackManager).
-features = ["std", "NSApplication", "NSResponder", "NSHapticFeedback"]
+# `NSEvent`/`block2` are for `platform::scroll_touch`'s local event monitor.
+features = ["std", "NSApplication", "NSResponder", "NSHapticFeedback", "NSEvent", "block2"]
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
 version = "0.3.2"
