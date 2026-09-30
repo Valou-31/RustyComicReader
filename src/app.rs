@@ -230,6 +230,32 @@ pub(crate) struct WebtoonEdgeHold {
     pub held_for: f32,
 }
 
+/// A snapshot of `WebtoonEdgeHold`'s own visual state (`overscroll`,
+/// `held_for`, `direction`), taken the instant a hold is dropped unarmed —
+/// `webtoon_edge_hold` itself goes straight to `None` that same frame (see
+/// `ui::reader::webtoon_edge_hold_step`'s docs for why: no rebound while
+/// the gesture is still live), which would otherwise cut the badge from
+/// wherever it was straight to invisible in a single frame. Kept around
+/// just long enough for `ui::reader::draw_webtoon` to ease the badge back
+/// out on its own instead, then dropped for real — see
+/// `ui::reader::WEBTOON_EDGE_HOLD_RELEASE_EASE_DURATION`.
+pub(crate) struct WebtoonEdgeHoldRelease {
+    /// `1`/`-1`, same meaning as `WebtoonEdgeHold::direction` — which edge's
+    /// badge this is.
+    pub direction: i32,
+    /// `WebtoonEdgeHold::overscroll` at the moment of release — the ease's
+    /// starting point.
+    pub from_overscroll: f32,
+    /// `WebtoonEdgeHold::held_for` at the moment of release, already
+    /// expressed as a `0.0..=1.0` fraction of
+    /// `ui::reader::WEBTOON_EDGE_HOLD_DURATION_SECONDS` — the countdown
+    /// arc's own starting point for the same ease.
+    pub from_hold_progress: f32,
+    /// When the release happened — the ease's own clock, independent of
+    /// `held_for`/`overscroll`, which no longer exist to advance it.
+    pub started: Instant,
+}
+
 pub struct ComicApp {
     /// Each page's original compressed bytes (JPEG/PNG/etc.), not decoded
     /// pixels — decoding happens on demand in the reader UI, only for pages
@@ -297,10 +323,15 @@ pub struct ComicApp {
     pub(crate) webtoon_anchor_page: Option<usize>,
     pub(crate) webtoon_anchor_offset: f32,
     /// The live edge-past-the-strip hold toward opening the next/previous
-    /// sibling volume, if one is currently in progress (gesture still live)
-    /// or settling back to rest (released without arming) — see
-    /// `WebtoonEdgeHold`. `None` the rest of the time.
+    /// sibling volume, if one is currently in progress — see
+    /// `WebtoonEdgeHold`. Goes straight to `None` the instant it resolves,
+    /// armed or not; see `webtoon_edge_hold_release` for what keeps the
+    /// badge itself from just as abruptly vanishing when it doesn't.
     pub(crate) webtoon_edge_hold: Option<WebtoonEdgeHold>,
+    /// Set for a few frames right after `webtoon_edge_hold` drops unarmed —
+    /// see `WebtoonEdgeHoldRelease`. `None` the rest of the time, including
+    /// while `webtoon_edge_hold` itself is live.
+    pub(crate) webtoon_edge_hold_release: Option<WebtoonEdgeHoldRelease>,
     pub filename: String,
     /// Parsed from the current book's `ComicInfo.xml`, if it had one — see
     /// `comic::comic_info::ComicInfo`. Shown alongside the filename in the
@@ -575,6 +606,7 @@ impl Default for ComicApp {
             webtoon_anchor_page: None,
             webtoon_anchor_offset: 0.0,
             webtoon_edge_hold: None,
+            webtoon_edge_hold_release: None,
             filename: "Aucun fichier".to_string(),
             comic_info: None,
             show_settings: false,
@@ -1656,6 +1688,7 @@ impl ComicApp {
                     self.reset_zoom_for_new_page();
                     self.webtoon_scroll_target = Some(self.current_page);
                     self.webtoon_edge_hold = None;
+                    self.webtoon_edge_hold_release = None;
 
                     self.loading = false;
                     // Any decode still in flight for the previous archive is

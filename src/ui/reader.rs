@@ -1,6 +1,6 @@
 use crate::app::{
-    ComicApp, PageZoom, ReadingMode, UI_HIDE_DELAY, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, WebtoonEdgeHold, ZOOM_MAX,
-    ZOOM_MIN, ZoomTarget,
+    ComicApp, PageZoom, ReadingMode, UI_HIDE_DELAY, WEBTOON_WIDTH_PCT_MAX, WEBTOON_WIDTH_PCT_MIN, WebtoonEdgeHold,
+    WebtoonEdgeHoldRelease, ZOOM_MAX, ZOOM_MIN, ZoomTarget,
 };
 use crate::comic::archive::{ComicArchive, PageMeta};
 use crate::ui::theme::Theme;
@@ -139,6 +139,13 @@ const WEBTOON_EDGE_HOLD_OVERSCROLL_MAX: f32 = 56.0;
 /// long enough that grazing the edge in passing (and easing back off it
 /// again right away) never arms it by accident.
 const WEBTOON_EDGE_HOLD_DURATION_SECONDS: f32 = 1.0;
+
+/// Seconds `draw_webtoon` spends easing the badge back out once a hold
+/// drops unarmed — see `app::WebtoonEdgeHoldRelease`. Short and quick
+/// (versus `WEBTOON_EDGE_HOLD_DURATION_SECONDS`'s own much longer wait):
+/// this is just enough motion to read as "canceled" rather than "vanished",
+/// not another wait the reader has to sit through.
+const WEBTOON_EDGE_HOLD_RELEASE_EASE_DURATION: f32 = 0.25;
 
 /// Raw per-frame drag magnitude (physical points, same units as
 /// `webtoon_edge_hold_step`'s `raw_delta`) a frame's movement, in either
@@ -324,6 +331,7 @@ struct WebtoonEdgeHoldHaptics {
 /// dropped outright, with no rebound or settle animation — that motion
 /// belongs to this gesture alone, and a reader who let go without arming it
 /// gets an immediate, plain cancel.
+#[allow(clippy::too_many_arguments)] // each parameter is independently meaningful per-frame state; see the docs above
 fn webtoon_edge_hold_step(
     scroll: f32,
     max_scroll: f32,
@@ -515,6 +523,10 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
             let raw_delta = if app.webtoon_scroll_inverted { wheel_delta_y } else { -wheel_delta_y };
             let doc_delta = raw_delta * app.webtoon_wheel_sensitivity / scale;
             let dt = ui.ctx().input(|i| i.stable_dt);
+            // Snapshot before the step below (which owns `edge_hold` via
+            // `take()`) — needed if this turns out to be the exact frame it
+            // drops unarmed, to seed `webtoon_edge_hold_release`'s ease-out.
+            let prev_hold = app.webtoon_edge_hold.as_ref().map(|h| (h.direction, h.overscroll, h.held_for));
             let (new_scroll, new_hold, commit, haptics) = webtoon_edge_hold_step(
                 app.webtoon_scroll,
                 max_scroll,
@@ -527,6 +539,19 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
             );
             app.webtoon_scroll = new_scroll;
             app.webtoon_edge_hold = new_hold;
+            if app.webtoon_edge_hold.is_some() {
+                // A fresh push supersedes whatever the badge was still
+                // easing back from.
+                app.webtoon_edge_hold_release = None;
+            } else if commit.is_none() && let Some((direction, overscroll, held_for)) = prev_hold {
+                // Dropped unarmed this frame — see `WebtoonEdgeHoldRelease`.
+                app.webtoon_edge_hold_release = Some(WebtoonEdgeHoldRelease {
+                    direction,
+                    from_overscroll: overscroll,
+                    from_hold_progress: (held_for / WEBTOON_EDGE_HOLD_DURATION_SECONDS).clamp(0.0, 1.0),
+                    started: std::time::Instant::now(),
+                });
+            }
             if haptics.crossed_min_overscroll {
                 crate::platform::haptics::perform(crate::platform::haptics::HapticTap::MinOverscrollCrossed);
             }
@@ -552,20 +577,43 @@ fn draw_webtoon(ui: &mut Ui, app: &mut ComicApp) {
     // pushing past the bottom, i.e. "next"; negative past the top, i.e.
     // "previous") the strip is currently rubber-banded — see
     // `WEBTOON_EDGE_HOLD_OVERSCROLL_MAX`.
-    let overscroll_px = app
+    let mut overscroll_px = app
         .webtoon_edge_hold
         .as_ref()
         .map(|h| h.overscroll * WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * h.direction as f32)
         .unwrap_or(0.0);
     // `0.0..=1.0`: how much of `WEBTOON_EDGE_HOLD_DURATION_SECONDS` this
     // hold has gone without easing back toward the edge.
-    let hold_progress = app
+    let mut hold_progress = app
         .webtoon_edge_hold
         .as_ref()
         .map(|h| (h.held_for / WEBTOON_EDGE_HOLD_DURATION_SECONDS).clamp(0.0, 1.0))
         .unwrap_or(0.0);
     // Whether letting go *right now* would actually commit.
     let armed = app.webtoon_edge_hold.as_ref().is_some_and(|h| h.held_for >= WEBTOON_EDGE_HOLD_DURATION_SECONDS);
+
+    // No live hold, but one was just dropped unarmed — ease the badge back
+    // out from wherever it was instead of leaving it to just vanish (see
+    // `WebtoonEdgeHoldRelease`), by synthesizing `overscroll_px`/
+    // `hold_progress` from the snapshot for as long as the ease still has
+    // left to run.
+    if app.webtoon_edge_hold.is_none() && let Some(release) = &app.webtoon_edge_hold_release {
+        let t = (release.started.elapsed().as_secs_f32() / WEBTOON_EDGE_HOLD_RELEASE_EASE_DURATION).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            app.webtoon_edge_hold_release = None;
+        } else {
+            // Ease-out (decelerating): fast at first, settling as it
+            // reaches the edge — reads as a quick, deliberate "never mind"
+            // rather than a linear slide.
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let remaining = 1.0 - eased;
+            overscroll_px = release.from_overscroll * WEBTOON_EDGE_HOLD_OVERSCROLL_MAX * release.direction as f32 * remaining;
+            hold_progress = release.from_hold_progress * remaining;
+            // Own clock, not driven by any wheel event — needs its own
+            // repaint request to actually animate.
+            ui.ctx().request_repaint();
+        }
+    }
 
     let x_min = base_rect.center().x - displayed_width / 2.0;
 
